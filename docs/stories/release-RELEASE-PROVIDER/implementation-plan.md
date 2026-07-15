@@ -13,11 +13,13 @@ storyId: "release:RELEASE-PROVIDER"
 > Baseline note: this scaffold already exists in the worktree (module `github.com/smartpcr/terraform-provider-labdeploy`, `main.go`, `Makefile`, and the `internal/{provider,spec,transport,artifact,pattern,engine,logs,layout}` package tree with initial implementations). The boxes below are checked to reflect that landed baseline; later phases harden, test, and complete each module.
 
 ### Implementation Steps
-- [x] Go module `github.com/smartpcr/terraform-provider-labdeploy` (`go.mod`, Go 1.22, no cgo) with `main.go` wiring `providerserver.Serve` at plugin protocol v6 for address `registry.local/smartpcr/labdeploy`.
+- [x] Go module `github.com/smartpcr/terraform-provider-labdeploy` (`go.mod`, Go 1.22) with `main.go` wiring `providerserver.Serve` at plugin protocol v6 for address `registry.local/smartpcr/labdeploy`.
 - [x] Package tree under `internal/{provider,spec,transport,artifact,pattern,engine,logs,layout}` created with initial sources so later stages land in isolation.
-- [x] Dependencies pinned in `go.mod`: terraform-plugin-framework v1.11.0, terraform-plugin-log v0.9.0, masterzen/winrm, golang.org/x/crypto, pkg/sftp, gopkg.in/yaml.v3 (`go mod tidy` clean).
+- [x] Dependencies declared in `go.mod`: terraform-plugin-framework v1.11.0, terraform-plugin-log v0.9.0, masterzen/winrm, golang.org/x/crypto, pkg/sftp, gopkg.in/yaml.v3.
 - [x] `Makefile` with `build`/`test`/`lint` targets present; keep it aligned with DESIGN sec 20 (`golangci-lint run` clean).
-- [ ] Add a CI workflow that runs `make build test lint` on the gate host (the one Stage 1.1 item not yet in the worktree).
+- [ ] Run `go mod tidy` and commit the resulting `go.sum` (absent in the worktree today) so dependency checksums are pinned and builds are reproducible.
+- [ ] Enforce the no-cgo build invariant: set `CGO_ENABLED=0` in the Makefile `build` target (currently line 11 runs plain `go build`) and in the goreleaser config (Stage 8.3).
+- [ ] Add a CI workflow that runs `make build test lint` on the gate host (not yet in the worktree).
 
 ### Dependencies
 - _none -- start stage_
@@ -30,10 +32,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 1.2: Spec Types and YAML JSON Parsing
 
 ### Implementation Steps
-- [ ] Define Go structs in `internal/spec/types.go` for the `Deployment` envelope, `target`, `artifact`, the `pattern` discriminated union, `environment`/`files`/`health_check`/`strategy`/`logs`, and the `TestRun` kind (DESIGN sec 6, sec 7).
-- [ ] Implement `internal/spec/parse.go`: accept YAML or JSON, convert YAML to JSON, unmarshal into typed structs, and detect `apiVersion`/`kind`.
-- [ ] Decode the `pattern.type` discriminated union into the concrete pattern struct (console_app, windows_service, node_web_app, dotnet_api, cluster_generic_service, docker_container).
-- [ ] Add `OSKind` and `TransportKind` enums plus provider-default merge helpers used by validation.
+- [x] Define Go structs in `internal/spec/types.go` for the `Deployment` envelope, `target`, `artifact`, the `pattern` discriminated union, `environment`/`files`/`health_check`/`strategy`/`logs`, and the `TestRun` kind (DESIGN sec 6, sec 7).
+- [x] Implement `internal/spec/parse.go`: accept YAML or JSON, convert YAML to JSON, unmarshal into typed structs, and detect `apiVersion`/`kind`.
+- [x] Decode the `pattern.type` discriminated union into the concrete pattern struct (console_app, windows_service, node_web_app, dotnet_api, cluster_generic_service, docker_container).
+- [x] Add `OSKind` and `TransportKind` enums plus provider-default merge helpers used by validation.
 
 ### Dependencies
 - phase-project-scaffold-and-spec-engine/stage-repository-bootstrap-and-toolchain
@@ -45,10 +47,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 1.3: Spec Validation and Variable Substitution
 
 ### Implementation Steps
-- [ ] Implement `internal/spec/validate.go` covering every DESIGN sec 6/sec 7 rule: envelope regex, target merge + required fields, artifact regex/checksum rules, pattern x os matrix (sec 14), and artifact x pattern matrix.
-- [ ] Implement `${var:NAME}` substitution sourced only from the resource `variables` map, with `$${var:...}` escape and unresolved-token error `unresolved variable NAME at <json-path>`.
-- [ ] Implement env-var NAME hygiene: specs carry env-var names only; a referenced-but-unset env var yields `ERR_SPEC_INVALID env var <NAME> ... is not set` before any dial.
-- [ ] Emit every `ERR_SPEC_INVALID` with the offending JSON path, matching the VAL-01..VAL-09 message contracts.
+- [x] Implement `internal/spec/validate.go` covering every DESIGN sec 6/sec 7 rule: envelope regex, target merge + required fields, artifact regex/checksum rules, pattern x os matrix (sec 14), and artifact x pattern matrix.
+- [x] Implement `${var:NAME}` substitution sourced only from the resource `variables` map, with `$${var:...}` escape and unresolved-token error `unresolved variable NAME at <json-path>`.
+- [x] Implement env-var NAME hygiene: specs carry env-var names only; a referenced-but-unset env var yields `ERR_SPEC_INVALID env var <NAME> ... is not set` before any dial.
+- [x] Emit every `ERR_SPEC_INVALID` with the offending JSON path, matching the VAL-01..VAL-09 message contracts.
 
 ### Dependencies
 - phase-project-scaffold-and-spec-engine/stage-spec-types-and-yaml-json-parsing
@@ -60,10 +62,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 1.4: Canonical JSON and Spec Hashing
 
 ### Implementation Steps
-- [ ] Implement a canonical JSON emitter (sorted keys, no insignificant whitespace) over the substituted spec.
-- [ ] Compute `spec_hash = sha256(canonical JSON)` after `${var}` substitution and `version_override` application.
-- [ ] Apply `version_override` to `artifact.version` before hashing so the pipeline build number drives the release dir name.
-- [ ] Provide the immutable-field extraction helper (pattern.type, service_name, role_name, install_root, metadata.name, hosts-set, os) consumed by the RequiresReplace plan modifier in Stage 5.2.
+- [x] Implement a canonical JSON emitter (sorted keys, no insignificant whitespace) over the substituted spec.
+- [x] Compute `spec_hash = sha256(canonical JSON)` after `${var}` substitution and `version_override` application.
+- [x] Apply `version_override` to `artifact.version` before hashing so the pipeline build number drives the release dir name.
+- [x] Provide the immutable-field extraction helper (pattern.type, service_name, role_name, install_root, metadata.name, hosts-set, os) consumed by the RequiresReplace plan modifier in Stage 5.2.
 
 ### Dependencies
 - phase-project-scaffold-and-spec-engine/stage-spec-validation-and-variable-substitution
@@ -80,10 +82,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 2.1: Transport Interface and Local Execution
 
 ### Implementation Steps
-- [ ] Define the `Transport` interface plus `Cmd`/`Result`/`Shell` types in `internal/transport/transport.go` (DESIGN sec 8.1).
-- [ ] Implement `local.go` with `os/exec` + file copy; `Connect` verifies `runtime.GOOS` matches `target.os`.
-- [ ] Implement the connect retry loop (`connect_retries`, fixed 5s backoff) with `ERR_CONNECT` vs `ERR_AUTH` mapping seam.
-- [ ] Add the `NewTransport` factory dispatching on transport kind (local/ssh/winrm), reused by the engine seam for fake-transport tests.
+- [x] Define the `Transport` interface plus `Cmd`/`Result`/`Shell` types in `internal/transport/transport.go` (DESIGN sec 8.1).
+- [x] Implement `local.go` with `os/exec` + file copy; `Connect` verifies `runtime.GOOS` matches `target.os`.
+- [x] Implement the connect retry loop (`connect_retries`, fixed 5s backoff) with `ERR_CONNECT` vs `ERR_AUTH` mapping seam.
+- [x] Add the `NewTransport` factory dispatching on transport kind (local/ssh/winrm), reused by the engine seam for fake-transport tests.
 
 ### Dependencies
 - _none -- start stage_
@@ -95,10 +97,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 2.2: PowerShell Encoding and WinRM Transport
 
 ### Implementation Steps
-- [ ] Implement the `EncodedCommand` builder: `base64(UTF-16LE(script))` invoked as `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand`.
-- [ ] Implement env injection by prepending `$env:K='V';` lines with single-quote escaping; secret values never appear on the command line.
-- [ ] Implement `winrm.go` (masterzen/winrm) `Exec` with https/insecure toggles; a 401 maps to `ERR_AUTH` and is not retried.
-- [ ] Implement WinRM chunked base64 upload (48000-byte raw chunks, `CreateNew` first then `FileStream` append) and download.
+- [x] Implement the `EncodedCommand` builder: `base64(UTF-16LE(script))` invoked as `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand`.
+- [x] Implement env injection by prepending `$env:K='V';` lines with single-quote escaping; secret values never appear on the command line.
+- [x] Implement `winrm.go` (masterzen/winrm) `Exec` with https/insecure toggles; a 401 maps to `ERR_AUTH` and is not retried.
+- [x] Implement WinRM chunked base64 upload (48000-byte raw chunks, `CreateNew` first then `FileStream` append) and download.
 
 ### Dependencies
 - phase-transport-and-artifact-acquisition/stage-transport-interface-and-local-execution
@@ -110,25 +112,25 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 2.3: SSH Transport and SFTP Transfer
 
 ### Implementation Steps
-- [ ] Implement `ssh.go` (golang.org/x/crypto/ssh) dial with `host_key` pinning ("" accepts any + WARN diag) and password/private-key env auth.
-- [ ] Implement SFTP upload/download via pkg/sftp.
-- [ ] Map ssh auth failure to `ERR_AUTH` (no retry), dial/timeout to `ERR_CONNECT`, and pinned-key mismatch to `ERR_CONNECT` with `host key mismatch`.
-- [ ] Wire the Linux `sh -c` env-prepend (`K='V' `) for Exec.
+- [x] Implement `ssh.go` (golang.org/x/crypto/ssh) dial with `host_key` pinning ("" accepts any + WARN diag) and password/private-key env auth.
+- [x] Implement SFTP upload/download via pkg/sftp.
+- [x] Map ssh auth failure to `ERR_AUTH` (no retry), dial/timeout to `ERR_CONNECT`, and pinned-key mismatch to `ERR_CONNECT` with `host key mismatch`.
+- [x] Wire the Linux `sh -c` env-prepend (`K='V' `) for Exec.
 
 ### Dependencies
 - phase-transport-and-artifact-acquisition/stage-transport-interface-and-local-execution
 
 ### Test Scenarios
-- [ ] Scenario: SSH dial and SFTP round-trip -- Given a real SSH endpoint, When `Connect`/`Exec`/`Upload`/`Download` run over the ssh transport, Then data round-trips and auth rejection is not retried; a local shell cannot exercise ssh/sftp, so this belongs to lab acceptance [proof: lab; deps: L1 Linux VM with sshd per architecture L1 (live SSH is never local-shell)]
+- [ ] Scenario: SSH dial and SFTP round-trip -- Given a real SSH endpoint, When `Connect`/`Exec`/`Upload`/`Download` run over the ssh transport, Then data round-trips and auth rejection is not retried; a local shell cannot exercise ssh/sftp, so this belongs to lab acceptance [proof: lab; deps: L1 Linux VM with sshd, which architecture assigns to acceptance area L2 (live SSH is never local-shell)]
 - [ ] Scenario: Host key mismatch mapping -- Given a pinned wrong `ssh.host_key`, When `Connect` runs against a stub key, Then the error is `ERR_CONNECT` with detail `host key mismatch` [proof: in-process; deps: none]
 
 ## Stage 2.4: Artifact Fetch and Target Pull
 
 ### Implementation Steps
-- [ ] Implement `internal/artifact/fetch.go` for http/file/nuget: stream to a runner temp file, compute sha256 while streaming, compare to `artifact.checksum` (mismatch = `ERR_CHECKSUM_MISMATCH`, 4xx/5xx = `ERR_ARTIFACT_FETCH` with status + first 256B body).
-- [ ] Implement NuGet v3 flat-container URL construction and bearer/basic `Authorization` from `auth.token_env`.
-- [ ] Implement `TargetPullScript` generation (win `Invoke-WebRequest` + `Get-FileHash`, exit 41; linux `curl` + `sha256sum`) with `LD_AUTH_VALUE` injected via `Cmd.Env`.
-- [ ] Implement docker-ref passthrough (no runner fetch; pull deferred to the docker pattern).
+- [x] Implement `internal/artifact/fetch.go` for http/file/nuget: stream to a runner temp file, compute sha256 while streaming, compare to `artifact.checksum` (mismatch = `ERR_CHECKSUM_MISMATCH`, 4xx/5xx = `ERR_ARTIFACT_FETCH` with status + first 256B body).
+- [x] Implement NuGet v3 flat-container URL construction and bearer/basic `Authorization` from `auth.token_env`.
+- [x] Implement `TargetPullScript` generation (win `Invoke-WebRequest` + `Get-FileHash`, exit 41; linux `curl` + `sha256sum`) with `LD_AUTH_VALUE` injected via `Cmd.Env`.
+- [x] Implement docker-ref passthrough (no runner fetch; pull deferred to the docker pattern).
 
 ### Dependencies
 - _none -- start stage_
@@ -145,9 +147,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 3.1: Path Model and Target Layout
 
 ### Implementation Steps
-- [ ] Implement `internal/layout` `Paths` deriving `releases/`, `current`, `shared/`, `staging/`, `manifest.json`, `.lock` with the correct separator per os (DESIGN sec 9.1).
-- [ ] Generate directory-creation scripts (`New-Item -ItemType Directory -Force` / `mkdir -p`).
-- [ ] Provide the `LD_*` env injection map (`LD_APP`, `LD_VERSION`, `LD_RELEASE_DIR`, `LD_SHARED_DIR`, and `PORT` for node) merged under spec `environment` with spec winning.
+- [x] Implement `internal/layout` `Paths` deriving `releases/`, `current`, `shared/`, `staging/`, `manifest.json`, `.lock` with the correct separator per os (DESIGN sec 9.1).
+- [x] Generate directory-creation scripts (`New-Item -ItemType Directory -Force` / `mkdir -p`).
+- [x] Provide the `LD_*` env injection map (`LD_APP`, `LD_VERSION`, `LD_RELEASE_DIR`, `LD_SHARED_DIR`, and `PORT` for node) merged under spec `environment` with spec winning.
 
 ### Dependencies
 - _none -- start stage_
@@ -159,9 +161,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 3.2: Locking and Manifest Persistence
 
 ### Implementation Steps
-- [ ] Implement `AcquireLock`/`ReleaseLock` in `internal/engine/manifest.go` (per architecture sec 3.5, lock ownership lives in `manifest.go`, not a separate `lock.go`): atomic create-new (`[IO.File]::Open CreateNew` / `set -C`) returning exit 48 -> `ERR_LOCKED`; age >= `lock_timeout_seconds` overwrites with WARN; release runs in defer on all post-LOCK error paths.
-- [ ] Implement `engine/manifest.go` read/write of the JSON manifest (`current_version`, `previous_version`, `artifact_checksum`, `last_operation`, `extra`).
-- [ ] Implement the manifest-driven Read reconciliation helper: absent -> remove resource; `last_operation.result==failed` -> `<version>!failed` marker.
+- [x] Implement `AcquireLock`/`ReleaseLock` in `internal/engine/manifest.go` (per architecture sec 3.5, lock ownership lives in `manifest.go`, not a separate `lock.go`): atomic create-new (`[IO.File]::Open CreateNew` / `set -C`) returning exit 48 -> `ERR_LOCKED`; age >= `lock_timeout_seconds` overwrites with WARN; release runs in defer on all post-LOCK error paths.
+- [x] Implement `engine/manifest.go` read/write of the JSON manifest (`current_version`, `previous_version`, `artifact_checksum`, `last_operation`, `extra`).
+- [x] Implement the manifest-driven Read reconciliation helper: absent -> remove resource; `last_operation.result==failed` -> `<version>!failed` marker.
 
 ### Dependencies
 - _none -- start stage_
@@ -173,10 +175,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 3.3: Staging Extraction and Junction Switch
 
 ### Implementation Steps
-- [ ] Implement staging wipe plus upload-or-target-pull orchestration into `staging/`.
-- [ ] Implement extraction scripts (`Expand-Archive -Force` / `unzip -o`, nupkg renamed to .zip) and the `.labdeploy-release.json` `{version,sha256,extracted_at}` writer.
-- [ ] Implement the junction switch (win `rmdir` + `mklink /J`, exit 42 -> `ERR_SWITCH`; linux `ln -sfn`).
-- [ ] Implement prune keeping `strategy.keep_releases` and never deleting `previous_version`.
+- [x] Implement staging wipe plus upload-or-target-pull orchestration into `staging/`.
+- [x] Implement extraction scripts (`Expand-Archive -Force` / `unzip -o`, nupkg renamed to .zip) and the `.labdeploy-release.json` `{version,sha256,extracted_at}` writer.
+- [x] Implement the junction switch (win `rmdir` + `mklink /J`, exit 42 -> `ERR_SWITCH`; linux `ln -sfn`).
+- [x] Implement prune keeping `strategy.keep_releases` and never deleting `previous_version`.
 
 ### Dependencies
 - phase-engine-core-and-manifest-state/stage-path-model-and-target-layout
@@ -188,9 +190,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 3.4: Health Checks and Log Collection
 
 ### Implementation Steps
-- [ ] Implement `engine/health.go` for http/tcp/exec/none executed ON the target with `initial_delay`/`interval`/`timeout` budget; exhaustion -> `ERR_HEALTH_CHECK`.
-- [ ] Implement `internal/logs/collect.go`: glob-to-zip on target, download, unzip into `results/`, and `windows_event_logs` collected since operation start.
-- [ ] Implement TRX and JUnit counter parsing (namespace-insensitive; sum counters across multiple result files).
+- [x] Implement `engine/health.go` for http/tcp/exec/none executed ON the target with `initial_delay`/`interval`/`timeout` budget; exhaustion -> `ERR_HEALTH_CHECK`.
+- [x] Implement `internal/logs/collect.go`: glob-to-zip on target, download, unzip into `results/`, and `windows_event_logs` collected since operation start.
+- [x] Implement TRX and JUnit counter parsing (namespace-insensitive; sum counters across multiple result files).
 
 ### Dependencies
 - phase-engine-core-and-manifest-state/stage-path-model-and-target-layout
@@ -202,11 +204,11 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 3.5: Deploy State Machine and Rollback Matrix
 
 ### Implementation Steps
-- [ ] Define the `pattern.Pattern` seam interface and `ReleaseCtx` in `internal/pattern/pattern.go` (`Configure`/`Preflight`/`Stop`/`Start`/`Status`/`Uninstall`) plus the `pattern.For(type)` factory, so the engine orchestrates against a compile-safe interface before any concrete pattern lands (breaks the engine<->pattern cycle; concrete patterns follow in Phase 4).
-- [ ] Implement `engine/engine.go` `Deploy` orchestration emitting the exact named steps (VALIDATE..UNLOCK) via tflog with `app/host/step/version/duration_ms` fields, calling patterns through the `pattern.Pattern` seam.
-- [ ] Implement the idempotency short-circuit (DESIGN sec 10.1): current version + checksum + healthy status -> NO-OP with no fetch/restart.
-- [ ] Implement the single-target rollback matrix (DESIGN sec 10.2) for fresh vs update, and `ERR_ROLLBACK_FAILED` (sec 10.6) with detail starting `MACHINE IN UNKNOWN STATE host=<h>`.
-- [ ] Implement `Destroy` modes (purge/unregister/abandon) and `ReadStatus` reconciliation.
+- [x] Define the `pattern.Pattern` seam interface and `ReleaseCtx` in `internal/pattern/pattern.go` (`Configure`/`Preflight`/`Stop`/`Start`/`Status`/`Uninstall`) plus the `pattern.For(type)` factory, so the engine orchestrates against a compile-safe interface before any concrete pattern lands (breaks the engine<->pattern cycle; concrete patterns follow in Phase 4).
+- [x] Implement `engine/engine.go` `Deploy` orchestration emitting the exact named steps (VALIDATE..UNLOCK) via tflog with `app/host/step/version/duration_ms` fields, calling patterns through the `pattern.Pattern` seam.
+- [x] Implement the idempotency short-circuit (DESIGN sec 10.1): current version + checksum + healthy status -> NO-OP with no fetch/restart.
+- [x] Implement the single-target rollback matrix (DESIGN sec 10.2) for fresh vs update, and `ERR_ROLLBACK_FAILED` (sec 10.6) with detail starting `MACHINE IN UNKNOWN STATE host=<h>`.
+- [x] Implement `Destroy` modes (purge/unregister/abandon) and `ReadStatus` reconciliation.
 
 ### Dependencies
 - phase-engine-core-and-manifest-state/stage-locking-and-manifest-persistence
@@ -225,9 +227,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 4.1: Pattern Interface and Console App
 
 ### Implementation Steps
-- [ ] Implement the concrete `ConsoleApp` against the existing `pattern.Pattern` seam (interface defined in Stage 3.5; its methods are `Configure`/`Preflight`/`Stop`/`Start`/`Status`/`Uninstall` -- there is no `Validate` method, static validation lives in `internal/spec`).
-- [ ] `console_app` behavior: no service registration, `post_install` then `verify_command` in the current release dir, `service_status` reports `n/a` or drift; `Start`/`Stop` are no-ops.
-- [ ] Wire the pattern-specific preflight tool-check seam invoked by the engine after connect.
+- [x] Implement the concrete `ConsoleApp` against the existing `pattern.Pattern` seam (interface defined in Stage 3.5; its methods are `Configure`/`Preflight`/`Stop`/`Start`/`Status`/`Uninstall` -- there is no `Validate` method, static validation lives in `internal/spec`).
+- [x] `console_app` behavior: no service registration, `post_install` then `verify_command` in the current release dir, `service_status` reports `n/a` or drift; `Start`/`Stop` are no-ops.
+- [x] Wire the pattern-specific preflight tool-check seam invoked by the engine after connect.
 
 ### Dependencies
 - _none -- start stage_
@@ -239,10 +241,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 4.2: Windows Service Pattern
 
 ### Implementation Steps
-- [ ] Implement the `windows_service` S-steps: `sc.exe create`/`config` binPath, `start_type`, description, recovery actions, and non-builtin account with password via env-injected variable.
-- [ ] Implement stop with poll + `FORCE_KILL` (`taskkill /T /F`, exit 43 -> `ERR_SERVICE_STOP`) and start with poll + System event-log capture (exit 44 -> `ERR_SERVICE_START`).
-- [ ] Implement the HKLM `Environment` `REG_MULTI_SZ` writer (S5) using the full merged env map.
-- [ ] Implement the WinSW wrapper path: `.winsw.xml` generation and install/refresh (fallback uninstall+install).
+- [x] Implement the `windows_service` S-steps: `sc.exe create`/`config` binPath, `start_type`, description, recovery actions, and non-builtin account with password via env-injected variable.
+- [x] Implement stop with poll + `FORCE_KILL` (`taskkill /T /F`, exit 43 -> `ERR_SERVICE_STOP`) and start with poll + System event-log capture (exit 44 -> `ERR_SERVICE_START`).
+- [x] Implement the HKLM `Environment` `REG_MULTI_SZ` writer (S5) using the full merged env map.
+- [x] Implement the WinSW wrapper path: `.winsw.xml` generation and install/refresh (fallback uninstall+install).
 
 ### Dependencies
 - _none -- start stage_
@@ -254,9 +256,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 4.3: Node and Dotnet Service Patterns
 
 ### Implementation Steps
-- [ ] Implement `node_web_app`: `npm ci --omit=dev` preflight (requires package-lock; missing -> `ERR_SERVICE_INSTALL`) then WinSW wrapper with `node_exe`/`entry`/`PORT`.
-- [ ] Implement `dotnet_api`: `launcher=exe` vs `dotnet_dll` binPath, aspnet-runtime preflight (`dotnet --list-runtimes` contains `Microsoft.AspNetCore.App`), `hosting` native/winsw, and `ASPNETCORE_URLS`.
-- [ ] Add pattern preflight tool checks (`node --version`, `npm --version`, `dotnet --list-runtimes`).
+- [x] Implement `node_web_app`: `npm ci --omit=dev` preflight (requires package-lock; missing -> `ERR_SERVICE_INSTALL`) then WinSW wrapper with `node_exe`/`entry`/`PORT`.
+- [x] Implement `dotnet_api`: `launcher=exe` vs `dotnet_dll` binPath, aspnet-runtime preflight (`dotnet --list-runtimes` contains `Microsoft.AspNetCore.App`), `hosting` native/winsw, and `ASPNETCORE_URLS`.
+- [x] Add pattern preflight tool checks (`node --version`, `npm --version`, `dotnet --list-runtimes`).
 
 ### Dependencies
 - phase-single-target-deployment-patterns/stage-windows-service-pattern
@@ -273,9 +275,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 5.1: Provider and Deployment Resource Schema
 
 ### Implementation Steps
-- [ ] Implement `provider.go` with the optional `default_target` block and `Configure` passing defaults into resources.
-- [ ] Implement the `labdeploy_deployment` schema (arguments + computed attributes per DESIGN sec 5.2) with a `spec`/`spec_file` exactly-one-of validator.
-- [ ] Implement `spec_file` content hashing into the plan so file edits produce a diff.
+- [x] Implement `provider.go` with the optional `default_target` block and `Configure` passing defaults into resources.
+- [x] Implement the `labdeploy_deployment` schema (arguments + computed attributes per DESIGN sec 5.2) with a `spec`/`spec_file` exactly-one-of validator.
+- [x] Implement `spec_file` content hashing into the plan so file edits produce a diff.
 
 ### Dependencies
 - _none -- start stage_
@@ -287,10 +289,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 5.2: Deployment Resource CRUD and Plan Modifiers
 
 ### Implementation Steps
-- [ ] Implement `Create`/`Update`/`Delete` calling engine `Deploy`/`Destroy`, mapping every engine error to a diagnostic whose Summary is `[<CODE>] <short>`.
-- [ ] Implement the RequiresReplace plan modifier that parses old+new spec and compares the immutable paths from Stage 1.4.
-- [ ] Populate computed outputs (`id`, `deployed_version`, `previous_version`, `hosts`, `release_path`, `service_status`, `spec_hash`).
-- [ ] Implement the timeouts block (create/update 30m, delete 15m) and the import-unsupported error `import is not supported; adopt via apply`.
+- [x] Implement `Create`/`Update`/`Delete` calling engine `Deploy`/`Destroy`, mapping every engine error to a diagnostic whose Summary is `[<CODE>] <short>`.
+- [x] Implement the RequiresReplace plan modifier that parses old+new spec and compares the immutable paths from Stage 1.4.
+- [x] Populate computed outputs (`id`, `deployed_version`, `previous_version`, `hosts`, `release_path`, `service_status`, `spec_hash`).
+- [x] Implement the timeouts block (create/update 30m, delete 15m) and the import-unsupported error `import is not supported; adopt via apply`.
 
 ### Dependencies
 - phase-terraform-provider-surface/stage-provider-and-deployment-resource-schema
@@ -302,9 +304,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 5.3: Read Drift Reconciliation and Destroy Modes
 
 ### Implementation Steps
-- [ ] Implement `Read` refresh from the target manifest: absent -> `RemoveResource`; `last_operation.result==failed` -> `<version>!failed` marker forcing a converging plan; `service_status` from `pattern.Status`.
-- [ ] Implement `destroy_mode` purge/unregister/abandon in `Delete`.
-- [ ] Emit a once-per-apply WARN diag for insecure transport (`winrm.insecure_skip_verify=true` or `ssh.host_key=""`).
+- [x] Implement `Read` refresh from the target manifest: absent -> `RemoveResource`; `last_operation.result==failed` -> `<version>!failed` marker forcing a converging plan; `service_status` from `pattern.Status`.
+- [x] Implement `destroy_mode` purge/unregister/abandon in `Delete`.
+- [x] Emit a once-per-apply WARN diag for insecure transport (`winrm.insecure_skip_verify=true` or `ssh.host_key=""`).
 
 ### Dependencies
 - phase-terraform-provider-surface/stage-deployment-resource-crud-and-plan-modifiers
@@ -321,9 +323,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 6.1: Cluster Generic Service Pattern Scripts
 
 ### Implementation Steps
-- [ ] Implement cluster preflight: `Import-Module FailoverClusters`, `Get-ClusterNode` Up-set superset of spec hosts, and role/service binding conflict -> `ERR_SERVICE_INSTALL` naming both services.
-- [ ] Implement per-node `sc.exe create start=demand` plus role binding scripts (`Add-ClusterGenericServiceRole`, optional `-StaticAddress`).
-- [ ] Implement `Set-ClusterOwnerNode` / `Move-ClusterGroup` / `Start-ClusterGroup` / `Stop-ClusterGroup` script generation.
+- [x] Implement cluster preflight: `Import-Module FailoverClusters`, `Get-ClusterNode` Up-set superset of spec hosts, and role/service binding conflict -> `ERR_SERVICE_INSTALL` naming both services.
+- [x] Implement per-node `sc.exe create start=demand` plus role binding scripts (`Add-ClusterGenericServiceRole`, optional `-StaticAddress`).
+- [x] Implement `Set-ClusterOwnerNode` / `Move-ClusterGroup` / `Start-ClusterGroup` / `Stop-ClusterGroup` script generation.
 
 ### Dependencies
 - _none -- start stage_
@@ -335,10 +337,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 6.2: Cluster Rolling Update and Rollback Engine
 
 ### Implementation Steps
-- [ ] Implement `engine/cluster.go` all-or-nothing multi-node lock (hosts order, release reverse) and CREATE steps C1..C6.
-- [ ] Implement UPDATE steps U0..U8 rolling passive-first with exactly one `MOVE_GROUP` failover.
-- [ ] Implement cluster rollback R1..R5 with `ERR_CLUSTER_MOVE` / `ERR_ROLLBACK_FAILED`.
-- [ ] Implement cluster `Read` (owner node, role State lowercased) and destroy (`Stop-ClusterGroup` -> `Remove-ClusterGroup -RemoveResources -Force`).
+- [x] Implement `engine/cluster.go` all-or-nothing multi-node lock (hosts order, release reverse) and CREATE steps C1..C6.
+- [x] Implement UPDATE steps U0..U8 rolling passive-first with exactly one `MOVE_GROUP` failover.
+- [x] Implement cluster rollback R1..R5 with `ERR_CLUSTER_MOVE` / `ERR_ROLLBACK_FAILED`.
+- [x] Implement cluster `Read` (owner node, role State lowercased) and destroy (`Stop-ClusterGroup` -> `Remove-ClusterGroup -RemoveResources -Force`).
 
 ### Dependencies
 - phase-failover-cluster-support/stage-cluster-generic-service-pattern-scripts
@@ -355,9 +357,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 7.1: TestRun Spec and Result Parsing
 
 ### Implementation Steps
-- [ ] Implement `TestRun` validation (target `hosts==1`, `docker_image` forbidden, runner types `exec`/`vstest`/`dotnet_test`/`npm`).
-- [ ] Implement runner command expansion (`vstest.console.exe ... /Logger:trx`, `dotnet test --logger trx --no-build`, `npm`).
-- [ ] Implement pass-criteria evaluation (`exit_codes`, `min_pass_rate` over `total-skipped`) and the `summary.json` writer; `results.format: none` yields counters of -1.
+- [x] Implement `TestRun` validation (target `hosts==1`, `docker_image` forbidden, runner types `exec`/`vstest`/`dotnet_test`/`npm`).
+- [x] Implement runner command expansion (`vstest.console.exe ... /Logger:trx`, `dotnet test --logger trx --no-build`, `npm`).
+- [x] Implement pass-criteria evaluation (`exit_codes`, `min_pass_rate` over `total-skipped`) and the `summary.json` writer; `results.format: none` yields counters of -1.
 
 ### Dependencies
 - _none -- start stage_
@@ -369,15 +371,15 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 7.2: E2E Test Resource and Collection
 
 ### Implementation Steps
-- [ ] Implement the `labdeploy_e2e_test` schema (`spec`/`spec_file`, `deployment_id` edge, `triggers` RequiresReplace, `fail_on_test_failure`, computed outputs).
-- [ ] Implement `Create` running tests with process-tree kill on `runner.timeout_seconds` (`ERR_TIMEOUT`) and collection always before returning a test-failure error.
-- [ ] Implement results download/unzip into `destination_dir`, log + `windows_event_logs` collection since test start, and best-effort `Delete`.
+- [x] Implement the `labdeploy_e2e_test` schema (`spec`/`spec_file`, `deployment_id` edge, `triggers` RequiresReplace, `fail_on_test_failure`, computed outputs).
+- [x] Implement `Create` running tests with process-tree kill on `runner.timeout_seconds` (`ERR_TIMEOUT`) and collection always before returning a test-failure error.
+- [x] Implement results download/unzip into `destination_dir`, log + `windows_event_logs` collection since test start, and best-effort `Delete`.
 
 ### Dependencies
 - phase-e2e-test-resource-and-results/stage-testrun-spec-and-result-parsing
 
 ### Test Scenarios
-- [ ] Scenario: Collection before failure -- Given `fail_on_test_failure=true` and a failing run, When `Create` runs against a fake transport that serves the on-target results zip, Then the local `results_dir` (results + logs + `summary.json`) is fully populated on disk BEFORE `ERR_TEST_FAILED` is returned [proof: service:local-shell; deps: local-shell = the gate host's own filesystem (results_dir is a persisted local runner directory the provider writes and unzips into)]
+- [ ] Scenario: Collection before failure -- Given `fail_on_test_failure=true` and a failing run, When `Create` runs against a fake transport serving the on-target results zip, Then the resulting local `results_dir` tree (results + logs + `summary.json`) is byte-identical to a committed golden snapshot AND is fully written before `ERR_TEST_FAILED` is returned [proof: golden; deps: none -- committed expected results_dir snapshot under internal/engine/testdata; equality of the persisted output tree is the preservation proof]
 - [ ] Scenario: Timeout kills tree -- Given `runner.timeout_seconds` exceeded, When `Create` runs via a fake transport, Then it returns `ERR_TIMEOUT` and issues the process-tree kill script [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
 
 # Phase 8: Docker Examples and Packaging
@@ -388,9 +390,9 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 8.1: Docker Container Pattern
 
 ### Implementation Steps
-- [ ] Implement the `docker_container` pattern D1..D7: login, pull by tag or digest, `rm -f`, `run` with ports/env/volumes/restart policy.
-- [ ] Implement rollback to the recorded old image id on health failure, and `docker logout` when login ran.
-- [ ] Implement the docker preflight (`docker version` -> `ERR_PREFLIGHT`) and record the image id in `manifest.extra`.
+- [x] Implement the `docker_container` pattern D1..D7: login, pull by tag or digest, `rm -f`, `run` with ports/env/volumes/restart policy.
+- [x] Implement rollback to the recorded old image id on health failure, and `docker logout` when login ran.
+- [x] Implement the docker preflight (`docker version` -> `ERR_PREFLIGHT`) and record the image id in `manifest.extra`.
 
 ### Dependencies
 - _none -- start stage_
@@ -402,10 +404,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 8.2: Examples and Pipeline Templates
 
 ### Implementation Steps
-- [ ] Author `examples/main.tf` and `examples/specs/*.yaml` (one per pattern plus e2e).
-- [ ] Author `examples/pipelines/github-deploy.yml` (deploy/e2e/rollback jobs, `always()` artifact upload).
-- [ ] Author `examples/pipelines/azure-pipelines.yml` (Deploy/publish/Rollback stages with `condition: always()` publish).
-- [ ] Add the `~/.terraformrc` filesystem-mirror example and the `required_providers` snippet for `registry.local/smartpcr/labdeploy`.
+- [x] Author `examples/main.tf` and `examples/specs/*.yaml` (one per pattern plus e2e).
+- [x] Author `examples/pipelines/github-deploy.yml` (deploy/e2e/rollback jobs, `always()` artifact upload).
+- [x] Author `examples/pipelines/azure-pipelines.yml` (Deploy/publish/Rollback stages with `condition: always()` publish).
+- [x] Add the `~/.terraformrc` filesystem-mirror example and the `required_providers` snippet for `registry.local/smartpcr/labdeploy`.
 
 ### Dependencies
 - phase-docker-examples-and-packaging/stage-docker-container-pattern
