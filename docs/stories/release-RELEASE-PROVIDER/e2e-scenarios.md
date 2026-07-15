@@ -5,16 +5,20 @@ terraform-plugin-framework, plugin protocol v6).
 
 **Two ID namespaces (do not conflate):**
 - **Normative acceptance IDs** are drawn verbatim from the DESIGN section 18
-  matrix (`VAL-`, `CON-`, `ART-`, `CAP-`, `WSV-`, `NOD-`, `NET-`, `CLU-`, `RBK-`,
-  `DRF-`, `DST-`, `IDP-`, `LCK-`, `E2E-`, `PIP-`, plus the P1 `DKR-` docker
-  cases). Their test names MUST carry the same ID (e.g.
-  `TestAcc_WSV_03_FailStartRollback`), per `tech-spec.md:294`.
-- **Supplemental gate-proof IDs** (`HSH-`, `SRT-`, `ENC-`, `LCL-`, `ART_FETCH-`,
-  `NUG-`, `TPS-`, `PAT-`, `ENG-`, `LOG-`) are NOT DESIGN section 18 IDs. They name
-  the deterministic gate-host proofs that implement `architecture.md` section 6.1
-  pins T1-T9. They exist so the gate has coverage without a lab; they are marked
-  "supplemental (T#)" wherever they appear and are listed separately in the
-  Traceability table.
+  matrix (`VAL-01..09`, `CON-`, `ART-`, `CAP-`, `WSV-`, `NOD-`, `NET-`, `CLU-`,
+  `RBK-`, `DRF-`, `DST-`, `IDP-`, `LCK-`, `E2E-`, `PIP-`, plus the P1 `DKR-` docker
+  cases). The normative `VAL-` range is `VAL-01..09` (spec parse/validate, T1 per
+  `architecture.md:378`); nothing above `VAL-09` is a DESIGN section 18 ID. Their
+  test names MUST carry the same ID (e.g. `TestAcc_WSV_03_FailStartRollback`), per
+  `tech-spec.md:294`.
+- **Supplemental gate-proof IDs** (`HSH-`, `RRP-`, `SRT-`, `ENC-`, `LCL-`,
+  `ART_FETCH-`, `NUG-`, `TPS-`, `PAT-`, `ENG-`, `LOG-`) are NOT DESIGN section 18
+  IDs. They name the deterministic gate-host proofs that implement
+  `architecture.md` section 6.1 pins T1-T9 -- in particular `RRP-`/`SRT-` cover T9
+  (RequiresReplace on each immutable path + schema state round-trip), which the
+  DESIGN section 18 matrix does not enumerate. They exist so the gate has coverage
+  without a lab; they are marked "supplemental (T#)" wherever they appear and are
+  listed separately in the Traceability table.
 
 ## Proof-tier model (why phases are typed the way they are)
 
@@ -162,7 +166,7 @@ contacted; these run in Forge's gate on every change.
 
 **Feature: Provider schema, RequiresReplace, and canonical hashing (T2, T9)**
 
-  Scenario: VAL-10 Every immutable path forces replace (table-driven)
+  Scenario: RRP-01 Every immutable path forces replace (table-driven, T9)
     Given an applied deployment
     When I change, one at a time, each immutable path -- `pattern.type`,
     `pattern.*.service_name`, `pattern.*.role_name`, `pattern.install_root`,
@@ -171,7 +175,7 @@ contacted; these run in Forge's gate on every change.
     resource and proposes no in-place update (DESIGN section 5.2 immutable set;
     `implementation-plan.md:311`).
 
-  Scenario: VAL-11 Mutable spec change is an in-place update
+  Scenario: RRP-02 Mutable spec change is an in-place update (T9)
     Given an applied deployment
     When I change a mutable field (e.g. `artifact.version` / `environment`)
     Then the plan is an in-place Update (no replacement), confirming the plan
@@ -384,13 +388,15 @@ docker, so these run only on a Linux lab VM.
 - **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
   `[self-hosted, linux, forge-lab-hw]`. L1 Linux VM (Ubuntu 22.04) with sshd and
   docker preinstalled.
-- **Artifact source (HTTP, with injectable delay)**: the http zip source is
-  addressed by env-var name `LD_L1_ARTIFACT_URL`; the seeding script stands up a
-  tiny static file host on the L1 VM whose `/slow/*` route honors a
-  `LD_ARTIFACT_DELAY_MS` env var (a sleep before first byte). LCK-01 points apply
-  A at `${LD_L1_ARTIFACT_URL}/slow/sample-svc-1.0.0.zip` with
-  `LD_ARTIFACT_DELAY_MS=30000` to hold the `.lock` open deterministically while
-  apply B races; no wall-clock guesswork.
+- **Artifact source (HTTP, with injectable per-request delay)**: the http zip
+  source is addressed by env-var name `LD_L1_ARTIFACT_URL`; the seeding script
+  stands up a tiny static file host on the L1 VM whose `/slow/*` route reads a
+  `delay_ms` QUERY PARAMETER on each request and sleeps that long before the first
+  byte (per-request, so a long-running server started at bootstrap honors it
+  without any runner-process env change). LCK-01 points apply A at
+  `${LD_L1_ARTIFACT_URL}/slow/sample-svc-1.0.0.zip?delay_ms=30000` to hold the
+  `.lock` open deterministically while apply B races; no wall-clock guesswork and
+  no dependency on process-environment observation.
 - **Registry source**: the docker registry (ART-06, DKR-01..03) is addressed by
   env-var name only: `LD_REGISTRY` (registry host), `LD_REGISTRY_USER` (username),
   and `LD_REGISTRY_PASSWORD` (resolved via `auth.password_env`). The
@@ -450,8 +456,8 @@ docker, so these run only on a Linux lab VM.
 
   Scenario: LCK-01 Second concurrent apply fails fast
     Given apply A is mid-flight holding `.lock`, fetching
-    `${LD_L1_ARTIFACT_URL}/slow/sample-svc-1.0.0.zip` with
-    `LD_ARTIFACT_DELAY_MS=30000`
+    `${LD_L1_ARTIFACT_URL}/slow/sample-svc-1.0.0.zip?delay_ms=30000` (the server
+    sleeps 30s per request before the first byte)
     When apply B runs in parallel against the same target
     Then B fails in < 5s with `[ERR_LOCKED]` naming A's owner; A completes.
 
@@ -885,32 +891,47 @@ in-process (Phase 3, LOG-01); these scenarios add the live-target execution.
 
 Live acceptance pinned `lab` (`architecture.md` section 6.2 L4;
 `implementation-plan.md:484`). Covers DESIGN section 18.10 (PIP-01..03): the
-shipped reference pipelines in `examples/pipelines/` driving the provider end to
-end via GitHub Actions and Azure DevOps, including `always()` artifact publishing
-and the auto-rollback job/stage, against the W1 lab and filesystem-mirror
-provider distribution (DESIGN section 16.1).
+shipped reference pipelines in `examples/pipelines/github-deploy.yml` (workflow
+`name: deploy-lab`) and `examples/pipelines/azure-pipelines.yml` driving the
+provider end to end, including `always()` artifact publishing and the
+`if: failure()` / `condition: failed()` rollback job/stage, against the W1 lab
+and filesystem-mirror provider distribution (DESIGN section 16.1). Scenario
+inputs and secret names are taken verbatim from those two files.
 
 ### Setup
 - **Type**: lab-bare-metal
-- **Local**: not typically run locally; a developer can
-  `gh workflow run github-deploy.yml -f version=1.1.0` against a personal W1 and
-  self-hosted runner, or queue the ADO pipeline manually.
-- **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
-  `[self-hosted, windows, forge-lab-hw]` (same W1 class as Phase 5). The runner
-  lays the provider into its filesystem mirror per DESIGN section 16.1 before the
-  workflow runs.
-- **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
-  (ADO variable group `forge-lab-hw-vg`, mapped to
-  `env: LABDEPLOY_PASSWORD: $(LabPassword)`) **and** GitHub environment
-  `lab-windows` secret `LAB_PASSWORD` (mapped to `env: LABDEPLOY_PASSWORD`).
-  Target host from KeyVault `labdeploy-w1-host` / GitHub environment variable
-  `LD_W1_HOST`.
-- **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds
+- **Local**: not typically run locally. Because `github-deploy.yml` ships under
+  `examples/pipelines/` (NOT `.github/workflows/`), a developer first installs it
+  as a dispatchable workflow -- `pwsh tests/e2e/pipeline/install-workflow.ps1`
+  copies `examples/pipelines/github-deploy.yml` to
+  `.github/workflows/deploy-lab.yml` on a throwaway fixture branch -- then
+  `gh workflow run deploy-lab.yml -f version=1.1.0 -f checksum=sha256:<hex>`
+  (BOTH `version` and `checksum` are required inputs per
+  `github-deploy.yml:5-11`). The ADO pipeline is queued manually with the same
+  `version` + `checksum` parameters.
+- **CI runner**: ADO agent pool `LabAgents` (the pool named in
+  `azure-pipelines.yml:13`); GitHub self-hosted runner labels `[self-hosted, lab]`
+  (the labels in `github-deploy.yml:17`), same W1 class as Phase 5. The runner
+  lays the provider into its filesystem mirror via `make install`
+  (`github-deploy.yml:28`) before the workflow runs.
+- **Secrets**: Azure Key Vault `kv-forge-lab` entries `labdeploy-lab-password`
+  and `labdeploy-nuget-pat`, surfaced through the ADO variable group
+  `lab-secrets` (referenced at `azure-pipelines.yml:11`) as secret variables
+  `LABDEPLOY_PASSWORD` and `NUGET_PAT` **and** through the GitHub environment
+  `lab` with secrets `LABDEPLOY_PASSWORD` and `NUGET_PAT` (the exact names read at
+  `github-deploy.yml:21-22` / `azure-pipelines.yml:33-34`). Target host from
+  KeyVault `labdeploy-w1-host` / GitHub environment variable `LD_W1_HOST`. Rollback
+  inputs come from GitHub/ADO variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM`
+  (`github-deploy.yml:61-62`, `azure-pipelines.yml:61-62`).
+- **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-workflow.ps1` (copies
+  the example workflow into `.github/workflows/` on the fixture branch and seeds
+  repo variables `LAST_GOOD_VERSION=1.1.0` / `LAST_GOOD_CHECKSUM=sha256:<hex>` for
+  the rollback path) then `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds
   or downloads `terraform-provider-labdeploy_v<version>` and lays it into the
   `%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\...` mirror
   with the `~/.terraformrc` filesystem_mirror block; then reuses `verify-w1.ps1`.
-  This provisions the PROVIDER binary only; the target OS tooling is
-  pre-provisioned.
+  This provisions the PROVIDER binary and the dispatchable workflow only; the
+  target OS tooling is pre-provisioned.
 - **Gate provisioning**: n/a (lab). PIP scenarios skip when `LD_W1_HOST` / the
   self-hosted runner are unavailable (allowed for `lab-*`); provider binary
   behavior and spec substitution are proven in Phases 1-3.
@@ -920,23 +941,32 @@ provider distribution (DESIGN section 16.1).
 **Feature: reference pipeline integration**
 
   Scenario: PIP-01 GitHub deploy workflow publishes results
-    Given `github-deploy.yml` dispatched with `version=1.1.0`
+    Given `deploy-lab.yml` (installed from `github-deploy.yml`) dispatched with
+    `version=1.1.0` and `checksum=sha256:<good-hex>`
     When the workflow runs
-    Then it is green, the uploaded `e2e-results` artifact contains
-    trx + summary + logs, and the job summary echoes the `summary` output.
+    Then the `deploy` job is green and the `always()` step uploads the
+    `labdeploy-results-1.1.0` artifact containing trx + summary + logs from
+    `examples/labdeploy-results/**`.
 
   Scenario: PIP-02 GitHub deploy failure triggers auto-rollback
-    Given dispatch with `version=1.2.0-bad`, `auto_rollback=true`,
-    `rollback_to=1.1.0`
+    Given repo variables `LAST_GOOD_VERSION=1.1.0` /
+    `LAST_GOOD_CHECKSUM=sha256:<good-hex>` are set, dispatched with
+    `version=1.2.0-bad` and its `checksum`
     When the workflow runs
-    Then the deploy job fails with `[ERR_SERVICE_START]`, the rollback job runs
-    and ends green, and the final target serves `v=1.1.0`.
+    Then the `deploy` job fails with `[ERR_SERVICE_START]`, the `rollback` job
+    (`if: failure()`) applies `app_version=${{ vars.LAST_GOOD_VERSION }}` /
+    `app_checksum=${{ vars.LAST_GOOD_CHECKSUM }}` and ends green, and the target
+    serves `v=1.1.0`.
 
   Scenario: PIP-03 Azure DevOps pass case publishes to the Tests tab
-    Given a run of `azure-pipelines.yml` (pass case)
+    Given a run of `azure-pipelines.yml` (pass case) on pool `LabAgents` with
+    parameters `version` + `checksum`
     When the pipeline runs
-    Then the Tests tab shows 3 VSTest results and the pipeline artifact
-    `labdeploy-logs` is present.
+    Then the `Deploy` stage is green, `PublishTestResults@2` shows 3 VSTest
+    results in the Tests tab, and `PublishPipelineArtifact@1` publishes
+    `labdeploy-results-<version>`. (On a failing `version`, the `Rollback` stage
+    `condition: failed()` applies `$(LAST_GOOD_VERSION)` / `$(LAST_GOOD_CHECKSUM)`,
+    mirroring PIP-02's GitHub rollback contract.)
 
 ---
 
@@ -954,7 +984,7 @@ the authoritative contract.
 
 | Phase | Tier | Scenario IDs | Type | Proof pin |
 |---|---|---|---|---|
-| 1 Spec/Schema | gate | VAL-01..11, SRT-01 | inline | T1, T9 |
+| 1 Spec/Schema | gate | VAL-01..09 | inline | T1 |
 | 4 Linux + Docker | lab | CON-06, CAP-03, IDP-01, DRF-02, LCK-01..02, DST-02, ART-06, DKR-01..03 | lab-bare-metal | L2 |
 | 5 Windows single-target | lab | CON-01..03, CON-05, ART-01..05, CAP-01..02, WSV-01..08, NOD-01..03, NET-01..02, RBK-01..02, DRF-01/03, DST-01 | lab-bare-metal | L1 |
 | 6 Failover cluster | lab | CLU-01..08 | lab-wsfc | L3 |
@@ -965,7 +995,7 @@ the authoritative contract.
 
 | Phase | Supplemental IDs | Type | Proof pin |
 |---|---|---|---|
-| 1 Spec/Schema | HSH-01 | inline | T2 |
+| 1 Spec/Schema | HSH-01, RRP-01..02, SRT-01 | inline | T2, T9 |
 | 2 Transport/Artifact proofs | ENC-01..02, LCL-01, CON-04, ART_FETCH-01..02, NUG-01, TPS-01 | compose | T3, T4, T5 |
 | 3 Pattern/Engine/Logs proofs | PAT-01..03, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
 
@@ -988,10 +1018,20 @@ Notes:
 - CON-06 (live SSH dial + SFTP round-trip) is lab-tier (Phase 4) per
   `implementation-plan.md:126`; its in-process host-key-mismatch counterpart is
   the supplemental CON-04 (Phase 2). No live sshd runs in Forge's gate.
-- SRT-01 (provider-state round-trip, T9) and VAL-11 (mutable field in-place
-  update) are gate-runnable in Phase 1 alongside VAL-01..10; VAL-10 is
-  table-driven over the full immutable set (`architecture.md:386`,
-  `implementation-plan.md:311`).
+- SRT-01 (provider-state round-trip) and RRP-01/RRP-02 are supplemental T9
+  gate proofs, NOT DESIGN section 18 IDs: RRP-01 is table-driven over the full
+  immutable set (forces replacement) and RRP-02 proves a mutable change is an
+  in-place update (`architecture.md:386` T9; `implementation-plan.md:311`). They
+  are gate-runnable in Phase 1 alongside the normative VAL-01..09.
 - PAT-03 (docker_container run/rollback golden, `implementation-plan.md:421`) is
   the gate-tier script-generation proof for the docker engine; the live docker
   run/rollback legs are DKR-01..03 (Phase 4).
+- Phase 8 PIP-01..03 are anchored to the SHIPPED assets
+  `examples/pipelines/github-deploy.yml` and `azure-pipelines.yml`, which use
+  `version`+`checksum` inputs, `[self-hosted, lab]` / `LabAgents`, secrets
+  `LABDEPLOY_PASSWORD`+`NUGET_PAT`, `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM`
+  rollback variables, and artifact `labdeploy-results-<version>`. This DIVERGES
+  from the DESIGN section 18.10 matrix wording (`e2e-results`/`labdeploy-logs`
+  artifacts, `auto_rollback`/`rollback_to` inputs); the shipped files are
+  authoritative for execution, so the scenarios follow them. See Open Question
+  `pip-design-vs-assets` for reconciling the DESIGN matrix or the assets.
