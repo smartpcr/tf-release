@@ -9,7 +9,7 @@ This document fixes the **problem framing** for the story: what we are building
 and why, what is explicitly in and out of scope, the non-goals, the hard
 constraints that bound every design choice, and the risks that must be actively
 managed. Every claim here is anchored in the operator attachment
-`.forge-attachments/DESIGN.md` (cited as `DESIGN sec N`).
+`docs/DESIGN.md` (cited as `DESIGN sec N`).
 
 ---
 
