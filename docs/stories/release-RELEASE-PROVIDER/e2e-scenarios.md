@@ -932,9 +932,18 @@ ADO agent against W1").
   workflows on a repo's default branch, so the L4 registration lifecycle syncs it
   there (not to a feature branch). Its body is the shipped `github-deploy.yml` with
   one documented `environment: lab` binding per job added by the in-process Go
-  registration helper `pipeline.RegisterWorkflow`; PIP_REG-01 asserts that removing
-  those two `environment: lab` lines yields a byte-for-byte `sha256` match to the
-  shipped template, so PIP-01 can never run stale or otherwise-altered content. The
+  registration helper `RegisterWorkflow` in package `pipeline` at
+  `tests/e2e/pipeline/register_workflow.go` (owned by Stage 9.2's pipeline-acceptance
+  step, `implementation-plan.md:484`; the shipped templates it reads are authored at
+  Stage 8.2, `implementation-plan.md:428-429`,`:490`), with PIP_REG-01/PIP_REG-02 in
+  `tests/e2e/pipeline/register_workflow_test.go`. PIP_REG-01 (gate) asserts that
+  removing those two `environment: lab` lines from the generated body yields a
+  byte-for-byte `sha256` match to the shipped template. PIP_REG-02 (live, pre-dispatch)
+  fetches the ACTUAL `.github/workflows/labdeploy-e2e.yml` from the `LD_GH_LAB_REPO`
+  default branch via `FetchRemoteWorkflow` (`gh api` REST contents on the default
+  branch) and asserts it is byte-for-byte equal to the `RegisterWorkflow` output, so a
+  stale or drifted remote workflow FAILS the run instead of silently dispatching --
+  PIP-01/PIP-02 never run stale or otherwise-altered content. The
   ADO leg (PIP-03) runs an Azure DevOps pipeline definition pointed at
   `examples/pipelines/azure-pipelines.yml` on pool `LabAgents`. Both take
   `version`+`checksum` (`github-deploy.yml:5-11`, `azure-pipelines.yml:4-8`).
@@ -967,18 +976,20 @@ ADO agent against W1").
   with the `~/.terraformrc` filesystem_mirror block; then reuses `verify-w1.ps1`.
   The GitHub workflow registration (sync of the shipped template + `environment: lab`
   binding onto the `LD_GH_LAB_REPO` default branch) is an L4 lab-provisioning step,
-  performed by the lab out of band and gated by PIP_REG-01's in-process equality
-  proof; this suite writes nothing to the mainline worktree. `PIP_LINT-01` and
+  performed by the lab out of band; it is NOT trusted blindly -- PIP_REG-02 fetches the
+  remote workflow and byte-compares it against the `RegisterWorkflow` output as the
+  first live step, so a stale registration fails the run rather than relying on operator
+  vigilance. `PIP_LINT-01` and
   `PIP_REG-01` need no bootstrap (pure Go over the committed files). The L4 GitHub
   Actions runner and target OS tooling are pre-provisioned lab dependencies
   (`architecture.md:400`).
 - **Gate provisioning**: `PIP_LINT-01` and `PIP_REG-01` are the in-gate proofs --
   both are pure in-process Go over the committed `examples/pipelines/*.yml` (deps:
   none, no docker, no runner, no PowerShell; `implementation-plan.md:438`) and run in
-  Forge's gate every time. The live PIP-01..03 skip when the L4 lab (`LD_W1_HOST`,
-  `LD_GH_LAB_REPO`'s registered runner, or the ADO agent) is unavailable (allowed for
-  `lab-*`); provider binary behavior and spec substitution are additionally proven in
-  Phases 1-3.
+  Forge's gate every time. The live PIP_REG-02 and PIP-01..03 skip when the L4 lab
+  (`LD_W1_HOST`, `LD_GH_LAB_REPO`'s registered runner, or the ADO agent) is unavailable
+  (allowed for `lab-*`); provider binary behavior and spec substitution are additionally
+  proven in Phases 1-3.
 
 ### Scenarios
 
@@ -995,21 +1006,37 @@ ADO agent against W1").
 
   Scenario: PIP_REG-01 Registered workflow equals shipped template plus only the environment binding (gate)
     Given the committed `examples/pipelines/github-deploy.yml`
-    When the in-process Go helper `pipeline.RegisterWorkflow` reads it with
-    `os.ReadFile` and produces the registered workflow body (deps: none -- pure Go,
-    no PowerShell, no runner, no lab)
+    When the in-process Go helper `RegisterWorkflow` (package `pipeline`,
+    `tests/e2e/pipeline/register_workflow.go`; test in
+    `tests/e2e/pipeline/register_workflow_test.go`) reads it with `os.ReadFile` and
+    produces the registered workflow body (deps: none -- pure Go, no PowerShell, no
+    runner, no lab)
     Then the registered body contains an `environment: lab` binding on BOTH the
     `deploy` and `rollback` jobs, AND removing exactly those two `environment: lab`
     lines yields a byte-for-byte `sha256` match to the shipped template -- proving the
     ONLY delta is the documented environment binding (no step, input, or logic
     change). This runs in Forge's gate (pure Go over the committed file).
 
+  Scenario: PIP_REG-02 Remote registered workflow matches the generated body (live pre-dispatch)
+    Given the L4 lab is available and the workflow has been registered onto the
+    `LD_GH_LAB_REPO` default branch
+    When, as the FIRST live step before any `workflow_dispatch`, `FetchRemoteWorkflow`
+    (`tests/e2e/pipeline/register_workflow.go`) fetches the actual
+    `.github/workflows/labdeploy-e2e.yml` from the `LD_GH_LAB_REPO` default branch via
+    `gh api repos/{owner}/{repo}/contents/.github/workflows/labdeploy-e2e.yml`
+    Then its decoded bytes are byte-for-byte equal (`sha256`) to the `RegisterWorkflow`
+    output; if they differ the run FAILS here with `[ERR_STALE_WORKFLOW]` -- a stale or
+    hand-edited remote registration can never be dispatched, so PIP-01/PIP-02 execute
+    exactly the proven body without relying on operator vigilance. Skips only when the
+    L4 lab is unavailable (`lab-*`).
+
 **Feature: reference pipeline integration (live lab)**
 
   Scenario: PIP-01 GitHub deploy workflow publishes results
     Given `.github/workflows/labdeploy-e2e.yml` on the `LD_GH_LAB_REPO` default
     branch (shipped `github-deploy.yml` plus the `environment: lab` binding, proven
-    by PIP_REG-01), dispatched via `workflow_dispatch` on the L4 lab's real
+    by PIP_REG-01 and confirmed current on the remote by PIP_REG-02's pre-dispatch
+    fetch), dispatched via `workflow_dispatch` on the L4 lab's real
     `[self-hosted, lab]` GitHub Actions runner (`architecture.md:400`,
     `implementation-plan.md:494`) with GitHub environment `lab` secrets
     `LABDEPLOY_PASSWORD` / `NUGET_PAT` injected, `version=1.1.0`, and
@@ -1072,6 +1099,7 @@ the authoritative contract.
 | 3 Pattern/Engine/Logs proofs | PAT-01..03, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
 | 8 Pipeline contract (in-gate) | PIP_LINT-01 | lab-bare-metal (gate-runnable) | golden (`implementation-plan.md:438`) |
 | 8 Pipeline registration equality (in-gate) | PIP_REG-01 | lab-bare-metal (gate-runnable) | golden (in-process Go `sha256` diff) |
+| 8 Remote workflow currency (live pre-dispatch) | PIP_REG-02 | lab-bare-metal | lab (remote fetch `sha256` equality) |
 
 Notes:
 - CON-04 (host-key mismatch, in-process stub) and LCL-01 (local round-trip) are
@@ -1107,8 +1135,11 @@ Notes:
   GitHub legs execute `.github/workflows/labdeploy-e2e.yml` on the `LD_GH_LAB_REPO`
   default branch (required for `workflow_dispatch`); its body is the shipped template
   plus one documented `environment: lab` binding per job, produced by the in-process
-  Go helper `pipeline.RegisterWorkflow` and proven by PIP_REG-01 to differ from the
-  shipped file by nothing else. The ADO leg runs a pipeline definition pointed at the
+  Go helper `RegisterWorkflow` (package `pipeline`,
+  `tests/e2e/pipeline/register_workflow.go`; Stage 9.2, `implementation-plan.md:484`)
+  and proven by PIP_REG-01 to differ from the
+  shipped file by nothing else, with PIP_REG-02 fetching the remote copy pre-dispatch
+  to prove the running workflow is current. The ADO leg runs a pipeline definition pointed at the
   YAML path on pool `LabAgents`. They use
   `version`+`checksum` inputs, `[self-hosted, lab]` / `LabAgents`, and
   `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM` rollback variables. Secrets exercise BOTH
@@ -1121,11 +1152,21 @@ Notes:
   sibling, so the suite validates the shipped files as-built (see the resolved
   naming note under Phase 8); no operator pin is open.
 - PIP_REG-01 is a gate-tier proof (deps none, pure in-process Go): the
-  `pipeline.RegisterWorkflow` helper reads the shipped `github-deploy.yml` with
-  `os.ReadFile`, and the test asserts the registered body carries `environment: lab`
+  `RegisterWorkflow` helper (package `pipeline`,
+  `tests/e2e/pipeline/register_workflow.go`; test in
+  `tests/e2e/pipeline/register_workflow_test.go`) reads the shipped `github-deploy.yml`
+  with `os.ReadFile`, and the test asserts the registered body carries `environment: lab`
   on both jobs AND that stripping those two lines gives a byte-for-byte `sha256`
   match to the shipped template -- guaranteeing PIP-01/PIP-02 run the shipped content
   plus only the documented environment binding, with no PowerShell dependency.
+- PIP_REG-02 is the live pre-dispatch currency proof (deps: L4 lab): `FetchRemoteWorkflow`
+  (`tests/e2e/pipeline/register_workflow.go`) pulls the actual
+  `.github/workflows/labdeploy-e2e.yml` from the `LD_GH_LAB_REPO` default branch via
+  `gh api` and asserts byte-for-byte `sha256` equality with the `RegisterWorkflow`
+  output before any `workflow_dispatch`; a stale or hand-edited remote registration
+  fails with `[ERR_STALE_WORKFLOW]` instead of dispatching, so the remote workflow's
+  currency is machine-checked rather than assumed. Skips only when the lab is
+  unavailable (`lab-*`).
 - PIP_LINT-01 is the gate-tier structural proof authorized at
   `implementation-plan.md:438` (proof golden, deps none): it parses ONLY the two
   committed `examples/pipelines/*.yml` and asserts they are well-formed and contain
