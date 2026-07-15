@@ -47,7 +47,8 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 1.3: Spec Validation and Variable Substitution
 
 ### Implementation Steps
-- [x] Implement `internal/spec/validate.go` covering every DESIGN sec 6/sec 7 rule: envelope regex, target merge + required fields, artifact regex/checksum rules, pattern x os matrix (sec 14), and artifact x pattern matrix.
+- [x] Implement `internal/spec/validate.go` covering the DESIGN sec 6/sec 7 rules that are landed: envelope regex, target merge + required fields, artifact regex/checksum rules, pattern x os matrix (sec 14), artifact x pattern matrix, and `files[].path` required (validate.go lines 313-317).
+- [ ] Add the missing `files[].path` relative-path constraint (DESIGN.md line 323): `validate.go` lines 313-317 only reject an empty path; reject absolute paths and `..` traversal so a spec cannot write outside the release dir.
 - [x] Implement `${var:NAME}` substitution sourced only from the resource `variables` map, with `$${var:...}` escape and unresolved-token error `unresolved variable NAME at <json-path>`.
 - [x] Implement env-var NAME hygiene: specs carry env-var names only; a referenced-but-unset env var yields `ERR_SPEC_INVALID env var <NAME> ... is not set` before any dial.
 - [x] Emit every `ERR_SPEC_INVALID` with the offending JSON path, matching the VAL-01..VAL-09 message contracts.
@@ -65,7 +66,7 @@ storyId: "release:RELEASE-PROVIDER"
 - [x] Implement a canonical JSON emitter (sorted keys, no insignificant whitespace) over the substituted spec.
 - [x] Compute `spec_hash = sha256(canonical JSON)` after `${var}` substitution and `version_override` application.
 - [x] Apply `version_override` to `artifact.version` before hashing so the pipeline build number drives the release dir name.
-- [x] Provide the immutable-field extraction helper (pattern.type, service_name, role_name, install_root, metadata.name, hosts-set, os) consumed by the RequiresReplace plan modifier in Stage 5.2.
+- [x] The immutable-field set (pattern.type, service_name, role_name, install_root, metadata.name, hosts, os) is captured by `immutableKey` in `deployment_resource.go` lines 118-123 (implemented in the provider, not a separate `internal/spec` helper) and consumed by the RequiresReplace plan modifier in Stage 5.2.
 
 ### Dependencies
 - phase-project-scaffold-and-spec-engine/stage-spec-validation-and-variable-substitution
@@ -219,6 +220,7 @@ storyId: "release:RELEASE-PROVIDER"
 ### Test Scenarios
 - [ ] Scenario: Rollback matrix rows -- Given a fake transport scripting a failure at each DESIGN sec 10.2 step, When `Deploy` runs, Then the resulting state matches the matrix row (staging wiped / fresh cleaned / update restored to previous) (T7) [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
 - [ ] Scenario: Idempotent short-circuit -- Given a manifest whose version and checksum equal the spec and a healthy status, When `Deploy` runs, Then it returns NO-OP with no FETCH or SWITCH step logged [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
+- [ ] Scenario: Every step logged with fields -- Given a successful `Deploy` captured through a tflog test sink, When it completes, Then each fixed step VALIDATE/CONNECT/PREFLIGHT/LOCK/FETCH/CHECKSUM/STAGE/EXTRACT/RENDER/CONFIGURE/STOP/SWITCH/START/HEALTH/FINALIZE/PRUNE/UNLOCK emits exactly one log entry carrying `app`, `host`, `step`, `version`, and a numeric `duration_ms` field [proof: in-process; deps: none -- tflog test sink asserting structured fields]
 
 # Phase 4: Single Target Deployment Patterns
 
@@ -293,7 +295,8 @@ storyId: "release:RELEASE-PROVIDER"
 ### Implementation Steps
 - [x] `Create`/`Update`/`Delete` call engine `Deploy`/`Destroy` and surface warnings.
 - [ ] Fix diagnostic Summary contract: map every engine error to Summary `[<CODE>] <short>` (DESIGN sec 12). Current `Create` emits `diags.AddError("Deploy failed", ...)` (line ~196) and `Delete` emits `"Destroy failed"` -- neither carries the `[<CODE>]` prefix pipelines grep for.
-- [x] RequiresReplace plan modifier that parses old+new spec and compares the immutable paths from Stage 1.4.
+- [x] RequiresReplace plan modifier that parses old+new spec and compares the immutable paths via `immutableKey`.
+- [ ] Fix `immutableKey` (deployment_resource.go lines 118-123) to compare `target.hosts` as a SET (sort before join): it currently joins hosts in author order, so reordering hosts wrongly triggers replacement, contradicting architecture.md line 350 which requires set inequality.
 - [ ] Fix computed `id` to the authoritative formula `sha1(sorted(hosts)+"/"+name)[0:12] + ":" + name` (architecture line 78); `deploymentID` (lines 266-267) currently returns `name@hosts`, which is wrong and unstable across host order.
 - [ ] Populate remaining computed outputs verified against state: `deployed_version`, `previous_version`, `hosts`, `release_path`, `service_status`, `spec_hash` (present) plus the corrected `id` above.
 - [ ] Add the create/update (30m) and delete (15m) timeouts block: no `timeouts` schema or resource-timeout handling exists under `internal/provider`.
@@ -304,6 +307,10 @@ storyId: "release:RELEASE-PROVIDER"
 
 ### Test Scenarios
 - [ ] Scenario: RequiresReplace on immutable paths -- Given a plan changing `pattern.type` / `service_name` / `target.hosts` / `target.os`, When the plan is computed, Then each change triggers RequiresReplace (T9) [proof: in-process; deps: none -- terraform-plugin-framework plan unit test]
+- [ ] Scenario: Host reorder is not a replace -- Given a prior state with `target.hosts=[a,b]` and a new plan with `target.hosts=[b,a]` and no other change, When the plan is computed, Then `immutableKey` compares equal and RequiresReplace does NOT fire [proof: in-process; deps: none -- terraform-plugin-framework plan unit test]
+- [ ] Scenario: Coded diagnostic Summary -- Given an engine error mapped to code `ERR_DEPLOY_FAILED`, When `Create` surfaces it, Then the diagnostic Summary matches the `[<CODE>] <short>` shape (e.g. begins `[ERR_DEPLOY_FAILED] `) [proof: in-process; deps: none -- terraform-plugin-framework diagnostics unit test]
+- [ ] Scenario: Deterministic SHA-1 id -- Given a spec with `metadata.name=n` and `target.hosts=[b,a]`, When `id` is computed, Then it equals `sha1(sorted(hosts)+"/"+name)[0:12] + ":" + name` and is byte-identical when the same hosts are supplied in a different order [proof: in-process; deps: none -- pure id-formula unit test]
+- [ ] Scenario: Timeout defaults -- Given a resource config with no explicit timeouts, When the schema is read, Then create/update default to 30m and delete to 15m [proof: in-process; deps: none -- terraform-plugin-framework schema unit test]
 - [ ] Scenario: Import unsupported -- Given `terraform import` on `labdeploy_deployment`, When invoked, Then the error is `import is not supported; adopt via apply` [proof: in-process; deps: none -- terraform-plugin-framework schema unit test]
 
 ## Stage 5.3: Read Drift Reconciliation and Destroy Modes
@@ -320,6 +327,8 @@ storyId: "release:RELEASE-PROVIDER"
 ### Test Scenarios
 - [ ] Scenario: Read absent manifest removes resource -- Given a missing manifest, When `Read` runs via a fake transport, Then the resource is removed from state (next plan = create) [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
 - [ ] Scenario: Failed op marker forces plan change -- Given a manifest with `last_operation.result==failed`, When `Read` runs, Then `deployed_version` carries the `!failed` suffix and the next plan is non-empty [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
+- [ ] Scenario: Unreachable target is a loud Read error -- Given a fake transport that fails to dial, When `Read` runs, Then it returns a Read ERROR diagnostic (not a warning) AND leaves prior state intact (resource NOT removed) [proof: in-process; deps: none -- fake Transport whose dial returns an error]
+- [ ] Scenario: Exactly one insecure-transport warning -- Given a spec with `winrm.insecure_skip_verify=true` (and separately one with SSH `host_key=""`), When an apply runs, Then exactly one WARN diagnostic naming the insecure setting is emitted per apply [proof: in-process; deps: none -- terraform-plugin-framework diagnostics unit test]
 
 # Phase 6: Failover Cluster Support
 
@@ -388,6 +397,7 @@ storyId: "release:RELEASE-PROVIDER"
 ### Test Scenarios
 - [ ] Scenario: Collection before failure -- Given `fail_on_test_failure=true` and a failing run, When `Create` runs against a fake transport serving the on-target results zip, Then the resulting local `results_dir` tree (results + logs + `summary.json`) is byte-identical to a committed golden snapshot AND is fully written before `ERR_TEST_FAILED` is returned [proof: golden; deps: none -- committed expected results_dir snapshot under internal/engine/testdata; equality of the persisted output tree is the preservation proof]
 - [ ] Scenario: Timeout kills tree -- Given `runner.timeout_seconds` exceeded, When `Create` runs via a fake transport, Then it returns `ERR_TIMEOUT` and issues the process-tree kill script [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
+- [ ] Scenario: deployment_id creates a dependency edge -- Given an `labdeploy_e2e_test` whose `deployment_id` references a `labdeploy_deployment.id`, When the graph is built, Then the test node depends on the deployment node AND a change to `deployment_id` alone does NOT force replacement of the test resource [proof: in-process; deps: none -- terraform-plugin-framework plan/graph unit test]
 
 # Phase 8: Docker Examples and Packaging
 
