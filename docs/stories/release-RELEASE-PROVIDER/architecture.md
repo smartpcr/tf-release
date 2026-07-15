@@ -107,16 +107,25 @@ cluster_generic_service|docker_container`).
 
 `internal/engine/manifest.go` -> `Manifest` at `<root>/<app>/manifest.json`:
 
-| Field | Meaning |
-|---|---|
-| `current_version` | active release version (junction target) |
-| `previous_version` | prior release (`""` when none); rollback target |
-| `artifact_checksum` | `sha256:...` of current release (idempotency + downgrade cache) |
-| `pattern_type` | pattern that owns the unit |
-| `service_name` / `role_name` | registered SCM service / cluster group |
-| `install_root` / `release_path` | resolved paths |
-| `last_operation` (`LastOp`) | `{type, result: succeeded\|failed\|rolled_back, ts}` (drives sec 10.4 drift) |
-| `extra` | pattern scratch (e.g. docker image id for rollback) |
+Fields as defined by the `Manifest` struct in the scaffold:
+
+| Field (json) | Go field | Meaning |
+|---|---|---|
+| `schema` | `Schema int` | manifest schema version |
+| `app` | `App string` | app name (`metadata.name`) |
+| `pattern` | `Pattern string` | pattern that owns the unit |
+| `current_version` | `CurrentVersion string` | active release version (junction target) |
+| `previous_version` | `PreviousVersion string` | prior release (`""` when none); rollback target |
+| `current_release_path` | `CurrentRelease string` | resolved path of the current release dir |
+| `artifact_checksum` | `ArtifactChecksum string` | `sha256:...` of current release (idempotency + downgrade cache) |
+| `provider_version` | `ProviderVersion string` | provider that wrote the manifest |
+| `extra` | `Extra map[string]string` | pattern scratch (e.g. docker image id for rollback) |
+| `last_operation` | `LastOperation LastOp` | see below; drives sec 10.4 drift |
+
+`LastOp`: `type` (`deploy|destroy`), `result` (`success|failed|rolled_back`),
+`started`, `finished`. Note the scaffold does NOT persist service/role/
+install_root in the manifest; the pattern's registered unit is re-derived from
+`pattern` + spec at Read time, and paths from `install_root` in the spec.
 
 Each release dir also carries `.labdeploy-release.json` =
 `{version, sha256, extracted_at}` (local proof used by drift + downgrade cache).
@@ -203,13 +212,27 @@ stay in lockstep.
 ### 3.4 engine -> artifact / layout / logs
 
 ```go
-// internal/artifact
-Fetch(ctx, s spec.Artifact, secrets) (Fetched{LocalPath,Sha256,Size}, error) // runner_push
-TargetPullScript(s spec.Artifact) (script string, ok bool)                   // target_pull
+// internal/artifact (real signatures)
+func Fetch(ctx context.Context, a *spec.Artifact) (*Fetched, error) // runner_push; Fetched{LocalPath,Sha256,Size}
+func UseTargetPull(a *spec.Artifact) bool
+func TargetPullScriptWindows(a *spec.Artifact, stagingPkg string) (script string, env map[string]string, err error)
+func TargetPullScriptLinux(a *spec.Artifact, stagingPkg string) (script string, env map[string]string, err error)
+func ResolveURL(a *spec.Artifact) (string, error)   // http/nuget flat-container URL
+func AuthHeader(a *spec.Artifact) (name, value string)
 
-// internal/logs
-Collect(ctx, t, spec.Collect, destDir) (Summary, error) // TRX/JUnit parse + zip/download
+// internal/logs (real signatures)
+func CollectFiles(ctx context.Context, t transport.Transport, globs []string, destDir string) ([]string, []string)
+func CollectEventLogs(ctx context.Context, t transport.Transport, specs []spec.EventLogSpec, since time.Time, destDir string) ([]string, []string)
+func ParseTRX(path string) (Counters, error)
+func ParseJUnit(path string) (Counters, error)
+func SumResults(format string, baseDir string, patterns []string) (Counters, []string, error) // Counters{Total,Passed,Failed,Skipped}
 ```
+
+Secrets are resolved by the caller from the runner env (env-var-name
+indirection); `TargetPullScript*` returns the `env` map that the transport
+injects so tokens never hit the command line. The `logs` package exposes
+discrete collect + parse primitives (no single unified `Collect`); the engine's
+`RunTest` orchestrates them (sec 4.5).
 
 ### 3.5 engine internal contracts (`manifest.go`)
 
@@ -295,13 +318,14 @@ performs Start ONLY (no FETCH/SWITCH) and converges.
 ### 4.5 E2E test run (labdeploy_e2e_test, E2E-01/E2E-02)
 
 ```
-provider.Create -> engine.RunTestRun (testrun.go):
+provider.Create (e2e_test_resource.go) -> eng.RunTest(ctx, tr) (engine/testrun.go):
  CONNECT + LOCK-free test dir <install_root>/_tests/<name>/releases/<version>
  FETCH+EXTRACT test package -> run runner (exec|vstest|dotnet_test|npm), timeout
    -> ERR_TIMEOUT kills process tree
- ALWAYS: logs.Collect -> zip _results + globbed logs + event logs -> download
-   into results_dir; parse TRX/JUnit counters; write summary.json
- evaluate pass_criteria (exit_codes, min_pass_rate)
+ ALWAYS: logs.CollectFiles + logs.CollectEventLogs -> download _results + globbed
+   logs + event logs into results_dir; logs.SumResults parses TRX/JUnit counters;
+   writeSummaryJSON writes summary.json
+ evaluate pass_criteria (exit_codes, min_pass_rate) against the *TestOutcome
    fail & fail_on_test_failure -> ERR_TEST_FAILED **after** collection
 ```
 Collection happens before any test-failure error so pipelines publish via
@@ -353,7 +377,7 @@ provided DSN) | `lab` (physical/hardware lab only).
 | T1 | Spec parse/validate: YAML==JSON, every sec 6/sec 7 rule, `${var}` subst+escape+unresolved, pattern x os matrix, artifact x pattern (VAL-01..09) | `in-process` | Table-driven `go test ./internal/spec`; zero I/O. |
 | T2 | Canonical JSON + `spec_hash` stability across key order | `golden` | Committed canonical-JSON fixture; assert byte-identical hash. Honest choice: hash equality is a preservation proof. |
 | T3 | Transport encoding: EncodedCommand exact bytes, chunk math (0/1/48000/48001), single-quote env escaping (`O'Brien`) | `golden` | Committed expected-bytes fixtures; `go test ./internal/transport`. |
-| T4 | Local transport round-trip (Exec + Upload/Download) | `service:local-shell` | The gate's own OS shell (`powershell`/`sh`) via `transport: local`, os matches host. No external service, no docker. |
+| T4 | Local transport round-trip (Exec + Upload/Download) | `service:local-shell` | The gate's own OS shell (`powershell`/`sh`) via `transport: local`, gated on `runtime.GOOS` matching the pattern OS (see D-gate-1). No external service, no docker. |
 | T5 | Artifact fetch: sha stream verify, 404, header auth injected, nuget flat-container URL | `service:httptest` | Go `net/http/httptest` in-process ephemeral server (bundled stdlib, no extension). NOT inline: needs a live socket. |
 | T6 | Pattern script generation: S4 fresh vs update (5 patterns), winsw xml, cluster create/move/rollback scripts | `golden` | Committed `.golden` PowerShell/xml snapshots; `go test ./internal/pattern`. |
 | T7 | Engine state machine: every sec 10.2 rollback row, prune-keeps-previous, stale vs fresh lock, idempotent short-circuit | `in-process` | Fake `Transport` with a scripted `Result` queue (engine's `NewTransport` seam); zero I/O. |
@@ -384,8 +408,20 @@ endpoint, or cluster is ever claimed as `inline`.
 
 ---
 
-## 7. Open Questions
+## 7. Resolved Decisions (no open questions)
 
-See the JSON block after the Iteration Summary. Primary ambiguity: whether the
-gate should attempt any `transport: local` proof (T4) on the gate OS or treat ALL
-target interaction as `lab`.
+The iter-1 open question (gate `transport: local` proof vs treat all target I/O
+as lab) is now RESOLVED and pinned here so nothing blocks convergence:
+
+- **D-gate-1**: T4 (local transport round-trip) IS run on the gate host via
+  `transport: local`, gated on the runtime `runtime.GOOS` matching the pattern's
+  required OS. It needs no docker and no external service (only the host's own
+  `powershell`/`sh`), so it is honest gate coverage of the real `Exec` /
+  `Upload` / `Download` code path. When the gate OS cannot satisfy a pattern
+  (e.g. Linux gate, `windows_service`), that pattern's script generation is still
+  covered by the `golden` pins (T3/T6), and the live behavior falls to `lab`
+  (L1-L4). This mirrors the DESIGN D1 "runner==target via transport: local"
+  decision, so no operator input is required.
+
+All other ambiguities are settled by the DESIGN Decision Table (sec 21). This
+file emits no `open-questions` block.
