@@ -1,0 +1,30 @@
+apiVersion: labdeploy/v1
+kind: TestRun
+metadata:
+  name: sample-svc-e2e
+target:
+  transport: winrm
+  hosts: ["${var:HOST}"]
+  os: windows
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "${var:CHECKSUM}"
+  source: { type: http, url: "https://artifacts.contoso.lab/sample-svc-tests/latest/tests.zip" }
+runner:
+  type: vstest
+  assemblies: ["SampleSvc.E2E.dll"]
+  timeout_seconds: 1800
+  env:
+    E2E_BASE_URL: "http://localhost:8080"
+results:
+  format: trx
+  paths: ["TestResults/*.trx"]
+pass_criteria:
+  exit_codes: [0]
+  min_pass_rate: 1.0
+collect:
+  logs: ['C:\deploy\sample-svc\shared\logs\*.log']
+  windows_event_logs:
+    - { log: Application, provider: SampleSvc }
+  destination_dir: "labdeploy-results"

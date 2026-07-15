@@ -1,0 +1,71 @@
+# ---- Go ----
+# Build output
+/bin/
+dist/
+
+# Compiled Object files, Static and Dynamic libs
+*.o
+*.a
+*.so
+*.exe
+*.dll
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+profile.cov
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency vendor directory (uncomment if you do not vendor)
+# vendor/
+
+# ---- Terraform provider binaries ----
+# Locally built provider plugin (see Makefile BIN)
+terraform-provider-labdeploy
+terraform-provider-labdeploy_v*
+terraform-provider-*[!.]*
+
+# ---- Terraform ----
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude all .tfvars files, which are likely to contain sensitive data
+*.tfvars
+*.tfvars.json
+
+# Ignore override files as they are usually used to override resources locally
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ignore CLI configuration files
+.terraformrc
+terraform.rc
+
+# Ignore transient lock info files created by terraform apply
+.terraform.tfstate.lock.info
+
+# ---- IDE / editors ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db

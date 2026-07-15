@@ -1,0 +1,62 @@
+# Deploy + E2E from GitHub Actions on a self-hosted lab runner (DESIGN §16.2).
+name: deploy-lab
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Artifact version to deploy"
+        required: true
+      checksum:
+        description: "sha256:<hex> of the artifact"
+        required: true
+
+concurrency: lab-sample-svc   # one rollout at a time per app/lab
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, lab]   # runner must reach lab hosts + tf mirror
+    defaults: { run: { working-directory: examples } }
+    env:
+      # Secrets surface as ENV VARS; specs reference the NAMES only (D6).
+      LABDEPLOY_PASSWORD: ${{ secrets.LABDEPLOY_PASSWORD }}
+      NUGET_PAT:          ${{ secrets.NUGET_PAT }}
+      TF_IN_AUTOMATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install provider into local mirror
+        run: make -C .. install
+
+      - name: Terraform init/apply (deploy + e2e in one apply)
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false \
+            -var "app_version=${{ inputs.version }}" \
+            -var "app_checksum=${{ inputs.checksum }}"
+
+      - name: Upload test results + logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: labdeploy-results-${{ inputs.version }}
+          path: examples/labdeploy-results/**
+          if-no-files-found: warn
+
+  rollback:
+    needs: deploy
+    if: failure()
+    runs-on: [self-hosted, lab]
+    defaults: { run: { working-directory: examples } }
+    env:
+      LABDEPLOY_PASSWORD: ${{ secrets.LABDEPLOY_PASSWORD }}
+      NUGET_PAT:          ${{ secrets.NUGET_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Roll back to last known good
+        run: |
+          terraform init -input=false
+          # LAST_GOOD_* maintained by the release pipeline (e.g. repo/environment
+          # variables updated on every green deploy).
+          terraform apply -auto-approve -input=false \
+            -var "app_version=${{ vars.LAST_GOOD_VERSION }}" \
+            -var "app_checksum=${{ vars.LAST_GOOD_CHECKSUM }}"

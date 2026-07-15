@@ -1,0 +1,30 @@
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata:
+  name: sample-clu
+target:
+  transport: winrm
+  hosts: ["clu-n1.contoso.lab", "clu-n2.contoso.lab"]
+  os: windows
+artifact:
+  type: nupkg
+  version: 1.0.0
+  checksum: "${var:CHECKSUM}"
+  source:
+    type: nuget_feed
+    feed_url: "${var:FEED_URL}"
+    package_id: Contoso.SampleSvc
+pattern:
+  type: cluster_generic_service
+  service_name: SampleSvc
+  role_name: SampleSvcRole
+  exe: bin\SampleSvc.exe
+  preferred_owner: clu-n1.contoso.lab
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+strategy:
+  rollback_on_failure: true
+  cluster:
+    drain_timeout_seconds: 300
+    health_settle_seconds: 10

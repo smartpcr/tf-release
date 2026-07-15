@@ -1,0 +1,46 @@
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata:
+  name: sample-svc
+target:
+  transport: winrm
+  hosts: ["${var:HOST}"]
+  os: windows
+artifact:
+  type: nupkg
+  version: 1.0.0            # overridden by version_override
+  checksum: "${var:CHECKSUM}"
+  source:
+    type: nuget_feed
+    feed_url: "${var:FEED_URL}"
+    package_id: Contoso.SampleSvc
+    auth:
+      token_env: NUGET_PAT   # ADO PAT -> Basic pat:<token>
+pattern:
+  type: windows_service
+  service_name: SampleSvc
+  display_name: "Contoso Sample Service"
+  exe: bin\SampleSvc.exe
+  args: ["--config", "appsettings.json"]
+  start_type: auto
+  stop_timeout_seconds: 30
+environment:
+  SAMPLE_MODE: lab
+health_check:
+  type: http
+  http:
+    url: "http://localhost:8080/health"
+    expect_status: 200
+    expect_body_regex: '"v":"\d+\.\d+\.\d+"'
+  initial_delay_seconds: 5
+  interval_seconds: 5
+  timeout_seconds: 60
+strategy:
+  keep_releases: 3
+  rollback_on_failure: true
+logs:
+  paths:
+    - 'C:\deploy\sample-svc\shared\logs\*.log'
+  windows_event_logs:
+    - log: Application
+      provider: SampleSvc

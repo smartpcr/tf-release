@@ -1,0 +1,24 @@
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata:
+  name: sample-cli
+target:
+  transport: ssh
+  hosts: ["lab-lnx-01.contoso.lab"]
+  os: linux
+  credentials:
+    username: deploy
+    private_key_env: LABDEPLOY_SSH_KEY
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "${var:CHECKSUM}"
+  source:
+    type: http
+    url: "https://artifacts.contoso.lab/sample-cli/${var:VERSION}/sample-cli.zip"
+pattern:
+  type: console_app
+  exe: bin/sample-cli
+  verify_command: "./bin/sample-cli --version"
+health_check:
+  type: none

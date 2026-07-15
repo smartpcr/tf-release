@@ -1,0 +1,23 @@
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata:
+  name: sample-web
+target:
+  transport: winrm
+  hosts: ["${var:HOST}"]
+  os: windows
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "${var:CHECKSUM}"
+  source: { type: http, url: "${var:URL}" }
+pattern:
+  type: node_web_app
+  service_name: SampleWeb
+  entry: server.js
+  port: 3000
+  install_deps: true          # npm ci --omit=dev in release dir, pre-switch
+  winsw_exe: tools\winsw.exe  # ships inside the artifact (D2)
+health_check:
+  type: http
+  http: { url: "http://localhost:3000/health" }

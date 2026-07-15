@@ -1,0 +1,26 @@
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata:
+  name: sample-ctr
+target:
+  transport: ssh
+  hosts: ["lab-lnx-01.contoso.lab"]
+  os: linux
+  credentials: { username: deploy, private_key_env: LABDEPLOY_SSH_KEY }
+artifact:
+  type: docker_image
+  version: 1.0.0
+  source:
+    type: docker_registry
+    image: registry.contoso.lab/sample-svc
+    # tag defaults to artifact.version; pin digest for immutability:
+    # digest: "sha256:..."
+    auth: { username: deploy, password_env: REGISTRY_PASSWORD }
+pattern:
+  type: docker_container
+  container_name: sample-svc
+  ports: ["8080:8080"]
+  restart_policy: unless-stopped
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }

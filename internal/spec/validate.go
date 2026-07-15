@@ -1,0 +1,390 @@
+package spec
+
+import (
+	"fmt"
+	"os"
+	"regexp"
+)
+
+// ValidationError carries the ERR_SPEC_INVALID contract (DESIGN §12).
+type ValidationError struct{ Msg string }
+
+func (e *ValidationError) Error() string { return e.Msg }
+
+func vErr(format string, a ...interface{}) error {
+	return &ValidationError{Msg: fmt.Sprintf(format, a...)}
+}
+
+var (
+	reName     = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	reVersion  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+	reChecksum = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	reSvcName  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`)
+)
+
+// patternOS is the §14 support matrix.
+var patternOS = map[PatternType]map[OSKind]bool{
+	PatternConsoleApp:     {OSWindows: true, OSLinux: true},
+	PatternWindowsService: {OSWindows: true},
+	PatternNodeWebApp:     {OSWindows: true},
+	PatternDotnetAPI:      {OSWindows: true},
+	PatternClusterGeneric: {OSWindows: true},
+	PatternDockerCont:     {OSWindows: true, OSLinux: true},
+}
+
+func validateTarget(t *Target, isCluster bool) error {
+	switch t.Transport {
+	case TransportSSH, TransportWinRM, TransportLocal:
+	case "":
+		return vErr("target.transport: required (ssh|winrm|local)")
+	default:
+		return vErr("target.transport: %q not one of ssh|winrm|local", t.Transport)
+	}
+	switch t.OS {
+	case OSWindows, OSLinux:
+	default:
+		return vErr("target.os: required (windows|linux)")
+	}
+	n := len(t.Hosts)
+	if isCluster {
+		if n < 2 || n > 16 {
+			return vErr("target.hosts: cluster_generic_service needs 2..16 hosts, got %d", n)
+		}
+	} else if n != 1 {
+		return vErr("target.hosts: need exactly 1 host, got %d", n)
+	}
+	if t.Transport == TransportLocal && (n != 1 || t.Hosts[0] != "localhost") {
+		return vErr(`target.hosts: transport local requires exactly ["localhost"]`)
+	}
+	if t.Port < 0 || t.Port > 65535 {
+		return vErr("target.port: out of range")
+	}
+	if t.Transport != TransportLocal {
+		if t.Credentials.Username == "" {
+			return vErr("target.credentials.username: required for %s", t.Transport)
+		}
+		if t.Transport == TransportWinRM && t.Credentials.PasswordEnv == "" {
+			return vErr("target.credentials.password_env: required for winrm")
+		}
+		if t.Transport == TransportSSH &&
+			t.Credentials.PasswordEnv == "" && t.Credentials.PrivateKeyEnv == "" {
+			return vErr("target.credentials: one of password_env|private_key_env required for ssh")
+		}
+	}
+	// env var NAMES must resolve on the runner (VAL-08 fires here, pre-dial).
+	for _, name := range []string{t.Credentials.PasswordEnv, t.Credentials.PrivateKeyEnv} {
+		if name != "" {
+			if _, ok := os.LookupEnv(name); !ok {
+				return vErr("env var %s referenced by target.credentials is not set", name)
+			}
+		}
+	}
+	return nil
+}
+
+func validateArtifact(a *Artifact, p PatternType) error {
+	switch a.Type {
+	case ArtifactZip, ArtifactNupkg, ArtifactDocker:
+	default:
+		return vErr("artifact.type: %q not one of zip|nupkg|docker_image", a.Type)
+	}
+	if !reVersion.MatchString(a.Version) {
+		return vErr("artifact.version: required, must match %s", reVersion.String())
+	}
+	// artifact × pattern (DESIGN §14)
+	if a.Type == ArtifactDocker && p != PatternDockerCont {
+		return vErr("artifact.type docker_image only valid with pattern docker_container")
+	}
+	if a.Type != ArtifactDocker && p == PatternDockerCont {
+		return vErr("pattern docker_container requires artifact.type docker_image")
+	}
+	if a.Type != ArtifactDocker {
+		if !reChecksum.MatchString(a.Checksum) {
+			return vErr(`artifact.checksum: required, format "sha256:<64 hex>"`)
+		}
+	} else if a.Checksum != "" {
+		return vErr("artifact.checksum: forbidden for docker_image (use source.digest)")
+	}
+	switch a.FetchMode {
+	case "", "target_pull", "runner_push":
+	default:
+		return vErr("artifact.fetch_mode: %q not one of target_pull|runner_push", a.FetchMode)
+	}
+	s := &a.Source
+	switch s.Type {
+	case "http":
+		if s.URL == "" {
+			return vErr("artifact.source.url: required for http")
+		}
+	case "file":
+		if s.Path == "" {
+			return vErr("artifact.source.path: required for file")
+		}
+		if a.FetchMode == "target_pull" {
+			return vErr("artifact.fetch_mode: target_pull invalid with file source")
+		}
+	case "nuget_feed":
+		if s.FeedURL == "" || s.PackageID == "" {
+			return vErr("artifact.source: feed_url and package_id required for nuget_feed")
+		}
+	case "docker_registry":
+		if a.Type != ArtifactDocker {
+			return vErr("artifact.source.type docker_registry requires artifact.type docker_image")
+		}
+		if s.Image == "" {
+			return vErr("artifact.source.image: required for docker_registry")
+		}
+	default:
+		return vErr("artifact.source.type: %q not one of http|file|nuget_feed|docker_registry", s.Type)
+	}
+	for _, name := range []string{s.Auth.TokenEnv, s.Auth.PasswordEnv} {
+		if name != "" {
+			if _, ok := os.LookupEnv(name); !ok {
+				return vErr("env var %s referenced by artifact.source.auth is not set", name)
+			}
+		}
+	}
+	return nil
+}
+
+func validatePattern(p *Pattern, os OSKind) error {
+	sup, ok := patternOS[p.Type]
+	if !ok {
+		return vErr("pattern.type: %q unknown", p.Type)
+	}
+	if !sup[os] {
+		return vErr("pattern.type %s not supported on os %s (see support matrix)", p.Type, os)
+	}
+	needSvc := func() error {
+		if !reSvcName.MatchString(p.ServiceName) {
+			return vErr("pattern.service_name: required, must match %s", reSvcName.String())
+		}
+		switch p.StartType {
+		case "", "auto", "manual", "delayed":
+		default:
+			return vErr("pattern.start_type: %q not one of auto|manual|delayed", p.StartType)
+		}
+		if p.Account.Username != "" && p.Account.Username != "LocalSystem" &&
+			p.Account.Username != `NT AUTHORITY\NetworkService` &&
+			p.Account.Username != `NT AUTHORITY\LocalService` &&
+			p.Account.PasswordEnv == "" {
+			return vErr("pattern.account.password_env: required for account %q", p.Account.Username)
+		}
+		return nil
+	}
+	switch p.Type {
+	case PatternConsoleApp:
+		if p.Exe == "" {
+			return vErr("pattern.exe: required for console_app")
+		}
+	case PatternWindowsService:
+		if err := needSvc(); err != nil {
+			return err
+		}
+		if p.Exe == "" {
+			return vErr("pattern.exe: required for windows_service")
+		}
+		switch p.Wrapper {
+		case "", "none":
+		case "winsw":
+			if p.WinswExe == "" {
+				return vErr("pattern.winsw_exe: required when wrapper=winsw (D2: wrapper ships inside artifact)")
+			}
+		default:
+			return vErr("pattern.wrapper: %q not one of none|winsw", p.Wrapper)
+		}
+	case PatternNodeWebApp:
+		if err := needSvc(); err != nil {
+			return err
+		}
+		if p.Entry == "" {
+			return vErr("pattern.entry: required for node_web_app")
+		}
+		if p.Port <= 0 || p.Port > 65535 {
+			return vErr("pattern.port: required (1..65535) for node_web_app")
+		}
+		if p.WinswExe == "" {
+			return vErr("pattern.winsw_exe: required for node_web_app (D2)")
+		}
+	case PatternDotnetAPI:
+		if err := needSvc(); err != nil {
+			return err
+		}
+		switch p.Launcher {
+		case "", "exe":
+			if p.Exe == "" {
+				return vErr("pattern.exe: required when launcher=exe")
+			}
+		case "dotnet_dll":
+			if p.DLL == "" {
+				return vErr("pattern.dll: required when launcher=dotnet_dll")
+			}
+		default:
+			return vErr("pattern.launcher: %q not one of exe|dotnet_dll", p.Launcher)
+		}
+		switch p.Hosting {
+		case "", "windows_service_native":
+		case "winsw":
+			if p.WinswExe == "" {
+				return vErr("pattern.winsw_exe: required when hosting=winsw")
+			}
+		default:
+			return vErr("pattern.hosting: %q not one of windows_service_native|winsw", p.Hosting)
+		}
+	case PatternClusterGeneric:
+		if err := needSvc(); err != nil {
+			return err
+		}
+		if p.RoleName == "" {
+			return vErr("pattern.role_name: required for cluster_generic_service")
+		}
+		if p.Exe == "" {
+			return vErr("pattern.exe: required for cluster_generic_service")
+		}
+		if p.Wrapper != "" && p.Wrapper != "none" {
+			return vErr("pattern.wrapper: not supported for cluster_generic_service (D5b)")
+		}
+	case PatternDockerCont:
+		if p.ContainerName == "" {
+			return vErr("pattern.container_name: required for docker_container")
+		}
+	}
+	return nil
+}
+
+func validateHealth(h *HealthCheck) error {
+	switch h.EffectiveType() {
+	case "none":
+	case "http":
+		if h.HTTP.URL == "" {
+			return vErr("health_check.http.url: required")
+		}
+	case "tcp":
+		if h.TCP.Port <= 0 || h.TCP.Port > 65535 {
+			return vErr("health_check.tcp.port: required (1..65535)")
+		}
+	case "exec":
+		if h.Exec.Command == "" {
+			return vErr("health_check.exec.command: required")
+		}
+	default:
+		return vErr("health_check.type: %q not one of http|tcp|exec|none", h.Type)
+	}
+	return nil
+}
+
+// ValidateDeployment enforces DESIGN §6 exhaustively.
+func ValidateDeployment(d *Deployment) error {
+	if d.APIVersion != "labdeploy/v1" {
+		return vErr(`apiVersion: expected "labdeploy/v1", got %q`, d.APIVersion)
+	}
+	if d.Kind != "Deployment" {
+		return vErr(`kind: expected "Deployment", got %q`, d.Kind)
+	}
+	if !reName.MatchString(d.Metadata.Name) {
+		return vErr("metadata.name: required, must match %s", reName.String())
+	}
+	if err := validateTarget(&d.Target, d.Pattern.Type == PatternClusterGeneric); err != nil {
+		return err
+	}
+	if err := validatePattern(&d.Pattern, d.Target.OS); err != nil {
+		return err
+	}
+	if err := validateArtifact(&d.Artifact, d.Pattern.Type); err != nil {
+		return err
+	}
+	if err := validateHealth(&d.HealthCheck); err != nil {
+		return err
+	}
+	if d.Strategy.KeepReleases != nil && *d.Strategy.KeepReleases < 1 {
+		return vErr("strategy.keep_releases: must be >= 1")
+	}
+	if d.Pattern.PreferredOwner != "" {
+		found := false
+		for _, h := range d.Target.Hosts {
+			if equalsFold(h, d.Pattern.PreferredOwner) {
+				found = true
+			}
+		}
+		if !found {
+			return vErr("pattern.preferred_owner: %q not in target.hosts", d.Pattern.PreferredOwner)
+		}
+	}
+	for i, f := range d.Files {
+		if f.Path == "" {
+			return vErr("files[%d].path: required", i)
+		}
+	}
+	if d.Pattern.Account.PasswordEnv != "" {
+		if _, ok := os.LookupEnv(d.Pattern.Account.PasswordEnv); !ok {
+			return vErr("env var %s referenced by pattern.account is not set", d.Pattern.Account.PasswordEnv)
+		}
+	}
+	return nil
+}
+
+// ValidateTestRun enforces DESIGN §7.
+func ValidateTestRun(t *TestRun) error {
+	if t.APIVersion != "labdeploy/v1" {
+		return vErr(`apiVersion: expected "labdeploy/v1", got %q`, t.APIVersion)
+	}
+	if t.Kind != "TestRun" {
+		return vErr(`kind: expected "TestRun", got %q`, t.Kind)
+	}
+	if !reName.MatchString(t.Metadata.Name) {
+		return vErr("metadata.name: required, must match %s", reName.String())
+	}
+	if err := validateTarget(&t.Target, false); err != nil {
+		return err
+	}
+	if t.Artifact.Type == ArtifactDocker {
+		return vErr("artifact.type: docker_image not allowed in TestRun (v1)")
+	}
+	// TestRun artifact reuses deployment rules minus pattern coupling.
+	if err := validateArtifact(&t.Artifact, PatternConsoleApp); err != nil {
+		return err
+	}
+	switch t.Runner.Type {
+	case "exec":
+		if t.Runner.Command == "" {
+			return vErr("runner.command: required for runner.type exec")
+		}
+	case "vstest", "dotnet_test", "npm":
+	default:
+		return vErr("runner.type: %q not one of exec|vstest|dotnet_test|npm", t.Runner.Type)
+	}
+	switch t.Results.Format {
+	case "", "none":
+	case "trx", "junit":
+		if len(t.Results.Paths) == 0 {
+			return vErr("results.paths: required when results.format=%s", t.Results.Format)
+		}
+	default:
+		return vErr("results.format: %q not one of trx|junit|none", t.Results.Format)
+	}
+	if t.PassCriteria.MinPassRate != nil {
+		if r := *t.PassCriteria.MinPassRate; r < 0 || r > 1 {
+			return vErr("pass_criteria.min_pass_rate: must be within [0,1]")
+		}
+	}
+	return nil
+}
+
+func equalsFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 32
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 32
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}

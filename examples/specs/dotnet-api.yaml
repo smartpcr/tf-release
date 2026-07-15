@@ -1,0 +1,23 @@
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata:
+  name: sample-api
+target:
+  transport: winrm
+  hosts: ["${var:HOST}"]
+  os: windows
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "${var:CHECKSUM}"
+  source: { type: http, url: "${var:URL}" }
+pattern:
+  type: dotnet_api
+  service_name: SampleApi
+  launcher: dotnet_dll
+  dll: SampleApi.dll
+  urls: "http://localhost:5000"
+  hosting: windows_service_native
+health_check:
+  type: http
+  http: { url: "http://localhost:5000/health" }

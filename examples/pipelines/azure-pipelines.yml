@@ -1,0 +1,67 @@
+# ADO equivalent (DESIGN §16.3): deploy stage + rollback stage on failure.
+trigger: none
+
+parameters:
+  - name: version
+    type: string
+  - name: checksum
+    type: string
+
+variables:
+  - group: lab-secrets   # LABDEPLOY_PASSWORD, NUGET_PAT (secret vars)
+
+pool: { name: LabAgents }   # self-hosted pool with lab connectivity
+
+stages:
+  - stage: Deploy
+    jobs:
+      - job: apply
+        workspace: { clean: outputs }
+        steps:
+          - checkout: self
+          - script: make install
+            displayName: Install provider into local mirror
+          - script: |
+              terraform init -input=false
+              terraform apply -auto-approve -input=false \
+                -var "app_version=${{ parameters.version }}" \
+                -var "app_checksum=${{ parameters.checksum }}"
+            workingDirectory: examples
+            displayName: terraform apply (deploy + e2e)
+            env:
+              # map secrets to env — specs reference env var NAMES only (D6)
+              LABDEPLOY_PASSWORD: $(LABDEPLOY_PASSWORD)
+              NUGET_PAT: $(NUGET_PAT)
+          - task: PublishTestResults@2
+            displayName: Publish TRX
+            condition: always()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: "examples/labdeploy-results/results/**/*.trx"
+              failTaskOnFailedTests: false   # terraform already gated
+          - task: PublishPipelineArtifact@1
+            displayName: Publish logs + results
+            condition: always()
+            inputs:
+              targetPath: examples/labdeploy-results
+              artifact: labdeploy-results-${{ parameters.version }}
+
+  - stage: Rollback
+    dependsOn: Deploy
+    condition: failed()
+    jobs:
+      - job: rollback
+        steps:
+          - checkout: self
+          - script: make install
+            displayName: Install provider
+          - script: |
+              terraform init -input=false
+              terraform apply -auto-approve -input=false \
+                -var "app_version=$(LAST_GOOD_VERSION)" \
+                -var "app_checksum=$(LAST_GOOD_CHECKSUM)"
+            workingDirectory: examples
+            displayName: Roll back to last known good
+            env:
+              LABDEPLOY_PASSWORD: $(LABDEPLOY_PASSWORD)
+              NUGET_PAT: $(NUGET_PAT)
