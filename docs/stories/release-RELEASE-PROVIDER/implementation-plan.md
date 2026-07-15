@@ -10,20 +10,22 @@ storyId: "release:RELEASE-PROVIDER"
 
 ## Stage 1.1: Repository Bootstrap and Toolchain
 
+> Baseline note: this scaffold already exists in the worktree (module `github.com/smartpcr/terraform-provider-labdeploy`, `main.go`, `Makefile`, and the `internal/{provider,spec,transport,artifact,pattern,engine,logs,layout}` package tree with initial implementations). The boxes below are checked to reflect that landed baseline; later phases harden, test, and complete each module.
+
 ### Implementation Steps
-- [ ] Initialize the Go module `terraform-provider-labdeploy` (`go.mod`, Go >= 1.22, no cgo) and `main.go` wiring `providerserver.Serve` with plugin protocol v6 at address `registry.local/smartpcr/labdeploy`.
-- [ ] Add the empty package skeleton under `internal/{provider,spec,transport,artifact,pattern,engine,logs,layout}` with package doc-comment stubs so later stages can land in isolation.
-- [ ] Pin dependencies in `go.mod`: terraform-plugin-framework v1.x, terraform-plugin-log, masterzen/winrm, golang.org/x/crypto, pkg/sftp, gopkg.in/yaml.v3; run `go mod tidy`.
-- [ ] Add a `Makefile` with `build`, `test`, `lint` targets and a `.golangci.yml` config matching DESIGN sec 20 (`golangci-lint run` clean).
-- [ ] Add a CI workflow that runs `make build test lint` on the gate host.
+- [x] Go module `github.com/smartpcr/terraform-provider-labdeploy` (`go.mod`, Go 1.22, no cgo) with `main.go` wiring `providerserver.Serve` at plugin protocol v6 for address `registry.local/smartpcr/labdeploy`.
+- [x] Package tree under `internal/{provider,spec,transport,artifact,pattern,engine,logs,layout}` created with initial sources so later stages land in isolation.
+- [x] Dependencies pinned in `go.mod`: terraform-plugin-framework v1.11.0, terraform-plugin-log v0.9.0, masterzen/winrm, golang.org/x/crypto, pkg/sftp, gopkg.in/yaml.v3 (`go mod tidy` clean).
+- [x] `Makefile` with `build`/`test`/`lint` targets present; keep it aligned with DESIGN sec 20 (`golangci-lint run` clean).
+- [ ] Add a CI workflow that runs `make build test lint` on the gate host (the one Stage 1.1 item not yet in the worktree).
 
 ### Dependencies
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Module builds -- Given the scaffolded repo, When `make build` runs, Then binary `terraform-provider-labdeploy_v0.1.0` is produced with `CGO_ENABLED=0` [proof: in-process; deps: none]
-- [ ] Scenario: Lint clean -- Given the skeleton, When `golangci-lint run` runs, Then it exits 0 with no findings [proof: in-process; deps: none]
-- [ ] Scenario: Provider advertises protocol v6 -- Given `main.go`, When the provider server starts under the terraform-plugin-testing harness, Then it advertises plugin protocol v6 and address `registry.local/smartpcr/labdeploy` [proof: in-process; deps: none]
+- [ ] Scenario: Module builds -- Given the existing repo, When `make build` runs on the gate host, Then binary `terraform-provider-labdeploy_v0.1.0` is produced with `CGO_ENABLED=0` [proof: service:go-toolchain; deps: go-toolchain = the gate host's own Go compiler + make (build tool + emitted binary, not pure logic)]
+- [ ] Scenario: Lint clean -- Given the repo, When `golangci-lint run` runs on the gate host, Then it exits 0 with no findings [proof: service:go-toolchain; deps: go-toolchain = the gate host's golangci-lint binary (external tool invocation)]
+- [ ] Scenario: Provider advertises protocol v6 -- Given `main.go`, When the provider is served under the terraform-plugin-testing harness, Then it advertises plugin protocol v6 and address `registry.local/smartpcr/labdeploy` [proof: service:tf-plugin-server; deps: tf-plugin-server = the in-process terraform-plugin-testing gRPC provider server (bundled, no external target)]
 
 ## Stage 1.2: Spec Types and YAML JSON Parsing
 
@@ -117,7 +119,7 @@ storyId: "release:RELEASE-PROVIDER"
 - phase-transport-and-artifact-acquisition/stage-transport-interface-and-local-execution
 
 ### Test Scenarios
-- [ ] Scenario: SSH shell round-trip on gate -- Given the gate host `sh` reached through the transport seam, When `Exec`/`Upload`/`Download` run, Then data round-trips and auth rejection is not retried (real ssh dialing validated in lab L1) [proof: service:local-shell; deps: local-shell = the gate host's own sh, gated on runtime.GOOS per architecture D-gate-1]
+- [ ] Scenario: SSH dial and SFTP round-trip -- Given a real SSH endpoint, When `Connect`/`Exec`/`Upload`/`Download` run over the ssh transport, Then data round-trips and auth rejection is not retried; a local shell cannot exercise ssh/sftp, so this belongs to lab acceptance [proof: lab; deps: L1 Linux VM with sshd per architecture L1 (live SSH is never local-shell)]
 - [ ] Scenario: Host key mismatch mapping -- Given a pinned wrong `ssh.host_key`, When `Connect` runs against a stub key, Then the error is `ERR_CONNECT` with detail `host key mismatch` [proof: in-process; deps: none]
 
 ## Stage 2.4: Artifact Fetch and Target Pull
@@ -157,7 +159,7 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 3.2: Locking and Manifest Persistence
 
 ### Implementation Steps
-- [ ] Implement `engine/lock.go` acquire (`[IO.File]::Open CreateNew` / `set -C`) returning exit 48 -> `ERR_LOCKED`; age >= `lock_timeout_seconds` overwrites with WARN; release runs in defer on all post-LOCK error paths.
+- [ ] Implement `AcquireLock`/`ReleaseLock` in `internal/engine/manifest.go` (per architecture sec 3.5, lock ownership lives in `manifest.go`, not a separate `lock.go`): atomic create-new (`[IO.File]::Open CreateNew` / `set -C`) returning exit 48 -> `ERR_LOCKED`; age >= `lock_timeout_seconds` overwrites with WARN; release runs in defer on all post-LOCK error paths.
 - [ ] Implement `engine/manifest.go` read/write of the JSON manifest (`current_version`, `previous_version`, `artifact_checksum`, `last_operation`, `extra`).
 - [ ] Implement the manifest-driven Read reconciliation helper: absent -> remove resource; `last_operation.result==failed` -> `<version>!failed` marker.
 
@@ -200,7 +202,8 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 3.5: Deploy State Machine and Rollback Matrix
 
 ### Implementation Steps
-- [ ] Implement `engine/engine.go` `Deploy` orchestration emitting the exact named steps (VALIDATE..UNLOCK) via tflog with `app/host/step/version/duration_ms` fields.
+- [ ] Define the `pattern.Pattern` seam interface and `ReleaseCtx` in `internal/pattern/pattern.go` (`Configure`/`Preflight`/`Stop`/`Start`/`Status`/`Uninstall`) plus the `pattern.For(type)` factory, so the engine orchestrates against a compile-safe interface before any concrete pattern lands (breaks the engine<->pattern cycle; concrete patterns follow in Phase 4).
+- [ ] Implement `engine/engine.go` `Deploy` orchestration emitting the exact named steps (VALIDATE..UNLOCK) via tflog with `app/host/step/version/duration_ms` fields, calling patterns through the `pattern.Pattern` seam.
 - [ ] Implement the idempotency short-circuit (DESIGN sec 10.1): current version + checksum + healthy status -> NO-OP with no fetch/restart.
 - [ ] Implement the single-target rollback matrix (DESIGN sec 10.2) for fresh vs update, and `ERR_ROLLBACK_FAILED` (sec 10.6) with detail starting `MACHINE IN UNKNOWN STATE host=<h>`.
 - [ ] Implement `Destroy` modes (purge/unregister/abandon) and `ReadStatus` reconciliation.
@@ -222,8 +225,8 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 4.1: Pattern Interface and Console App
 
 ### Implementation Steps
-- [ ] Define the `Pattern` interface (`Validate`/`Preflight`/`Configure`/`Stop`/`Start`/`Status`/`Uninstall`) in `internal/pattern/pattern.go`.
-- [ ] Implement `console_app`: no service registration, `post_install` then `verify_command` in the current release dir, `service_status` reports `n/a` or drift.
+- [ ] Implement the concrete `ConsoleApp` against the existing `pattern.Pattern` seam (interface defined in Stage 3.5; its methods are `Configure`/`Preflight`/`Stop`/`Start`/`Status`/`Uninstall` -- there is no `Validate` method, static validation lives in `internal/spec`).
+- [ ] `console_app` behavior: no service registration, `post_install` then `verify_command` in the current release dir, `service_status` reports `n/a` or drift; `Start`/`Stop` are no-ops.
 - [ ] Wire the pattern-specific preflight tool-check seam invoked by the engine after connect.
 
 ### Dependencies
@@ -374,7 +377,7 @@ storyId: "release:RELEASE-PROVIDER"
 - phase-e2e-test-resource-and-results/stage-testrun-spec-and-result-parsing
 
 ### Test Scenarios
-- [ ] Scenario: Collection before failure -- Given `fail_on_test_failure=true` and a failing run via a fake transport, When `Create` runs, Then it returns `ERR_TEST_FAILED` only AFTER `results_dir` is populated [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
+- [ ] Scenario: Collection before failure -- Given `fail_on_test_failure=true` and a failing run, When `Create` runs against a fake transport that serves the on-target results zip, Then the local `results_dir` (results + logs + `summary.json`) is fully populated on disk BEFORE `ERR_TEST_FAILED` is returned [proof: service:local-shell; deps: local-shell = the gate host's own filesystem (results_dir is a persisted local runner directory the provider writes and unzips into)]
 - [ ] Scenario: Timeout kills tree -- Given `runner.timeout_seconds` exceeded, When `Create` runs via a fake transport, Then it returns `ERR_TIMEOUT` and issues the process-tree kill script [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
 
 # Phase 8: Docker Examples and Packaging
@@ -409,8 +412,8 @@ storyId: "release:RELEASE-PROVIDER"
 - phase-e2e-test-resource-and-results/stage-e2e-test-resource-and-collection
 
 ### Test Scenarios
-- [ ] Scenario: Example specs validate -- Given each `examples/specs/*.yaml`, When run through the spec validator, Then all parse and validate without error [proof: in-process; deps: none]
-- [ ] Scenario: Pipeline YAML well-formed -- Given the two pipeline files, When parsed with a YAML parser, Then both are well-formed and contain the `always()`/`condition: always()` publish steps [proof: in-process; deps: none]
+- [ ] Scenario: Example specs validate -- Given each committed `examples/specs/*.yaml`, When run through the spec validator, Then all parse and validate without error [proof: golden; deps: none -- committed examples/specs/*.yaml fixtures read from disk]
+- [ ] Scenario: Pipeline YAML well-formed -- Given the two committed pipeline files, When parsed with a YAML parser, Then both are well-formed and contain the `always()`/`condition: always()` publish steps [proof: golden; deps: none -- committed examples/pipelines/*.yml fixtures read from disk]
 
 ## Stage 8.3: GoReleaser Packaging and Distribution
 
@@ -423,8 +426,8 @@ storyId: "release:RELEASE-PROVIDER"
 - phase-docker-examples-and-packaging/stage-examples-and-pipeline-templates
 
 ### Test Scenarios
-- [ ] Scenario: Build matrix -- Given the goreleaser config, When `goreleaser build --snapshot` runs, Then zips for linux_amd64 and windows_amd64 are produced with the correct binary name [proof: in-process; deps: none]
-- [ ] Scenario: No cgo -- Given the built binaries, When inspected, Then they are statically built with `CGO_ENABLED=0` [proof: in-process; deps: none]
+- [ ] Scenario: Build matrix -- Given the goreleaser config, When `goreleaser build --snapshot` runs on the gate host, Then zips for linux_amd64 and windows_amd64 are produced with the correct binary name [proof: service:go-toolchain; deps: go-toolchain = the gate host's Go compiler + goreleaser (external build tool + emitted binaries)]
+- [ ] Scenario: No cgo -- Given the built binaries, When inspected on the gate host, Then they are statically built with `CGO_ENABLED=0` [proof: service:go-toolchain; deps: go-toolchain = the gate host's Go toolchain producing the inspected binaries]
 
 # Phase 9: Lab Acceptance Gate
 
