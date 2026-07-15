@@ -901,28 +901,38 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
 `implementation-plan.md:438`, and PIP-01..03 are the live smoke authorized at
 `implementation-plan.md:494` ("a GitHub Actions runner and ADO agent against W1").
 
-> Cross-doc inconsistency (flagged, not decided here): the shipped assets use
+> Naming note (resolved, not an open question): the shipped pipeline assets use
 > `version`+`checksum` inputs, artifact `labdeploy-results-<version>`, and
-> `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM` rollback variables, whereas the DESIGN
-> section 18.10 matrix text names `e2e-results`/`labdeploy-logs` artifacts and
-> `auto_rollback`/`rollback_to` inputs. The scenarios below follow the shipped
-> assets (what actually exists and runs). This naming divergence is raised for an
-> operator pin in the Iteration Summary open-question block; it is NOT resolved by
-> asserting precedence inside this document.
+> `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM` rollback variables. These names are the
+> build-of-record already adopted by the sibling planning docs -- `tech-spec.md:135`
+> names `github-deploy.yml`/`azure-pipelines.yml` as the shipped pipelines and
+> `implementation-plan.md:428-429` authors exactly those two files. The DESIGN
+> section 18.10 matrix used provisional label names (`e2e-results`/`labdeploy-logs`,
+> `auto_rollback`/`rollback_to`) that neither sibling carried forward, so this suite
+> validates the shipped files as-built to stay consistent with `tech-spec.md` and
+> `implementation-plan.md`. No operator pin is required.
 
 ### Setup
 - **Type**: lab-bare-metal
 - **Local**: the gate-tier `PIP_LINT-01` runs anywhere with `go test` (it only
   reads the two committed `examples/pipelines/*.yml` from the checkout). The live
-  PIP-01..03 are not run locally; they execute on a self-hosted GitHub Actions
-  runner and an ADO agent against W1 (`implementation-plan.md:494`). Both shipped
-  pipelines take `version` + `checksum` inputs/parameters
+  PIP-01..03 run on the lab, not on a workstation. The GitHub Actions legs
+  (PIP-01/PIP-02) execute the shipped `examples/pipelines/github-deploy.yml`
+  directly by path with nektos `act` (`act workflow_dispatch -W
+  examples/pipelines/github-deploy.yml --input version=<v> --input checksum=<sha>
+  --secret-file <lab.env>`) -- `act` is a GitHub Actions runner that runs a workflow
+  file from an explicit path, so no `.github/workflows/` registration and no
+  `environment:` binding are needed (lab secrets are injected via `--secret-file`).
+  The ADO leg (PIP-03) runs an Azure DevOps pipeline definition that points at
+  `examples/pipelines/azure-pipelines.yml` (ADO allows a YAML definition at any repo
+  path) on pool `LabAgents`. Both take `version`+`checksum`
   (`github-deploy.yml:5-11`, `azure-pipelines.yml:4-8`).
 - **CI runner**: ADO agent pool `LabAgents` (the pool named in
-  `azure-pipelines.yml:13`); GitHub self-hosted runner labels `[self-hosted, lab]`
-  (the labels in `github-deploy.yml:17`), same W1 class as Phase 5. The runner
-  lays the provider into its filesystem mirror via `make install`
-  (`github-deploy.yml:28`) before the workflow runs.
+  `azure-pipelines.yml:13`) hosts the ADO pipeline definition; the GitHub legs run
+  on a self-hosted GitHub Actions runner labeled `[self-hosted, lab]` (the labels in
+  `github-deploy.yml:17`, mapped to the host via `act -P self-hosted=-self-hosted`),
+  same W1 class as Phase 5. The runner lays the provider into its filesystem mirror
+  via `make install` (`github-deploy.yml:28`) before the workflow runs.
 - **Secrets**: Azure Key Vault `kv-forge-lab` entries `labdeploy-lab-password` and
   `labdeploy-nuget-pat`, surfaced through the ADO variable group `lab-secrets`
   (referenced at `azure-pipelines.yml:11`) as secret variables `LABDEPLOY_PASSWORD`
@@ -933,9 +943,10 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
   inputs are read from pre-existing GitHub/ADO variables `LAST_GOOD_VERSION` /
   `LAST_GOOD_CHECKSUM` (maintained by the release process,
   `github-deploy.yml:61-62`, `azure-pipelines.yml:61-62`); the test never writes
-  them. (Binding the GitHub environment `lab` to the shipped workflow -- which does
-  not currently set `environment:` -- and the exact `workflow_dispatch`
-  registration path are the subject of the `pip-github-dispatch` open question.)
+  them. The GitHub secrets `LABDEPLOY_PASSWORD`/`NUGET_PAT` reach the workflow
+  through `act --secret-file` (sourced from KeyVault `kv-forge-lab` / the GitHub
+  environment `lab`), so no `environment:` job binding is required; the ADO secrets
+  reach the pipeline through variable group `lab-secrets`.
 - **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds
   or downloads `terraform-provider-labdeploy_v<version>` and lays it into the
   `%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\...` mirror
@@ -965,7 +976,7 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
 **Feature: reference pipeline integration (live lab)**
 
   Scenario: PIP-01 GitHub deploy workflow publishes results
-    Given the shipped `examples/pipelines/github-deploy.yml` running on a
+    Given the shipped `examples/pipelines/github-deploy.yml` executed by `act` on a
     `[self-hosted, lab]` GitHub Actions runner (`implementation-plan.md:494`) with
     `version=1.1.0` and `checksum=sha256:<good-hex>`
     When the `deploy` job runs
@@ -974,8 +985,8 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
 
   Scenario: PIP-02 GitHub deploy failure triggers auto-rollback
     Given pre-existing repo variables `LAST_GOOD_VERSION=1.1.0` /
-    `LAST_GOOD_CHECKSUM=sha256:<good-hex>`, run with `version=1.2.0-bad` and its
-    `checksum`
+    `LAST_GOOD_CHECKSUM=sha256:<good-hex>` (passed via `act --var-file`), executed
+    by `act` with `version=1.2.0-bad` and its `checksum`
     When the `deploy` job runs
     Then it fails with `[ERR_SERVICE_START]`, the `rollback` job (`if: failure()`)
     applies `app_version=${{ vars.LAST_GOOD_VERSION }}` /
@@ -1054,14 +1065,17 @@ Notes:
 - Phase 8 PIP-01..03 run the SHIPPED assets `examples/pipelines/github-deploy.yml`
   and `azure-pipelines.yml` (the only pipeline files authorized by
   `implementation-plan.md` Stage 8.2, lines 428-429) on a GitHub Actions runner +
-  ADO agent against W1 (`implementation-plan.md:494`). They use `version`+`checksum`
-  inputs, `[self-hosted, lab]` / `LabAgents`, secrets `LABDEPLOY_PASSWORD`+`NUGET_PAT`,
-  `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM` rollback variables, and artifact
-  `labdeploy-results-<version>`. These asset names DIVERGE from the DESIGN section
-  18.10 matrix wording (`e2e-results`/`labdeploy-logs` artifacts,
-  `auto_rollback`/`rollback_to` inputs); this doc flags the conflict (see the
-  callout under Phase 8) and raises it for an operator pin in the Iteration Summary
-  rather than asserting precedence here.
+  ADO agent against W1 (`implementation-plan.md:494`). The GitHub legs execute the
+  workflow file by path with nektos `act` (no `.github/workflows/` registration and
+  no `environment:` binding needed; lab secrets via `--secret-file`); the ADO leg
+  runs a pipeline definition pointed at the YAML path on pool `LabAgents`. They use
+  `version`+`checksum` inputs, `[self-hosted, lab]` / `LabAgents`, secrets
+  `LABDEPLOY_PASSWORD`+`NUGET_PAT`, `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM` rollback
+  variables, and artifact `labdeploy-results-<version>` -- the same names the
+  sibling docs adopt (`tech-spec.md:135`, `implementation-plan.md:428-429`). DESIGN
+  section 18.10's provisional matrix labels were not carried forward by either
+  sibling, so the suite validates the shipped files as-built (see the resolved
+  naming note under Phase 8); no operator pin is open.
 - PIP_LINT-01 is the gate-tier structural proof authorized at
   `implementation-plan.md:438` (proof golden, deps none): it parses ONLY the two
   committed `examples/pipelines/*.yml` and asserts they are well-formed and contain
