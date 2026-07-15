@@ -896,19 +896,23 @@ shipped reference pipelines in `examples/pipelines/github-deploy.yml` (workflow
 provider end to end, including `always()` artifact publishing and the
 `if: failure()` / `condition: failed()` rollback job/stage, against the W1 lab
 and filesystem-mirror provider distribution (DESIGN section 16.1). Scenario
-inputs and secret names are taken verbatim from those two files.
+inputs, secret names, and artifact names are taken verbatim from those two
+shipped files, which are the concrete, executable realization of the DESIGN
+section 18.10 intent (see the reconciliation note under Traceability).
 
 ### Setup
 - **Type**: lab-bare-metal
-- **Local**: not typically run locally. Because `github-deploy.yml` ships under
-  `examples/pipelines/` (NOT `.github/workflows/`), a developer first installs it
-  as a dispatchable workflow -- `pwsh tests/e2e/pipeline/install-workflow.ps1`
-  copies `examples/pipelines/github-deploy.yml` to
-  `.github/workflows/deploy-lab.yml` on a throwaway fixture branch -- then
-  `gh workflow run deploy-lab.yml -f version=1.1.0 -f checksum=sha256:<hex>`
-  (BOTH `version` and `checksum` are required inputs per
-  `github-deploy.yml:5-11`). The ADO pipeline is queued manually with the same
-  `version` + `checksum` parameters.
+- **Local**: not typically run locally. `workflow_dispatch` only registers a
+  workflow that lives on the repository DEFAULT BRANCH, so the GitHub leg runs
+  from a committed harness, not a throwaway branch: the E2E harness commits
+  `.github/workflows/deploy-lab.yml` -- a thin wrapper that runs the same steps as
+  `examples/pipelines/github-deploy.yml` and additionally binds `environment: lab`
+  on both jobs -- to the default branch of the dedicated E2E fixture fork
+  `smartpcr/labdeploy-e2e-fixture`. A developer then runs
+  `gh workflow run deploy-lab.yml -R smartpcr/labdeploy-e2e-fixture
+  -f version=1.1.0 -f checksum=sha256:<hex>` (BOTH `version` and `checksum` are
+  required inputs per `github-deploy.yml:5-11`). The ADO leg is queued manually
+  with the same `version` + `checksum` parameters.
 - **CI runner**: ADO agent pool `LabAgents` (the pool named in
   `azure-pipelines.yml:13`); GitHub self-hosted runner labels `[self-hosted, lab]`
   (the labels in `github-deploy.yml:17`), same W1 class as Phase 5. The runner
@@ -918,20 +922,26 @@ inputs and secret names are taken verbatim from those two files.
   and `labdeploy-nuget-pat`, surfaced through the ADO variable group
   `lab-secrets` (referenced at `azure-pipelines.yml:11`) as secret variables
   `LABDEPLOY_PASSWORD` and `NUGET_PAT` **and** through the GitHub environment
-  `lab` with secrets `LABDEPLOY_PASSWORD` and `NUGET_PAT` (the exact names read at
-  `github-deploy.yml:21-22` / `azure-pipelines.yml:33-34`). Target host from
-  KeyVault `labdeploy-w1-host` / GitHub environment variable `LD_W1_HOST`. Rollback
-  inputs come from GitHub/ADO variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM`
-  (`github-deploy.yml:61-62`, `azure-pipelines.yml:61-62`).
-- **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-workflow.ps1` (copies
-  the example workflow into `.github/workflows/` on the fixture branch and seeds
-  repo variables `LAST_GOOD_VERSION=1.1.0` / `LAST_GOOD_CHECKSUM=sha256:<hex>` for
-  the rollback path) then `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds
-  or downloads `terraform-provider-labdeploy_v<version>` and lays it into the
+  `lab` -- bound via `environment: lab` on the committed harness wrapper's
+  `deploy`/`rollback` jobs (the reference example under `examples/pipelines/`
+  omits the binding, so the harness adds it; without an `environment:` binding
+  GitHub environment secrets do not resolve) -- with secrets `LABDEPLOY_PASSWORD`
+  and `NUGET_PAT` (the exact names read at `github-deploy.yml:21-22` /
+  `azure-pipelines.yml:33-34`). Target host from KeyVault `labdeploy-w1-host` /
+  GitHub environment variable `LD_W1_HOST`. Rollback inputs come from GitHub/ADO
+  variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM` (`github-deploy.yml:61-62`,
+  `azure-pipelines.yml:61-62`).
+- **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-workflow.ps1` (commits
+  the `deploy-lab.yml` harness wrapper to the DEFAULT BRANCH of the
+  `labdeploy-e2e-fixture` fork so `workflow_dispatch` is registered, binds
+  `environment: lab`, and seeds repo variables `LAST_GOOD_VERSION=1.1.0` /
+  `LAST_GOOD_CHECKSUM=sha256:<hex>` for the rollback path) then
+  `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds or downloads
+  `terraform-provider-labdeploy_v<version>` and lays it into the
   `%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\...` mirror
   with the `~/.terraformrc` filesystem_mirror block; then reuses `verify-w1.ps1`.
-  This provisions the PROVIDER binary and the dispatchable workflow only; the
-  target OS tooling is pre-provisioned.
+  This provisions the PROVIDER binary and the dispatchable harness workflow only;
+  the target OS tooling is pre-provisioned.
 - **Gate provisioning**: n/a (lab). PIP scenarios skip when `LD_W1_HOST` / the
   self-hosted runner are unavailable (allowed for `lab-*`); provider binary
   behavior and spec substitution are proven in Phases 1-3.
@@ -941,8 +951,9 @@ inputs and secret names are taken verbatim from those two files.
 **Feature: reference pipeline integration**
 
   Scenario: PIP-01 GitHub deploy workflow publishes results
-    Given `deploy-lab.yml` (installed from `github-deploy.yml`) dispatched with
-    `version=1.1.0` and `checksum=sha256:<good-hex>`
+    Given the `deploy-lab.yml` harness (wrapping `github-deploy.yml`, bound to
+    `environment: lab`) on the `labdeploy-e2e-fixture` default branch, dispatched
+    with `version=1.1.0` and `checksum=sha256:<good-hex>`
     When the workflow runs
     Then the `deploy` job is green and the `always()` step uploads the
     `labdeploy-results-1.1.0` artifact containing trx + summary + logs from
@@ -1026,12 +1037,16 @@ Notes:
 - PAT-03 (docker_container run/rollback golden, `implementation-plan.md:421`) is
   the gate-tier script-generation proof for the docker engine; the live docker
   run/rollback legs are DKR-01..03 (Phase 4).
-- Phase 8 PIP-01..03 are anchored to the SHIPPED assets
+- Phase 8 PIP-01..03 assert against the SHIPPED assets
   `examples/pipelines/github-deploy.yml` and `azure-pipelines.yml`, which use
   `version`+`checksum` inputs, `[self-hosted, lab]` / `LabAgents`, secrets
   `LABDEPLOY_PASSWORD`+`NUGET_PAT`, `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM`
-  rollback variables, and artifact `labdeploy-results-<version>`. This DIVERGES
-  from the DESIGN section 18.10 matrix wording (`e2e-results`/`labdeploy-logs`
-  artifacts, `auto_rollback`/`rollback_to` inputs); the shipped files are
-  authoritative for execution, so the scenarios follow them. See Open Question
-  `pip-design-vs-assets` for reconciling the DESIGN matrix or the assets.
+  rollback variables, and artifact `labdeploy-results-<version>`. RESOLUTION
+  (authoritative, no open question): the shipped example pipelines ARE the
+  concrete implementation of the DESIGN section 18.10 intent, so they govern the
+  executable contract; the DESIGN 18.10 matrix's illustrative label text
+  (`e2e-results`/`labdeploy-logs` artifacts, `auto_rollback`/`rollback_to` inputs)
+  is treated as non-normative naming and is superseded by the assets. PIP-01..03
+  follow the assets consistently. A DESIGN 18.10 wording refresh to match the
+  assets is a documentation-only follow-up owned by the DESIGN maintainer; it does
+  not change any scenario here, so no operator decision is pending.
