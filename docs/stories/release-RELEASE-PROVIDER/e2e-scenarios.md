@@ -940,8 +940,11 @@ ADO agent against W1").
   removing those two `environment: lab` lines from the generated body yields a
   byte-for-byte `sha256` match to the shipped template. PIP_REG-02 (live, pre-dispatch)
   fetches the ACTUAL `.github/workflows/labdeploy-e2e.yml` from the `LD_GH_LAB_REPO`
-  default branch via `FetchRemoteWorkflow` (`gh api` REST contents on the default
-  branch) and asserts it is byte-for-byte equal to the `RegisterWorkflow` output, so a
+  default branch via `FetchRemoteWorkflow` (a direct Go `net/http` GET against the
+  GitHub REST contents API -- no `gh` CLI or other external binary, so the only local
+  dependency is the Go toolchain), authenticated with a bearer token read from env-var
+  `LD_GH_TOKEN`, and asserts it is byte-for-byte equal to the `RegisterWorkflow`
+  output, so a
   stale or drifted remote workflow FAILS the run instead of silently dispatching --
   PIP-01/PIP-02 never run stale or otherwise-altered content. The
   ADO leg (PIP-03) runs an Azure DevOps pipeline definition pointed at
@@ -966,7 +969,12 @@ ADO agent against W1").
   entries as secret variables `LABDEPLOY_PASSWORD` / `NUGET_PAT`. The GitHub
   environment `lab` and the ADO variable group are both populated from
   `kv-forge-lab`. Target host from KeyVault `labdeploy-w1-host` / GitHub environment
-  variable `LD_W1_HOST`. Rollback inputs are read from pre-existing GitHub/ADO
+  variable `LD_W1_HOST`. The pre-dispatch remote fetch (PIP_REG-02) authenticates to
+  the GitHub REST API with env-var `LD_GH_TOKEN`, a fine-scoped (contents:read)
+  personal-access/GitHub-App token sourced from Key Vault entry `labdeploy-gh-token`
+  and surfaced as GitHub environment `lab` secret `LD_GH_TOKEN`; it is a read-only
+  token distinct from `NUGET_PAT`, and no cached operator `gh` login is used. Rollback
+  inputs are read from pre-existing GitHub/ADO
   variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM` (maintained by the release
   process, `github-deploy.yml:61-62`, `azure-pipelines.yml:61-62`); the test never
   writes them.
@@ -1022,8 +1030,12 @@ ADO agent against W1").
     `LD_GH_LAB_REPO` default branch
     When, as the FIRST live step before any `workflow_dispatch`, `FetchRemoteWorkflow`
     (`tests/e2e/pipeline/register_workflow.go`) fetches the actual
-    `.github/workflows/labdeploy-e2e.yml` from the `LD_GH_LAB_REPO` default branch via
-    `gh api repos/{owner}/{repo}/contents/.github/workflows/labdeploy-e2e.yml`
+    `.github/workflows/labdeploy-e2e.yml` from the `LD_GH_LAB_REPO` default branch with
+    a direct Go `net/http` GET to
+    `GET /repos/{owner}/{repo}/contents/.github/workflows/labdeploy-e2e.yml` on the
+    GitHub REST API (no `gh` CLI -- only the Go stdlib), sending
+    `Authorization: Bearer $LD_GH_TOKEN` (the token env-var, so no cached operator
+    credential is used) and base64-decoding the `content` field
     Then its decoded bytes are byte-for-byte equal (`sha256`) to the `RegisterWorkflow`
     output; if they differ the run FAILS here with `[ERR_STALE_WORKFLOW]` -- a stale or
     hand-edited remote registration can never be dispatched, so PIP-01/PIP-02 execute
@@ -1161,8 +1173,9 @@ Notes:
   plus only the documented environment binding, with no PowerShell dependency.
 - PIP_REG-02 is the live pre-dispatch currency proof (deps: L4 lab): `FetchRemoteWorkflow`
   (`tests/e2e/pipeline/register_workflow.go`) pulls the actual
-  `.github/workflows/labdeploy-e2e.yml` from the `LD_GH_LAB_REPO` default branch via
-  `gh api` and asserts byte-for-byte `sha256` equality with the `RegisterWorkflow`
+  `.github/workflows/labdeploy-e2e.yml` from the `LD_GH_LAB_REPO` default branch via a
+  direct Go `net/http` GET (no `gh` CLI), authenticated with `Bearer $LD_GH_TOKEN`, and
+  asserts byte-for-byte `sha256` equality with the `RegisterWorkflow`
   output before any `workflow_dispatch`; a stale or hand-edited remote registration
   fails with `[ERR_STALE_WORKFLOW]` instead of dispatching, so the remote workflow's
   currency is machine-checked rather than assumed. Skips only when the lab is
