@@ -896,8 +896,10 @@ running the two SHIPPED reference pipelines that already exist in the repo --
 `examples/pipelines/github-deploy.yml` and `examples/pipelines/azure-pipelines.yml`
 (the only pipeline assets authorized by `implementation-plan.md` Stage 8.2, lines
 428-429) -- against the W1 lab with filesystem-mirror provider distribution
-(DESIGN section 16.1). This phase invents no repository, workflow file, or test
-package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
+(DESIGN section 16.1). This phase authors no NEW pipeline logic and no test
+package: the executable GitHub workflow is a verbatim `sha256`-checked byte-copy of
+the shipped `examples/pipelines/github-deploy.yml` (see PIP_REG-01), not
+hand-written content. PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
 `implementation-plan.md:438`, and PIP-01..03 are the live smoke authorized at
 `implementation-plan.md:494` ("a GitHub Actions runner and ADO agent against W1").
 
@@ -914,21 +916,26 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
 
 ### Setup
 - **Type**: lab-bare-metal
-- **Local**: the gate-tier `PIP_LINT-01` runs anywhere with `go test` (it only
-  reads the two committed `examples/pipelines/*.yml` from the checkout). The live
-  PIP-01..03 run on the L4 lab, not on a workstation. Per `architecture.md:400`
-  (L4) and `implementation-plan.md:484`,`:494`, the L4 lab provides a real,
-  registered self-hosted GitHub Actions runner and a real ADO agent against W1/C2 --
-  the SAME class of pre-provisioned lab dependency as W1 itself. The workflow
-  content under test is the shipped `examples/pipelines/github-deploy.yml`; the L4
-  lab is responsible for registering that reference as a runnable repo workflow
-  (GitHub Actions only executes workflows under `.github/workflows/` on a branch, so
-  registration is an L4 lab-provisioning step -- this suite does NOT author, commit,
-  or promote any `.github/workflows/` file into the worktree, and PIP_LINT-01 proves
-  the shipped content in the gate). The ADO leg (PIP-03) runs an Azure DevOps
-  pipeline definition pointed at `examples/pipelines/azure-pipelines.yml` on pool
-  `LabAgents`. Both take `version`+`checksum` (`github-deploy.yml:5-11`,
-  `azure-pipelines.yml:4-8`).
+- **Local**: the gate-tier `PIP_LINT-01` and `PIP_REG-01` run anywhere with
+  `go test` (they only read/copy the committed `examples/pipelines/*.yml` from the
+  checkout). The live PIP-01..03 run on the L4 lab, not on a workstation. Per
+  `architecture.md:400` (L4) and `implementation-plan.md:484`,`:494`, the L4 lab
+  provides a real, registered self-hosted GitHub Actions runner and a real ADO agent
+  against W1/C2 -- the SAME class of pre-provisioned lab dependency as W1 itself. The
+  workflow executed by PIP-01/PIP-02 is registered by a committed, deterministic
+  harness step `tests/e2e/pipeline/register-workflow.ps1`, which does a **verbatim
+  byte-for-byte copy** of `examples/pipelines/github-deploy.yml` to
+  `.github/workflows/labdeploy-e2e.yml` on the lab's dedicated branch
+  `lab/e2e-pipeline` -- no field is added, removed, or rewritten (GitHub Actions only
+  executes workflows under `.github/workflows/` on a branch, so this copy is the
+  registration). `PIP_REG-01` asserts `sha256` byte-identity between the registered
+  `.github/workflows/labdeploy-e2e.yml` and the shipped
+  `examples/pipelines/github-deploy.yml`, so PIP-01 can never run a stale or altered
+  copy. This suite does NOT hand-author any `.github/workflows/` content; the file is
+  a mechanical copy of the shipped template on a lab branch, never on the mainline
+  worktree. The ADO leg (PIP-03) runs an Azure DevOps pipeline definition pointed at
+  `examples/pipelines/azure-pipelines.yml` on pool `LabAgents`. Both take
+  `version`+`checksum` (`github-deploy.yml:5-11`, `azure-pipelines.yml:4-8`).
 - **CI runner**: ADO agent pool `LabAgents` (the pool named in
   `azure-pipelines.yml:13`) hosts the ADO pipeline definition; the GitHub legs run
   on the L4 lab's real self-hosted GitHub Actions runner labeled `[self-hosted, lab]`
@@ -936,27 +943,33 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
   the provider into its filesystem mirror via `make install` (`github-deploy.yml:28`)
   before the workflow runs.
 - **Secrets**: Azure Key Vault `kv-forge-lab` entries `labdeploy-lab-password` and
-  `labdeploy-nuget-pat`, surfaced through the ADO variable group `lab-secrets`
-  (referenced at `azure-pipelines.yml:11`) as secret variables `LABDEPLOY_PASSWORD`
-  and `NUGET_PAT` **and** through the GitHub environment `lab` with secrets
-  `LABDEPLOY_PASSWORD` and `NUGET_PAT` (the exact names read at
-  `github-deploy.yml:21-22` / `azure-pipelines.yml:33-34`). Real GitHub Actions
-  injects the GitHub environment `lab` secrets natively when the L4-registered
-  workflow declares `environment: lab` on its jobs (a lab-provisioning detail of the
-  registered workflow, not of the `examples/` template); the secret values are never
-  exported to a file. The ADO secrets reach the pipeline through variable group
-  `lab-secrets`. Target host from KeyVault `labdeploy-w1-host` / GitHub environment
-  variable `LD_W1_HOST`. Rollback inputs are read from pre-existing GitHub/ADO
-  variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM` (maintained by the release
-  process, `github-deploy.yml:61-62`, `azure-pipelines.yml:61-62`); the test never
-  writes them.
+  `labdeploy-nuget-pat` are the source of truth, surfaced through the ADO variable
+  group `lab-secrets` (referenced at `azure-pipelines.yml:11`) as secret variables
+  `LABDEPLOY_PASSWORD` and `NUGET_PAT` **and** through the GitHub environment `lab`
+  (the Forge/GitHub secret provider for this lab) holding `LABDEPLOY_PASSWORD` and
+  `NUGET_PAT`. The shipped `github-deploy.yml` reads `${{ secrets.LABDEPLOY_PASSWORD }}`
+  / `${{ secrets.NUGET_PAT }}` (lines 21-22, 51-52) and declares NO `environment:`
+  field on any job (confirmed lines 15-52), so real GitHub Actions resolves those as
+  **repository-level Actions secrets**. The L4 lab provisions those two repository
+  secrets from the same KeyVault `kv-forge-lab` entries; no `environment:` binding is
+  added to the byte-identical registered workflow, and no secret value is ever read
+  back or exported to a file. The ADO secrets reach the pipeline through variable
+  group `lab-secrets`. Target host from KeyVault `labdeploy-w1-host` / GitHub
+  environment variable `LD_W1_HOST`. Rollback inputs are read from pre-existing
+  GitHub/ADO variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM` (maintained by the
+  release process, `github-deploy.yml:61-62`, `azure-pipelines.yml:61-62`); the test
+  never writes them.
 - **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds
   or downloads `terraform-provider-labdeploy_v<version>` and lays it into the
   `%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\...` mirror
   with the `~/.terraformrc` filesystem_mirror block; then reuses `verify-w1.ps1`.
-  This provisions the PROVIDER binary only; the L4 GitHub Actions runner/registration
-  and target OS tooling are pre-provisioned lab dependencies (`architecture.md:400`).
-  `PIP_LINT-01` needs no bootstrap (reads the committed files).
+  For the GitHub legs, `pwsh tests/e2e/pipeline/register-workflow.ps1` performs the
+  verbatim byte-copy registration (shipped `github-deploy.yml` ->
+  `.github/workflows/labdeploy-e2e.yml` on branch `lab/e2e-pipeline`) and fails fast
+  unless `sha256` matches the shipped file. This provisions the PROVIDER binary and
+  the byte-identical workflow only; the L4 GitHub Actions runner and target OS
+  tooling are pre-provisioned lab dependencies (`architecture.md:400`). `PIP_LINT-01`
+  and `PIP_REG-01` need no bootstrap (they read/copy the committed files).
 - **Gate provisioning**: `PIP_LINT-01` is the in-gate proof -- it parses the two
   committed `examples/pipelines/*.yml` from the checkout (deps: none, no docker, no
   runner, `implementation-plan.md:438`) and runs in Forge's gate every time. The
@@ -978,12 +991,25 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
     publish -- exactly as required by `implementation-plan.md:438`. This runs in
     Forge's gate so Phase 8 always has non-skippable coverage.
 
+  Scenario: PIP_REG-01 Registered workflow is byte-identical to the shipped template (gate)
+    Given the committed `examples/pipelines/github-deploy.yml`
+    When `tests/e2e/pipeline/register-workflow.ps1` copies it to a temp
+    `.github/workflows/labdeploy-e2e.yml` (deps: none, no runner, no lab)
+    Then `sha256(.github/workflows/labdeploy-e2e.yml)` equals
+    `sha256(examples/pipelines/github-deploy.yml)` byte-for-byte -- proving the
+    registration is a pure copy that adds/removes/rewrites nothing (in particular it
+    adds no `environment:` field), so the live PIP-01/PIP-02 workflow is provably the
+    shipped content. This runs in Forge's gate (a file copy + hash, no lab).
+
 **Feature: reference pipeline integration (live lab)**
 
   Scenario: PIP-01 GitHub deploy workflow publishes results
-    Given the shipped `examples/pipelines/github-deploy.yml` content, registered by
-    the L4 lab and run on its real `[self-hosted, lab]` GitHub Actions runner
-    (`architecture.md:400`, `implementation-plan.md:494`) with `version=1.1.0` and
+    Given the `.github/workflows/labdeploy-e2e.yml` registered by
+    `register-workflow.ps1` (proven byte-identical to the shipped
+    `examples/pipelines/github-deploy.yml` by PIP_REG-01), dispatched on the L4 lab's
+    real `[self-hosted, lab]` GitHub Actions runner (`architecture.md:400`,
+    `implementation-plan.md:494`) with repository secrets `LABDEPLOY_PASSWORD` /
+    `NUGET_PAT` provisioned from KeyVault, `version=1.1.0`, and
     `checksum=sha256:<good-hex>`
     When the `deploy` job runs
     Then it is green and the `always()` step uploads the `labdeploy-results-1.1.0`
@@ -1041,6 +1067,7 @@ the authoritative contract.
 | 2 Transport/Artifact proofs | ENC-01..02, LCL-01, CON-04, ART_FETCH-01..02, NUG-01, TPS-01 | compose | T3, T4, T5 |
 | 3 Pattern/Engine/Logs proofs | PAT-01..03, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
 | 8 Pipeline contract (in-gate) | PIP_LINT-01 | lab-bare-metal (gate-runnable) | golden (`implementation-plan.md:438`) |
+| 8 Pipeline registration byte-identity (in-gate) | PIP_REG-01 | lab-bare-metal (gate-runnable) | golden (`sha256` copy assertion) |
 
 Notes:
 - CON-04 (host-key mismatch, in-process stub) and LCL-01 (local round-trip) are
@@ -1073,17 +1100,23 @@ Notes:
   and `azure-pipelines.yml` (the only pipeline files authorized by
   `implementation-plan.md` Stage 8.2, lines 428-429) on a GitHub Actions runner +
   ADO agent against W1 (`implementation-plan.md:494`; `architecture.md:400` L4). The
-  GitHub legs run the shipped workflow content on the L4 lab's real registered
-  self-hosted GitHub Actions runner (workflow registration is L4 lab provisioning,
-  not a worktree file this suite authors); the ADO leg runs a pipeline definition
-  pointed at the YAML path on pool `LabAgents`. They use
-  `version`+`checksum` inputs, `[self-hosted, lab]` / `LabAgents`, secrets
-  `LABDEPLOY_PASSWORD`+`NUGET_PAT`, `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM` rollback
+  GitHub legs execute a `.github/workflows/labdeploy-e2e.yml` produced by a verbatim
+  byte-copy of the shipped template (`register-workflow.ps1`, proven byte-identical
+  by PIP_REG-01's `sha256` assertion, on lab branch `lab/e2e-pipeline`; no field
+  added or rewritten); the ADO leg runs a pipeline definition pointed at the YAML
+  path on pool `LabAgents`. They use
+  `version`+`checksum` inputs, `[self-hosted, lab]` / `LabAgents`, repository secrets
+  `LABDEPLOY_PASSWORD`+`NUGET_PAT` (resolved with no `environment:` field, matching
+  the shipped `secrets.*` refs at `github-deploy.yml:21-22`,`:51-52`),
+  `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM` rollback
   variables, and artifact `labdeploy-results-<version>` -- the same names the
   sibling docs adopt (`tech-spec.md:135`, `implementation-plan.md:428-429`). DESIGN
   section 18.10's provisional matrix labels were not carried forward by either
   sibling, so the suite validates the shipped files as-built (see the resolved
   naming note under Phase 8); no operator pin is open.
+- PIP_REG-01 is a gate-tier byte-identity proof (deps none): it copies the shipped
+  `github-deploy.yml` via `register-workflow.ps1` and asserts `sha256` equality with
+  the source, guaranteeing PIP-01/PIP-02 execute the shipped content unaltered.
 - PIP_LINT-01 is the gate-tier structural proof authorized at
   `implementation-plan.md:438` (proof golden, deps none): it parses ONLY the two
   committed `examples/pipelines/*.yml` and asserts they are well-formed and contain
