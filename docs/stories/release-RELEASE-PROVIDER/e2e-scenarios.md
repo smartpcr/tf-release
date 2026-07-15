@@ -1,26 +1,45 @@
 # release provider -- E2E Scenarios (QA acceptance)
 
 Gherkin-style feature scenarios for `terraform-provider-labdeploy` (Go,
-terraform-plugin-framework, plugin protocol v6). Scenario IDs map 1:1 to the
-normative matrix in `.forge-attachments/DESIGN.md` section 18; test names MUST
-carry the same ID (e.g. `TestAcc_WSV_03_FailStartRollback`).
+terraform-plugin-framework, plugin protocol v6).
+
+**Two ID namespaces (do not conflate):**
+- **Normative acceptance IDs** are drawn verbatim from the DESIGN section 18
+  matrix (`VAL-`, `CON-`, `ART-`, `CAP-`, `WSV-`, `NOD-`, `NET-`, `CLU-`, `RBK-`,
+  `DRF-`, `DST-`, `IDP-`, `LCK-`, `E2E-`, `PIP-`, plus the P1 `DKR-` docker
+  cases). Their test names MUST carry the same ID (e.g.
+  `TestAcc_WSV_03_FailStartRollback`), per `tech-spec.md:294`.
+- **Supplemental gate-proof IDs** (`HSH-`, `ENC-`, `LCL-`, `ART_FETCH-`, `NUG-`,
+  `TPS-`, `PAT-`, `ENG-`, `LOG-`) are NOT DESIGN section 18 IDs. They name the
+  deterministic gate-host proofs that implement `architecture.md` section 6.1
+  pins T1-T9. They exist so the gate has coverage without a lab; they are marked
+  "supplemental (T#)" wherever they appear and are listed separately in the
+  Traceability table.
 
 ## Proof-tier model (why phases are typed the way they are)
 
 This document is anchored to the **Test & Environment Contract** in
 `architecture.md` section 6, which is authoritative:
 
-- **The gate host has NO docker and NO pre-provisioned services**
-  (`architecture.md:363`). Therefore `compose` (docker-compose) is NOT a usable
-  Type for this provider -- there is no docker on the gate. Every phase here is
-  either `inline` (gate-host proofs) or `lab-*` (live targets).
+- **Gate-host tier types.** Pure logic proofs with zero sockets
+  (`in-process` table-driven `go test`, `golden` committed snapshots) are
+  `inline` (Phases 1 and 3). Proofs that need a live socket -- `service:httptest`
+  (Go `net/http/httptest` ephemeral) and `service:local-shell` (the gate's own
+  `powershell`/`sh` via `transport: local`) -- are `compose` (Phase 2):
+  `architecture.md:366-383` states a `service:*` pin can NEVER be realized as an
+  inline unit test and calls T5 a live-socket proof. The `compose` env-var-set
+  path is the CI service stack; when the connection env-var is unset the suite
+  self-provisions the SAME dependency IN-PROCESS (httptest server, local shell,
+  in-process stub key -- no docker), so Phase 2 still runs in Forge's gate and
+  never skips.
 - **Gate-host proof tier** (`architecture.md` section 6.1, pins T1..T9):
-  deterministic proofs that run in Forge's gate with zero external
-  dependencies -- `in-process` (table-driven `go test`), `golden` (committed
-  snapshots), `service:httptest` (Go `net/http/httptest` ephemeral, bundled
-  stdlib, no docker), and `service:local-shell` (the gate's own `powershell`/`sh`
-  via `transport: local`). These are Phases 1-3 below; they self-provision and
+  deterministic proofs that run in Forge's gate with zero pre-provisioned
+  services -- `in-process`, `golden`, `service:httptest`, and
+  `service:local-shell`. These are Phases 1-3 below; they self-provision and
   never skip.
+- **No lab-only docker on the gate.** Docker-backed acceptance
+  (docker_container, ART-06) needs a real container runtime, which the gate host
+  lacks (`architecture.md:363`), so it is lab-only (Phase 4), never `compose`.
 - **Live-lab acceptance tier** (`architecture.md` section 6.2, pins L1..L4;
   `implementation-plan.md` Phase 9): the DESIGN section 18 matrix
   (CON/ART/CAP/WSV/NOD/NET/CLU/RBK/DRF/DST/IDP/LCK/E2E/PIP) mutates real remote
@@ -168,24 +187,39 @@ SSH/WinRM round-trips and persisted-state assertions are NOT here -- they are
 lab (Phases 4-5), per `implementation-plan.md:126`.
 
 ### Setup
-- **Type**: inline
-- **Local**: `go test ./internal/transport/... ./internal/artifact/...
-  -run 'ENC|LCL|ART_FETCH|NUG|TPS|CON_04'`.
+- **Type**: compose
+- **Local**: `docker compose -f tests/e2e/transport-artifact/docker-compose.yml
+  up -d --wait` then `go test ./internal/transport/... ./internal/artifact/...
+  -run 'ENC|LCL|ART_FETCH|NUG|TPS|CON_04'`. Set `LD_ARTIFACT_URL` /
+  `LD_SSH_ENDPOINT` to the compose services; leave them unset to use the
+  in-process fallback.
 - **CI runner**: GitHub-hosted `ubuntu-latest` (plus `windows-latest` for the
   PowerShell EncodedCommand and `transport: local` Windows legs). Gate host.
 - **Secrets**: none. The artifact auth-header leg reads a throwaway value from a
-  test-scoped env var name; no real credential is involved.
-- **Pre-test bootstrap**: none.
-- **Gate provisioning**: the artifact fetch cases start a Go
-  `net/http/httptest.Server` on `127.0.0.1:0` (bundled stdlib, no docker) with a
-  200 route, a 404 route, and a bearer-auth route; when `LD_ARTIFACT_URL` is
-  unset this in-process server IS the endpoint. Local round-trip uses the gate's
+  test-scoped env var name; the compose sshd/artifact host use non-secret
+  container credentials from the compose `.env`; no real credential is involved.
+- **Pre-test bootstrap**:
+  `docker compose -f tests/e2e/transport-artifact/docker-compose.yml up -d --wait`
+  (only for the env-var-set path; the gate/unset path needs no bootstrap).
+- **Gate provisioning**: when `LD_ARTIFACT_URL` is unset the artifact fetch cases
+  start a Go `net/http/httptest.Server` on `127.0.0.1:0` (bundled stdlib, no
+  docker) with a 200 route, a 404 route, and a bearer-auth route; when set, they
+  target the compose `artifacts` service. Local round-trip always uses the gate's
   own OS shell via `transport: local` (`service:local-shell`), gated on
   `runtime.GOOS` matching the pattern OS. EncodedCommand/chunking/NuGet-URL/
   target-pull-script are compared against committed `.golden` fixtures under
   `internal/transport/testdata` and `internal/artifact/testdata`. Host-key
-  mismatch is proven against an in-process stub key -- no live sshd, no
-  third-party SSH server dependency.
+  mismatch (CON-04) is proven against an in-process stub key -- no live sshd, no
+  third-party SSH server dependency. Thus every required scenario runs in the
+  gate with the env-var unset; the compose stack is only the env-var-set path.
+
+**docker-compose.yml** (`tests/e2e/transport-artifact/docker-compose.yml`)
+services (env-var-set path only):
+- `artifacts` -- nginx serving `sample-svc` zip/nupkg plus a 404 route and a
+  bearer-auth location, mirroring the httptest routes (target of
+  `LD_ARTIFACT_URL`).
+- `sshd` -- OpenSSH server (target of `LD_SSH_ENDPOINT`) for an optional live SFTP
+  round-trip; unset => in-process stub, no live sshd.
 
 ### Scenarios
 
@@ -325,15 +359,27 @@ docker, so these run only on a Linux lab VM.
 - **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
   `[self-hosted, linux, forge-lab-hw]`. L1 Linux VM (Ubuntu 22.04) with sshd and
   docker preinstalled.
-- **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
-  (ADO variable group `forge-lab-hw-vg`, mapped to `env: LABDEPLOY_PASSWORD`)
-  **and** GitHub environment `lab-linux` secret `LAB_PASSWORD` (mapped to
-  `env: LABDEPLOY_PASSWORD`). Target host and registry come from KeyVault entries
-  `labdeploy-l1-host`/`labdeploy-registry-password` and GitHub environment
-  variables `LD_L1_HOST`/`LD_REGISTRY`.
+- **Registry source**: the docker registry (ART-06, DKR-01..03) is addressed by
+  env-var name only: `LD_REGISTRY` (registry host), `LD_REGISTRY_USER` (username),
+  and `LD_REGISTRY_PASSWORD` (resolved via `auth.password_env`). The
+  `sample-svc` image at `1.0.0`/`1.1.0` (with a captured `digest` for DKR-02) is
+  seeded into the registry by bootstrap.
+- **Secrets**: Azure Key Vault `kv-forge-lab` entries `labdeploy-lab-password`
+  (target auth), `labdeploy-registry-user`, and `labdeploy-registry-password`
+  (registry auth), via ADO variable group `forge-lab-hw-vg` mapped to
+  `env: LABDEPLOY_PASSWORD`, `env: LD_REGISTRY_USER`, `env: LD_REGISTRY_PASSWORD`
+  **and** GitHub environment `lab-linux` secrets `LAB_PASSWORD`, `REGISTRY_USER`,
+  `REGISTRY_PASSWORD` (mapped to the same env-var names). Target host from
+  KeyVault entry `labdeploy-l1-host` / GitHub environment variable `LD_L1_HOST`;
+  registry host from GitHub environment variable `LD_REGISTRY`.
 - **Pre-test bootstrap**: `bash tests/e2e/linux/verify-l1.sh` -- VERIFIES (does
-  not install) `sshd`, `docker version`, and free disk; fails fast if a
-  prerequisite is missing (targets are pre-provisioned, `tech-spec.md:165-170`).
+  not install) `sshd`, `docker version`, and free disk, then SEEDS the registry
+  by building/tagging and `docker push`ing the `sample-svc` `1.0.0`/`1.1.0`
+  images to `LD_REGISTRY` (recording the `1.1.0` digest into a fixture for
+  DKR-02); idempotent. It VERIFIES OS prerequisites and only SEEDS test images;
+  it never installs docker or runtimes (targets are pre-provisioned,
+  `tech-spec.md:165-170`). ART-06 supplies a deliberately wrong
+  `LD_REGISTRY_PASSWORD` to force the `docker login` failure.
 - **Gate provisioning**: n/a (lab). These scenarios skip when `LD_L1_HOST` is
   unset (allowed for `lab-*`); the deterministic slices (fetch, prune, lock,
   idempotent short-circuit, docker script generation) are proven in Phases 2-3
@@ -420,18 +466,33 @@ gate-provable, so its deterministic core lives in Phases 1-3.
 - **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
   `[self-hosted, windows, forge-lab-hw]`. W1 Windows Server 2022 with PowerShell
   5.1, WinRM HTTPS, node 20+npm, .NET 8 runtime + `vstest.console.exe`
-  (all pre-provisioned).
-- **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
-  (ADO variable group `forge-lab-hw-vg`, mapped to `env: LABDEPLOY_PASSWORD`)
-  **and** GitHub environment `lab-windows` secret `LAB_PASSWORD` (mapped to
-  `env: LABDEPLOY_PASSWORD`). Target host from KeyVault entry `labdeploy-w1-host`
-  / GitHub environment variable `LD_W1_HOST`.
+  (all pre-provisioned). A second pre-provisioned box `LD_W1_NOASPNET_HOST`
+  (labelled `[self-hosted, windows, forge-lab-hw, no-aspnet]`) has the .NET
+  runtime but intentionally NO `Microsoft.AspNetCore.App`, used only by NET-02.
+- **Artifact source**: the lab HTTP/NuGet artifact host is pre-provisioned and
+  addressed by env-var name only: `LD_ARTIFACT_URL` (http zip/nupkg base),
+  `LD_ARTIFACT_TOKEN` (bearer token for the ART-05 authenticated pull, resolved
+  via `auth.token_env`), `LD_NUGET_FEED` (NuGet v3 flat-container base), and
+  `LD_NUGET_TOKEN`. These are never literal URLs/credentials in specs.
+- **Secrets**: Azure Key Vault `kv-forge-lab` entries `labdeploy-lab-password`
+  (target auth) and `labdeploy-artifact-token` / `labdeploy-nuget-token`
+  (artifact-source auth), via ADO variable group `forge-lab-hw-vg` mapped to
+  `env: LABDEPLOY_PASSWORD`, `env: LD_ARTIFACT_TOKEN`, `env: LD_NUGET_TOKEN`
+  **and** GitHub environment `lab-windows` secrets `LAB_PASSWORD`,
+  `ARTIFACT_TOKEN`, `NUGET_TOKEN` (mapped to the same env-var names). Target hosts
+  from KeyVault entries `labdeploy-w1-host` / `labdeploy-w1-noaspnet-host` and
+  GitHub environment variables `LD_W1_HOST` / `LD_W1_NOASPNET_HOST`; the artifact
+  host from GitHub environment variables `LD_ARTIFACT_URL` / `LD_NUGET_FEED`.
 - **Pre-test bootstrap**: `pwsh tests/e2e/windows/verify-w1.ps1` -- VERIFIES (does
   not install) `$PSVersionTable.PSVersion.Major >= 5`, WinRM HTTPS listener,
-  `node`/`npm`/`dotnet --list-runtimes` (`Microsoft.AspNetCore.App`), and
-  `vstest.console.exe` on PATH; fails fast on a missing prerequisite (targets are
-  pre-provisioned, `tech-spec.md:165-170`). It also removes leftover
-  `sample-svc` services/releases from a prior run.
+  `node`/`npm`/`dotnet --list-runtimes` (`Microsoft.AspNetCore.App` on the
+  primary W1; ABSENT on the no-aspnet target), and `vstest.console.exe` on PATH;
+  also seeds the artifact source by publishing the `sample-svc`
+  `1.0.0`/`1.1.0`/`1.2.0-bad` zip+nupkg fixtures to `LD_ARTIFACT_URL` /
+  `LD_NUGET_FEED` (`tests/e2e/windows/seed-artifacts.ps1`, idempotent) and
+  removes leftover `sample-svc` services/releases. It VERIFIES OS prerequisites
+  and only SEEDS test fixtures; it never installs runtimes (targets are
+  pre-provisioned, `tech-spec.md:165-170`).
 - **Gate provisioning**: n/a (lab). Scenarios skip when `LD_W1_HOST` is unset
   (allowed for `lab-*`); the deterministic slices (transport encoding, pattern
   script generation, engine rollback matrix, counter parse) are proven in
@@ -455,6 +516,14 @@ gate-provable, so its deterministic core lives in Phases 1-3.
     Given `connect_retries = 2` against a dropped port
     When I apply
     Then it errors `[ERR_CONNECT]` and the log shows `attempts=3`.
+
+  Scenario: CON-05 Local transport on W1 opens no socket
+    Given the runner IS W1, `transport = local`, `os = windows`,
+    `hosts = [localhost]`
+    When I apply a `console_app` spec
+    Then apply succeeds without opening any socket
+    (the transport-independent local round-trip is also proven gate-side as the
+    supplemental LCL-01; this DESIGN ID exercises it on a real W1).
 
   Scenario: ART-01 HTTP zip with correct sha, runner_push
     Given an http zip with matching checksum and `fetch_mode = runner_push`
@@ -566,10 +635,13 @@ gate-provable, so its deterministic core lives in Phases 1-3.
     Then it runs, health passes, `ASPNETCORE_URLS` present in HKLM env.
 
   Scenario: NET-02 dotnet_dll without the ASP.NET runtime
-    Given `launcher = dotnet_dll` on a box lacking `Microsoft.AspNetCore.App`
+    Given `launcher = dotnet_dll` targeting `env(LD_W1_NOASPNET_HOST)`, a W1-class
+    box intentionally lacking `Microsoft.AspNetCore.App`
     When I apply
     Then it errors `[ERR_PREFLIGHT]` naming `Microsoft.AspNetCore.App` before any
     file is copied.
+    (Uses the dedicated no-ASP.NET target, NOT the primary W1; see Setup. Skips
+    when `LD_W1_NOASPNET_HOST` is unset.)
 
 **Feature: service drift, downgrade, and destroy**
 
@@ -825,30 +897,46 @@ provider distribution (DESIGN section 16.1).
 
 ## Traceability
 
-Every scenario ID is drawn from DESIGN section 18 and MUST appear verbatim in the
-corresponding test name (`go test` unit/golden for the gate tier;
+Test names carry their scenario ID (`go test` unit/golden for the gate tier;
 `terraform-plugin-testing` / terratest for the lab tier), satisfying the
-"Scenario IDs MUST appear in test names 1:1" requirement. Each row cites its
-`architecture.md` section 6 proof pin so phase Type never contradicts the
-authoritative contract.
+"Scenario IDs MUST appear in test names 1:1" requirement (`tech-spec.md:294`).
+The two ID namespaces are kept separate: normative DESIGN section 18 IDs (lab
+tier + gate-runnable VAL) versus supplemental T1-T9 gate-proof IDs. Each row
+cites its `architecture.md` section 6 proof pin so phase Type never contradicts
+the authoritative contract.
+
+**Normative DESIGN section 18 acceptance IDs**
 
 | Phase | Tier | Scenario IDs | Type | Proof pin |
 |---|---|---|---|---|
-| 1 Spec/Schema | gate | VAL-01..10, HSH-01 | inline | T1, T2, T9 |
-| 2 Transport/Artifact proofs | gate | ENC-01..02, LCL-01, CON-04, ART_FETCH-01..02, NUG-01, TPS-01 | inline | T3, T4, T5 |
-| 3 Pattern/Engine/Logs proofs | gate | PAT-01..02, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
+| 1 Spec/Schema | gate | VAL-01..10 | inline | T1 |
 | 4 Linux + Docker | lab | CAP-03, IDP-01, DRF-02, LCK-01..02, DST-02, ART-06, DKR-01..03 | lab-bare-metal | L2 |
-| 5 Windows single-target | lab | CON-01..03, ART-01..05, CAP-01..02, WSV-01..08, NOD-01..03, NET-01..02, RBK-01..02, DRF-01/03, DST-01 | lab-bare-metal | L1 |
+| 5 Windows single-target | lab | CON-01..03, CON-05, ART-01..05, CAP-01..02, WSV-01..08, NOD-01..03, NET-01..02, RBK-01..02, DRF-01/03, DST-01 | lab-bare-metal | L1 |
 | 6 Failover cluster | lab | CLU-01..08 | lab-wsfc | L3 |
 | 7 E2E test resource | lab | E2E-01..07 | lab-bare-metal | L1 |
 | 8 Pipeline integration | lab | PIP-01..03 | lab-bare-metal | L4 |
 
+**Supplemental gate-proof IDs (NOT DESIGN section 18; implement T1-T9)**
+
+| Phase | Supplemental IDs | Type | Proof pin |
+|---|---|---|---|
+| 1 Spec/Schema | HSH-01 | inline | T2, T9 |
+| 2 Transport/Artifact proofs | ENC-01..02, LCL-01, CON-04, ART_FETCH-01..02, NUG-01, TPS-01 | compose | T3, T4, T5 |
+| 3 Pattern/Engine/Logs proofs | PAT-01..02, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
+
 Notes:
-- CON-04 (host-key mismatch) and CON-05 (local, proven as LCL-01) are gate-tier
-  `in-process`/`service:local-shell` per `implementation-plan.md:127` and
-  `architecture.md` T4; the live WinRM legs CON-01..03 are lab-tier (Phase 5).
-- ART fetch/404/header (ART_FETCH-01..02, `service:httptest`, T5) are gate-tier;
-  the persisted-state legs ART-01..05 and the docker leg ART-06 are lab-tier
-  (Phases 4-5). ART-06 appears exactly once (Phase 4).
-- No phase uses `compose`: the gate host has no docker (`architecture.md:363`),
-  so docker-backed acceptance (docker_container, ART-06) is lab-only (Phase 4).
+- CON-04 (host-key mismatch, in-process stub) and LCL-01 (local round-trip) are
+  supplemental gate proofs (T4, per `implementation-plan.md:127` and
+  `architecture.md` T4/T5). The normative CON-05 (local on real W1) is lab-tier
+  (Phase 5); the live WinRM legs CON-01..03 are lab-tier (Phase 5).
+- ART fetch/404/header (ART_FETCH-01..02, `service:httptest`, T5) are supplemental
+  gate proofs; the normative persisted-state legs ART-01..05 and the docker leg
+  ART-06 are lab-tier (Phases 4-5). ART-06 appears exactly once (Phase 4).
+- Phase 2 is `compose` because T4/T5 are `service:*` pins that
+  `architecture.md:366-383` forbids as inline; its env-var-unset path
+  self-provisions in-process (httptest + local shell + stub key, no docker) so it
+  never skips. Docker-backed acceptance (docker_container, ART-06) is lab-only
+  (Phase 4); no phase relies on docker inside Forge's gate.
+- NET-02 runs against `LD_W1_NOASPNET_HOST` (a W1-class box lacking
+  `Microsoft.AspNetCore.App`), distinct from the primary `LD_W1_HOST` whose
+  bootstrap requires that runtime.
