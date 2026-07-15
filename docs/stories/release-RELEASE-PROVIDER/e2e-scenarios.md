@@ -916,49 +916,54 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
 - **Type**: lab-bare-metal
 - **Local**: the gate-tier `PIP_LINT-01` runs anywhere with `go test` (it only
   reads the two committed `examples/pipelines/*.yml` from the checkout). The live
-  PIP-01..03 run on the lab, not on a workstation. The GitHub Actions legs
-  (PIP-01/PIP-02) execute the shipped `examples/pipelines/github-deploy.yml`
-  directly by path with nektos `act` (`act workflow_dispatch -W
-  examples/pipelines/github-deploy.yml --input version=<v> --input checksum=<sha>
-  --secret-file <lab.env>`) -- `act` is a GitHub Actions runner that runs a workflow
-  file from an explicit path, so no `.github/workflows/` registration and no
-  `environment:` binding are needed (lab secrets are injected via `--secret-file`).
-  The ADO leg (PIP-03) runs an Azure DevOps pipeline definition that points at
-  `examples/pipelines/azure-pipelines.yml` (ADO allows a YAML definition at any repo
-  path) on pool `LabAgents`. Both take `version`+`checksum`
-  (`github-deploy.yml:5-11`, `azure-pipelines.yml:4-8`).
+  PIP-01..03 run on the L4 lab, not on a workstation. Per `architecture.md:400`
+  (L4) and `implementation-plan.md:484`,`:494`, the L4 lab provides a real,
+  registered self-hosted GitHub Actions runner and a real ADO agent against W1/C2 --
+  the SAME class of pre-provisioned lab dependency as W1 itself. The workflow
+  content under test is the shipped `examples/pipelines/github-deploy.yml`; the L4
+  lab is responsible for registering that reference as a runnable repo workflow
+  (GitHub Actions only executes workflows under `.github/workflows/` on a branch, so
+  registration is an L4 lab-provisioning step -- this suite does NOT author, commit,
+  or promote any `.github/workflows/` file into the worktree, and PIP_LINT-01 proves
+  the shipped content in the gate). The ADO leg (PIP-03) runs an Azure DevOps
+  pipeline definition pointed at `examples/pipelines/azure-pipelines.yml` on pool
+  `LabAgents`. Both take `version`+`checksum` (`github-deploy.yml:5-11`,
+  `azure-pipelines.yml:4-8`).
 - **CI runner**: ADO agent pool `LabAgents` (the pool named in
   `azure-pipelines.yml:13`) hosts the ADO pipeline definition; the GitHub legs run
-  on a self-hosted GitHub Actions runner labeled `[self-hosted, lab]` (the labels in
-  `github-deploy.yml:17`, mapped to the host via `act -P self-hosted=-self-hosted`),
-  same W1 class as Phase 5. The runner lays the provider into its filesystem mirror
-  via `make install` (`github-deploy.yml:28`) before the workflow runs.
+  on the L4 lab's real self-hosted GitHub Actions runner labeled `[self-hosted, lab]`
+  (the labels in `github-deploy.yml:17`), same W1 class as Phase 5. The runner lays
+  the provider into its filesystem mirror via `make install` (`github-deploy.yml:28`)
+  before the workflow runs.
 - **Secrets**: Azure Key Vault `kv-forge-lab` entries `labdeploy-lab-password` and
   `labdeploy-nuget-pat`, surfaced through the ADO variable group `lab-secrets`
   (referenced at `azure-pipelines.yml:11`) as secret variables `LABDEPLOY_PASSWORD`
   and `NUGET_PAT` **and** through the GitHub environment `lab` with secrets
   `LABDEPLOY_PASSWORD` and `NUGET_PAT` (the exact names read at
-  `github-deploy.yml:21-22` / `azure-pipelines.yml:33-34`). Target host from
-  KeyVault `labdeploy-w1-host` / GitHub environment variable `LD_W1_HOST`. Rollback
-  inputs are read from pre-existing GitHub/ADO variables `LAST_GOOD_VERSION` /
-  `LAST_GOOD_CHECKSUM` (maintained by the release process,
-  `github-deploy.yml:61-62`, `azure-pipelines.yml:61-62`); the test never writes
-  them. The GitHub secrets `LABDEPLOY_PASSWORD`/`NUGET_PAT` reach the workflow
-  through `act --secret-file` (sourced from KeyVault `kv-forge-lab` / the GitHub
-  environment `lab`), so no `environment:` job binding is required; the ADO secrets
-  reach the pipeline through variable group `lab-secrets`.
+  `github-deploy.yml:21-22` / `azure-pipelines.yml:33-34`). Real GitHub Actions
+  injects the GitHub environment `lab` secrets natively when the L4-registered
+  workflow declares `environment: lab` on its jobs (a lab-provisioning detail of the
+  registered workflow, not of the `examples/` template); the secret values are never
+  exported to a file. The ADO secrets reach the pipeline through variable group
+  `lab-secrets`. Target host from KeyVault `labdeploy-w1-host` / GitHub environment
+  variable `LD_W1_HOST`. Rollback inputs are read from pre-existing GitHub/ADO
+  variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM` (maintained by the release
+  process, `github-deploy.yml:61-62`, `azure-pipelines.yml:61-62`); the test never
+  writes them.
 - **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds
   or downloads `terraform-provider-labdeploy_v<version>` and lays it into the
   `%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\...` mirror
   with the `~/.terraformrc` filesystem_mirror block; then reuses `verify-w1.ps1`.
-  This provisions the PROVIDER binary only; the target OS tooling is
-  pre-provisioned. `PIP_LINT-01` needs no bootstrap (reads the committed files).
+  This provisions the PROVIDER binary only; the L4 GitHub Actions runner/registration
+  and target OS tooling are pre-provisioned lab dependencies (`architecture.md:400`).
+  `PIP_LINT-01` needs no bootstrap (reads the committed files).
 - **Gate provisioning**: `PIP_LINT-01` is the in-gate proof -- it parses the two
   committed `examples/pipelines/*.yml` from the checkout (deps: none, no docker, no
   runner, `implementation-plan.md:438`) and runs in Forge's gate every time. The
-  live PIP-01..03 skip when `LD_W1_HOST` / the self-hosted runner are unavailable
-  (allowed for `lab-*`); provider binary behavior and spec substitution are
-  additionally proven in Phases 1-3.
+  live PIP-01..03 skip when the L4 lab (`LD_W1_HOST`, the registered self-hosted
+  GitHub Actions runner, or the ADO agent) is unavailable (allowed for `lab-*`);
+  provider binary behavior and spec substitution are additionally proven in
+  Phases 1-3.
 
 ### Scenarios
 
@@ -976,17 +981,19 @@ package: PIP_LINT-01 is the gate-tier YAML-parse proof authorized at
 **Feature: reference pipeline integration (live lab)**
 
   Scenario: PIP-01 GitHub deploy workflow publishes results
-    Given the shipped `examples/pipelines/github-deploy.yml` executed by `act` on a
-    `[self-hosted, lab]` GitHub Actions runner (`implementation-plan.md:494`) with
-    `version=1.1.0` and `checksum=sha256:<good-hex>`
+    Given the shipped `examples/pipelines/github-deploy.yml` content, registered by
+    the L4 lab and run on its real `[self-hosted, lab]` GitHub Actions runner
+    (`architecture.md:400`, `implementation-plan.md:494`) with `version=1.1.0` and
+    `checksum=sha256:<good-hex>`
     When the `deploy` job runs
     Then it is green and the `always()` step uploads the `labdeploy-results-1.1.0`
-    artifact containing trx + summary + logs from `examples/labdeploy-results/**`.
+    artifact (via the real GitHub Actions artifact backend) containing trx + summary
+    + logs from `examples/labdeploy-results/**`.
 
   Scenario: PIP-02 GitHub deploy failure triggers auto-rollback
-    Given pre-existing repo variables `LAST_GOOD_VERSION=1.1.0` /
-    `LAST_GOOD_CHECKSUM=sha256:<good-hex>` (passed via `act --var-file`), executed
-    by `act` with `version=1.2.0-bad` and its `checksum`
+    Given pre-existing GitHub repository variables `LAST_GOOD_VERSION=1.1.0` /
+    `LAST_GOOD_CHECKSUM=sha256:<good-hex>`, run on the L4 lab's real GitHub Actions
+    runner with `version=1.2.0-bad` and its `checksum`
     When the `deploy` job runs
     Then it fails with `[ERR_SERVICE_START]`, the `rollback` job (`if: failure()`)
     applies `app_version=${{ vars.LAST_GOOD_VERSION }}` /
@@ -1065,10 +1072,11 @@ Notes:
 - Phase 8 PIP-01..03 run the SHIPPED assets `examples/pipelines/github-deploy.yml`
   and `azure-pipelines.yml` (the only pipeline files authorized by
   `implementation-plan.md` Stage 8.2, lines 428-429) on a GitHub Actions runner +
-  ADO agent against W1 (`implementation-plan.md:494`). The GitHub legs execute the
-  workflow file by path with nektos `act` (no `.github/workflows/` registration and
-  no `environment:` binding needed; lab secrets via `--secret-file`); the ADO leg
-  runs a pipeline definition pointed at the YAML path on pool `LabAgents`. They use
+  ADO agent against W1 (`implementation-plan.md:494`; `architecture.md:400` L4). The
+  GitHub legs run the shipped workflow content on the L4 lab's real registered
+  self-hosted GitHub Actions runner (workflow registration is L4 lab provisioning,
+  not a worktree file this suite authors); the ADO leg runs a pipeline definition
+  pointed at the YAML path on pool `LabAgents`. They use
   `version`+`checksum` inputs, `[self-hosted, lab]` / `LabAgents`, secrets
   `LABDEPLOY_PASSWORD`+`NUGET_PAT`, `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM` rollback
   variables, and artifact `labdeploy-results-<version>` -- the same names the
