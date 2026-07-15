@@ -9,9 +9,9 @@ terraform-plugin-framework, plugin protocol v6).
   `DRF-`, `DST-`, `IDP-`, `LCK-`, `E2E-`, `PIP-`, plus the P1 `DKR-` docker
   cases). Their test names MUST carry the same ID (e.g.
   `TestAcc_WSV_03_FailStartRollback`), per `tech-spec.md:294`.
-- **Supplemental gate-proof IDs** (`HSH-`, `ENC-`, `LCL-`, `ART_FETCH-`, `NUG-`,
-  `TPS-`, `PAT-`, `ENG-`, `LOG-`) are NOT DESIGN section 18 IDs. They name the
-  deterministic gate-host proofs that implement `architecture.md` section 6.1
+- **Supplemental gate-proof IDs** (`HSH-`, `SRT-`, `ENC-`, `LCL-`, `ART_FETCH-`,
+  `NUG-`, `TPS-`, `PAT-`, `ENG-`, `LOG-`) are NOT DESIGN section 18 IDs. They name
+  the deterministic gate-host proofs that implement `architecture.md` section 6.1
   pins T1-T9. They exist so the gate has coverage without a lab; they are marked
   "supplemental (T#)" wherever they appear and are listed separately in the
   Traceability table.
@@ -160,15 +160,32 @@ contacted; these run in Forge's gate on every change.
     When I run `terraform plan`
     Then it errors `[ERR_SPEC_INVALID]` (artifact x pattern rule, section 14).
 
-**Feature: Provider schema and canonical hashing (T2, T9)**
+**Feature: Provider schema, RequiresReplace, and canonical hashing (T2, T9)**
 
-  Scenario: VAL-10 Immutable field forces replace
-    Given an applied deployment with `pattern.install_root = C:\deploy`
-    When I change `install_root` and run `terraform plan`
-    Then the plan shows `# forces replacement` on the resource
-    And no in-place update is proposed (DESIGN section 5.2 immutable paths).
+  Scenario: VAL-10 Every immutable path forces replace (table-driven)
+    Given an applied deployment
+    When I change, one at a time, each immutable path -- `pattern.type`,
+    `pattern.*.service_name`, `pattern.*.role_name`, `pattern.install_root`,
+    `metadata.name`, `target.hosts` (set inequality), `target.os`
+    Then each change's `terraform plan` shows `# forces replacement` on the
+    resource and proposes no in-place update (DESIGN section 5.2 immutable set;
+    `implementation-plan.md:311`).
 
-  Scenario: HSH-01 Canonical JSON hash is key-order stable
+  Scenario: VAL-11 Mutable spec change is an in-place update
+    Given an applied deployment
+    When I change a mutable field (e.g. `artifact.version` / `environment`)
+    Then the plan is an in-place Update (no replacement), confirming the plan
+    modifier only trips on the immutable set.
+
+  Scenario: SRT-01 Provider state round-trip (T9)
+    Given a `labdeploy_deployment` (and a `labdeploy_e2e_test`) config
+    When the framework marshals the schema to state and back via
+    `terraform-plugin-framework` state round-trip (no provider server, no target)
+    Then every attribute (spec/spec_file one-of, computed `id`, `deployed_version`,
+    `hosts`, `spec_hash`, ...) survives unchanged and no `Unknown`/`Null`
+    mismatch is raised (`architecture.md:386` T9; `implementation-plan.md:293`).
+
+  Scenario: HSH-01 Canonical JSON hash is key-order stable (T2)
     Given two specs identical except for key ordering
     When each is canonicalized and hashed
     Then `spec_hash` is byte-identical (golden fixture compare).
@@ -190,14 +207,13 @@ lab (Phases 4-5), per `implementation-plan.md:126`.
 - **Type**: compose
 - **Local**: `docker compose -f tests/e2e/transport-artifact/docker-compose.yml
   up -d --wait` then `go test ./internal/transport/... ./internal/artifact/...
-  -run 'ENC|LCL|ART_FETCH|NUG|TPS|CON_04'`. Set `LD_ARTIFACT_URL` /
-  `LD_SSH_ENDPOINT` to the compose services; leave them unset to use the
-  in-process fallback.
+  -run 'ENC|LCL|ART_FETCH|NUG|TPS|CON_04'`. Set `LD_ARTIFACT_URL` to the compose
+  artifact service; leave it unset to use the in-process httptest fallback.
 - **CI runner**: GitHub-hosted `ubuntu-latest` (plus `windows-latest` for the
   PowerShell EncodedCommand and `transport: local` Windows legs). Gate host.
 - **Secrets**: none. The artifact auth-header leg reads a throwaway value from a
-  test-scoped env var name; the compose sshd/artifact host use non-secret
-  container credentials from the compose `.env`; no real credential is involved.
+  test-scoped env var name; the compose artifact host uses non-secret container
+  credentials from the compose `.env`; no real credential is involved.
 - **Pre-test bootstrap**:
   `docker compose -f tests/e2e/transport-artifact/docker-compose.yml up -d --wait`
   (only for the env-var-set path; the gate/unset path needs no bootstrap).
@@ -218,8 +234,10 @@ services (env-var-set path only):
 - `artifacts` -- nginx serving `sample-svc` zip/nupkg plus a 404 route and a
   bearer-auth location, mirroring the httptest routes (target of
   `LD_ARTIFACT_URL`).
-- `sshd` -- OpenSSH server (target of `LD_SSH_ENDPOINT`) for an optional live SFTP
-  round-trip; unset => in-process stub, no live sshd.
+
+No sshd service is provisioned here: live SSH/SFTP round-trip is lab-only
+(`implementation-plan.md:126`) and is exercised as CON-06 in Phase 4. Phase 2
+proves ONLY the in-process host-key-mismatch mapping (CON-04) with a stub key.
 
 ### Scenarios
 
@@ -312,6 +330,13 @@ proven so the gate never depends on a lab.
     When the winsw xml and the cluster create/move/rollback scripts are generated
     Then each matches its golden.
 
+  Scenario: PAT-03 docker_container run/rollback golden
+    Given a `docker_container` spec (ports, volumes, env, restart_policy, digest)
+    When the `docker run`/replace and rollback (previous-image restore) scripts
+    are generated
+    Then each matches its committed golden (`implementation-plan.md:421`),
+    covering the sixth pattern that PAT-01 omits.
+
 **Feature: Engine state machine over fake transport (T7)**
 
   Scenario: ENG-01 Rollback matrix rows
@@ -354,11 +379,18 @@ docker, so these run only on a Linux lab VM.
 - **Type**: lab-bare-metal
 - **Local**: point `LD_L1_HOST` at a personal Linux VM (sshd + docker), set
   `LABDEPLOY_PASSWORD` (or `LD_SSH_KEY`), then
-  `go test ./test/e2e/linux/... -run 'CAP_03|IDP|LCK|DRF_02|DST_02|ART_06|DKR'
-  -tags acc` with `TF_ACC=1`.
+  `go test ./test/e2e/linux/... -run
+  'CON_06|CAP_03|IDP|LCK|DRF_02|DST_02|ART_06|DKR' -tags acc` with `TF_ACC=1`.
 - **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
   `[self-hosted, linux, forge-lab-hw]`. L1 Linux VM (Ubuntu 22.04) with sshd and
   docker preinstalled.
+- **Artifact source (HTTP, with injectable delay)**: the http zip source is
+  addressed by env-var name `LD_L1_ARTIFACT_URL`; the seeding script stands up a
+  tiny static file host on the L1 VM whose `/slow/*` route honors a
+  `LD_ARTIFACT_DELAY_MS` env var (a sleep before first byte). LCK-01 points apply
+  A at `${LD_L1_ARTIFACT_URL}/slow/sample-svc-1.0.0.zip` with
+  `LD_ARTIFACT_DELAY_MS=30000` to hold the `.lock` open deterministically while
+  apply B races; no wall-clock guesswork.
 - **Registry source**: the docker registry (ART-06, DKR-01..03) is addressed by
   env-var name only: `LD_REGISTRY` (registry host), `LD_REGISTRY_USER` (username),
   and `LD_REGISTRY_PASSWORD` (resolved via `auth.password_env`). The
@@ -371,23 +403,34 @@ docker, so these run only on a Linux lab VM.
   **and** GitHub environment `lab-linux` secrets `LAB_PASSWORD`, `REGISTRY_USER`,
   `REGISTRY_PASSWORD` (mapped to the same env-var names). Target host from
   KeyVault entry `labdeploy-l1-host` / GitHub environment variable `LD_L1_HOST`;
-  registry host from GitHub environment variable `LD_REGISTRY`.
+  registry host + artifact host from GitHub environment variables `LD_REGISTRY` /
+  `LD_L1_ARTIFACT_URL`.
 - **Pre-test bootstrap**: `bash tests/e2e/linux/verify-l1.sh` -- VERIFIES (does
-  not install) `sshd`, `docker version`, and free disk, then SEEDS the registry
-  by building/tagging and `docker push`ing the `sample-svc` `1.0.0`/`1.1.0`
-  images to `LD_REGISTRY` (recording the `1.1.0` digest into a fixture for
-  DKR-02); idempotent. It VERIFIES OS prerequisites and only SEEDS test images;
-  it never installs docker or runtimes (targets are pre-provisioned,
-  `tech-spec.md:165-170`). ART-06 supplies a deliberately wrong
+  not install) `sshd`, `docker version`, and free disk, then SEEDS (a) the http
+  artifact host serving `sample-svc` zip fixtures incl. the delay-controlled
+  `/slow/*` route and (b) the registry by building/tagging and `docker push`ing
+  the `sample-svc` `1.0.0`/`1.1.0` images to `LD_REGISTRY` (recording the `1.1.0`
+  digest into a fixture for DKR-02); idempotent. It VERIFIES OS prerequisites and
+  only SEEDS test fixtures; it never installs docker or runtimes (targets are
+  pre-provisioned, `tech-spec.md:165-170`). ART-06 supplies a deliberately wrong
   `LD_REGISTRY_PASSWORD` to force the `docker login` failure.
 - **Gate provisioning**: n/a (lab). These scenarios skip when `LD_L1_HOST` is
   unset (allowed for `lab-*`); the deterministic slices (fetch, prune, lock,
-  idempotent short-circuit, docker script generation) are proven in Phases 2-3
-  so the gate is never empty.
+  idempotent short-circuit, and docker run/rollback script generation via PAT-03)
+  are proven in Phases 2-3 so the gate is never empty.
 
 ### Scenarios
 
-**Feature: console_app on Linux and generic lifecycle**
+**Feature: Linux transport, console_app, and generic lifecycle**
+
+  Scenario: CON-06 Live SSH dial and SFTP round-trip
+    Given `env(LD_L1_HOST)` reachable over `ssh` with `LABDEPLOY_PASSWORD` or
+    `LD_SSH_KEY`
+    When `Connect`/`Exec`/`Upload`/`Download` run over the ssh transport
+    Then data round-trips, auth rejection is not retried, and a bad
+    `ssh.host_key` maps to `[ERR_CONNECT]` `host key mismatch`
+    (live SSH is lab per `implementation-plan.md:126`; the in-process host-key
+    stub is the supplemental CON-04 in Phase 2).
 
   Scenario: CAP-03 Linux console over ssh uses a symlink
     Given a fresh apply of `sample-svc` v1.0.0 over `ssh` on linux
@@ -406,7 +449,9 @@ docker, so these run only on a Linux lab VM.
     Then the plan is CREATE and apply reinstalls cleanly over the leftovers.
 
   Scenario: LCK-01 Second concurrent apply fails fast
-    Given apply A is mid-flight holding `.lock` (slow-artifact route)
+    Given apply A is mid-flight holding `.lock`, fetching
+    `${LD_L1_ARTIFACT_URL}/slow/sample-svc-1.0.0.zip` with
+    `LD_ARTIFACT_DELAY_MS=30000`
     When apply B runs in parallel against the same target
     Then B fails in < 5s with `[ERR_LOCKED]` naming A's owner; A completes.
 
@@ -909,8 +954,8 @@ the authoritative contract.
 
 | Phase | Tier | Scenario IDs | Type | Proof pin |
 |---|---|---|---|---|
-| 1 Spec/Schema | gate | VAL-01..10 | inline | T1 |
-| 4 Linux + Docker | lab | CAP-03, IDP-01, DRF-02, LCK-01..02, DST-02, ART-06, DKR-01..03 | lab-bare-metal | L2 |
+| 1 Spec/Schema | gate | VAL-01..11, SRT-01 | inline | T1, T9 |
+| 4 Linux + Docker | lab | CON-06, CAP-03, IDP-01, DRF-02, LCK-01..02, DST-02, ART-06, DKR-01..03 | lab-bare-metal | L2 |
 | 5 Windows single-target | lab | CON-01..03, CON-05, ART-01..05, CAP-01..02, WSV-01..08, NOD-01..03, NET-01..02, RBK-01..02, DRF-01/03, DST-01 | lab-bare-metal | L1 |
 | 6 Failover cluster | lab | CLU-01..08 | lab-wsfc | L3 |
 | 7 E2E test resource | lab | E2E-01..07 | lab-bare-metal | L1 |
@@ -920,9 +965,9 @@ the authoritative contract.
 
 | Phase | Supplemental IDs | Type | Proof pin |
 |---|---|---|---|
-| 1 Spec/Schema | HSH-01 | inline | T2, T9 |
+| 1 Spec/Schema | HSH-01 | inline | T2 |
 | 2 Transport/Artifact proofs | ENC-01..02, LCL-01, CON-04, ART_FETCH-01..02, NUG-01, TPS-01 | compose | T3, T4, T5 |
-| 3 Pattern/Engine/Logs proofs | PAT-01..02, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
+| 3 Pattern/Engine/Logs proofs | PAT-01..03, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
 
 Notes:
 - CON-04 (host-key mismatch, in-process stub) and LCL-01 (local round-trip) are
@@ -940,3 +985,13 @@ Notes:
 - NET-02 runs against `LD_W1_NOASPNET_HOST` (a W1-class box lacking
   `Microsoft.AspNetCore.App`), distinct from the primary `LD_W1_HOST` whose
   bootstrap requires that runtime.
+- CON-06 (live SSH dial + SFTP round-trip) is lab-tier (Phase 4) per
+  `implementation-plan.md:126`; its in-process host-key-mismatch counterpart is
+  the supplemental CON-04 (Phase 2). No live sshd runs in Forge's gate.
+- SRT-01 (provider-state round-trip, T9) and VAL-11 (mutable field in-place
+  update) are gate-runnable in Phase 1 alongside VAL-01..10; VAL-10 is
+  table-driven over the full immutable set (`architecture.md:386`,
+  `implementation-plan.md:311`).
+- PAT-03 (docker_container run/rollback golden, `implementation-plan.md:421`) is
+  the gate-tier script-generation proof for the docker engine; the live docker
+  run/rollback legs are DKR-01..03 (Phase 4).
