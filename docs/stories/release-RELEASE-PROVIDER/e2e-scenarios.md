@@ -1,71 +1,93 @@
 # release provider -- E2E Scenarios (QA acceptance)
 
 Gherkin-style feature scenarios for `terraform-provider-labdeploy` (Go,
-terraform-plugin-framework, plugin protocol v6). These are the executable
-acceptance gate QA runs against the provider. Scenario IDs map 1:1 to the
+terraform-plugin-framework, plugin protocol v6). Scenario IDs map 1:1 to the
 normative matrix in `.forge-attachments/DESIGN.md` section 18; test names MUST
 carry the same ID (e.g. `TestAcc_WSV_03_FailStartRollback`).
 
-Cross-references (do not duplicate -- see sibling docs):
-- Component boundaries, `Transport`/`Pattern`/engine contracts:
-  `docs/stories/release-RELEASE-PROVIDER/architecture.md`.
-- Schema field tables, error taxonomy, decision table:
-  `docs/stories/release-RELEASE-PROVIDER/tech-spec.md`.
-- Phase/stage build order (Phase 1..9): `implementation-plan.md`. The phase
-  numbers below intentionally mirror that plan so a phase's tests land in the
-  same iteration that builds its code.
+## Proof-tier model (why phases are typed the way they are)
+
+This document is anchored to the **Test & Environment Contract** in
+`architecture.md` section 6, which is authoritative:
+
+- **The gate host has NO docker and NO pre-provisioned services**
+  (`architecture.md:363`). Therefore `compose` (docker-compose) is NOT a usable
+  Type for this provider -- there is no docker on the gate. Every phase here is
+  either `inline` (gate-host proofs) or `lab-*` (live targets).
+- **Gate-host proof tier** (`architecture.md` section 6.1, pins T1..T9):
+  deterministic proofs that run in Forge's gate with zero external
+  dependencies -- `in-process` (table-driven `go test`), `golden` (committed
+  snapshots), `service:httptest` (Go `net/http/httptest` ephemeral, bundled
+  stdlib, no docker), and `service:local-shell` (the gate's own `powershell`/`sh`
+  via `transport: local`). These are Phases 1-3 below; they self-provision and
+  never skip.
+- **Live-lab acceptance tier** (`architecture.md` section 6.2, pins L1..L4;
+  `implementation-plan.md` Phase 9): the DESIGN section 18 matrix
+  (CON/ART/CAP/WSV/NOD/NET/CLU/RBK/DRF/DST/IDP/LCK/E2E/PIP) mutates real remote
+  targets and asserts persisted state, so it can only run on lab VMs/clusters
+  behind `TF_ACC=1`. These are Phases 4-8; a missing-target skip is allowed here
+  (and ONLY here) per the closed-set rule.
+
+Cross-references (do not duplicate): component/`Transport`/`Pattern`/engine
+contracts in `architecture.md`; schema field tables + error taxonomy in
+`tech-spec.md`; build order (Phases 1-9) in `implementation-plan.md`. Phase
+numbers below track that plan: gate proofs are authored alongside their code
+(Phases 1-8 of the plan) and the live matrix is the Phase 9 acceptance gate,
+here decomposed by target class (Linux, Windows, cluster, pipeline).
 
 ## Conventions (apply to every scenario)
 
-- **Secrets are env-var NAMES, never values.** Specs and Terraform state carry
-  only the *name* of a runner env var (e.g. `password_env: LABDEPLOY_PASSWORD`);
-  the provider resolves the value with `os.Getenv` at runtime (DESIGN section 11,
-  D6). No scenario embeds a literal hostname, password, token, or key.
-- **Target/host indirection.** The target host itself is supplied through an
-  env var (`LD_TARGET_HOST`, `LD_CN1_HOST`, `LD_CN2_HOST`, ...) so the same
-  scenario body runs against a compose container, an embedded server, or a lab
-  box without edits.
-- **Connection env-var switch.** Each `inline`/`compose` phase reads a single
-  "connection endpoint" env var (named per phase). When it is **set**, the suite
-  talks to the CI-provided service (docker-compose or lab). When it is **unset**,
-  the suite self-provisions an embedded/ephemeral dependency IN-PROCESS (no
-  docker) so the scenario still runs in Forge's gate instead of skipping.
+- **Secrets are env-var NAMES, never values** (DESIGN section 11, D6). Specs and
+  Terraform state carry only the *name* of a runner env var (e.g.
+  `password_env: LABDEPLOY_PASSWORD`); the provider resolves the value with
+  `os.Getenv` at runtime. No scenario embeds a literal hostname, password, token,
+  or key.
+- **Target/host indirection.** Every lab target host is supplied through an env
+  var (`LD_W1_HOST`, `LD_L1_HOST`, `LD_CN1_HOST`, `LD_CN2_HOST`, ...), so a
+  scenario body is identical across developer VMs and lab pools.
+- **Lab connection switch.** Each `lab-*` phase reads its target-endpoint env var
+  (named in Setup). When it is unset, the acceptance case skips (allowed only for
+  `lab-*`); the deterministic slice of that behavior is already proven in the
+  gate tier (Phases 1-3), so coverage is never zero.
 - **Terminology.** "apply => error CODE" means `terraform apply` exits non-zero
   and stderr contains `[CODE]`. "plan empty" means
   `terraform plan -detailed-exitcode` exits 0. Every scenario ends by asserting
   `.lock` is absent on all touched hosts (DESIGN section 13).
+- **Targets are pre-provisioned.** Base OS tooling (WinRM, node/npm, .NET
+  runtime, vstest, docker) is installed out of band; the provider never installs
+  third-party binaries and lab bootstrap only VERIFIES prerequisites
+  (`tech-spec.md:165-170`, DESIGN D2).
 - **Test app.** `sample-svc` (tiny .NET worker) packaged as zip + nupkg at
   `1.0.0`, `1.1.0`, `1.2.0-bad` (fail-start). `sample-tests` (vstest) has 3 pass
   tests plus a fail-on-demand test via `FAIL_ONE=1`. Health endpoint returns
   `200` with body `v=<LD_VERSION>`; `--fail-start` exits immediately;
   `--health 500` serves 500.
-- **`TF_ACC`.** Acceptance tests gate on `TF_ACC=1`
-  (`terraform-plugin-testing`). Gate-provisioned inline scenarios set it
-  automatically; lab-only scenarios additionally require the lab connection env
-  var and skip (allowed only for `lab-*`) when it is absent.
 
 ---
 
-# Phase 1: Spec Validation and Provider Schema
+# Phase 1: Spec Validation and Provider Schema (gate proofs)
 
-Covers DESIGN section 18.1 (VAL) plus the Terraform-schema one-of/RequiresReplace
-rules from section 5. No target is contacted; these are the fastest gate tests
-and must pass before any transport work.
+Gate-host proofs pinned `in-process`/`golden` (`architecture.md` section 6.1 T1,
+T2, T9). Covers DESIGN section 18.1 (VAL) plus canonical-hash stability and the
+Terraform schema one-of / RequiresReplace rules (DESIGN section 5). No target is
+contacted; these run in Forge's gate on every change.
 
 ### Setup
 - **Type**: inline
 - **Local**: `go test ./internal/provider/... ./internal/spec/... -run VAL`
-  (unit + `terraform-plugin-testing` cases). No network, no VM.
-- **CI runner**: GitHub-hosted `ubuntu-latest` (and a matrix leg on
-  `windows-latest` to prove path/regex parity). No labels required.
+  (table-driven unit + `terraform-plugin-testing` schema cases). No network, no
+  VM, no docker.
+- **CI runner**: GitHub-hosted `ubuntu-latest`, with a `windows-latest` matrix
+  leg for path/regex parity. No labels required; this is the gate host.
 - **Secrets**: none.
-- **Pre-test bootstrap**: none (`go` toolchain from `go.mod`, Terraform CLI from
+- **Pre-test bootstrap**: none (Go toolchain from `go.mod`, Terraform CLI from
   `hashicorp/setup-terraform`).
-- **Gate provisioning**: none needed -- validation short-circuits before any
-  dial. VAL-01 asserts "no connection attempted" by pointing `target.hosts` at
-  an unroutable value taken from `LD_UNROUTABLE_HOST` (default `192.0.2.1`,
-  TEST-NET-1) and asserting the error is `ERR_SPEC_INVALID`, never
-  `ERR_CONNECT`.
+- **Gate provisioning**: dependency-free by construction. Validation
+  short-circuits before any dial; VAL-01 proves "no connection attempted" by
+  pointing `target.hosts` at `env(LD_UNROUTABLE_HOST)` (default `192.0.2.1`,
+  TEST-NET-1) and asserting `ERR_SPEC_INVALID`, never `ERR_CONNECT`. Canonical
+  hash uses a committed `internal/spec/testdata` fixture (golden). No embedded
+  service, no docker.
 
 ### Scenarios
 
@@ -75,8 +97,7 @@ and must pass before any transport work.
     Given a `labdeploy_deployment` whose `spec` has a tab-broken YAML block
     And `target.hosts = [ env(LD_UNROUTABLE_HOST) ]`
     When I run `terraform plan`
-    Then it errors `[ERR_SPEC_INVALID]`
-    And the message contains the offending line number
+    Then it errors `[ERR_SPEC_INVALID]` with the offending line number
     And no connection is attempted (no `ERR_CONNECT`, wall time < 2s).
 
   Scenario: VAL-02 Missing required artifact.version
@@ -105,7 +126,7 @@ and must pass before any transport work.
     Then it returns a schema error `exactly one of spec, spec_file`.
 
   Scenario: VAL-07 Unresolved variable token
-    Given `${var:missing}` appears in the spec and `variables` omits `missing`
+    Given `${var:missing}` in the spec and `variables` omits `missing`
     When I run `terraform plan`
     Then it errors `[ERR_SPEC_INVALID]` `unresolved variable missing at <path>`.
 
@@ -120,388 +141,443 @@ and must pass before any transport work.
     When I run `terraform plan`
     Then it errors `[ERR_SPEC_INVALID]` (artifact x pattern rule, section 14).
 
-  Scenario: VAL-10 Immutable field forces replace (schema plan modifier)
+**Feature: Provider schema and canonical hashing (T2, T9)**
+
+  Scenario: VAL-10 Immutable field forces replace
     Given an applied deployment with `pattern.install_root = C:\deploy`
     When I change `install_root` and run `terraform plan`
-    Then the plan shows `# forces replacement`
+    Then the plan shows `# forces replacement` on the resource
     And no in-place update is proposed (DESIGN section 5.2 immutable paths).
+
+  Scenario: HSH-01 Canonical JSON hash is key-order stable
+    Given two specs identical except for key ordering
+    When each is canonicalized and hashed
+    Then `spec_hash` is byte-identical (golden fixture compare).
 
 ---
 
-# Phase 2: Connectivity and Transport
+# Phase 2: Transport and Artifact Gate Proofs
 
-Covers DESIGN section 18.2 (CON) across `ssh`, `winrm`, and `local` transports.
-The `winrm-https` legs are genuinely Windows-Server behaviors validated in the
-lab phases; here we prove the transport state machine (retries, auth-no-retry,
-host-key pinning, local no-socket) with an in-process SSH server so the gate
-never skips.
+Gate-host proofs pinned `golden`, `service:local-shell`, and `service:httptest`
+(`architecture.md` section 6.1 T3, T4, T5). These prove the deterministic,
+target-independent slices of transport and artifact handling -- PowerShell
+EncodedCommand bytes, chunking math, env-escaping, local round-trip, sha/404
+fetch, NuGet URL, target-pull script, and the in-process host-key-mismatch
+mapping (`implementation-plan.md:127` pins host-key mismatch `in-process`). Live
+SSH/WinRM round-trips and persisted-state assertions are NOT here -- they are
+lab (Phases 4-5), per `implementation-plan.md:126`.
 
 ### Setup
-- **Type**: compose
-- **Local**: `docker compose -f tests/e2e/connectivity/docker-compose.yml up -d`
-  then `go test ./test/e2e/connectivity/... -run CON`. Set
-  `LD_SSH_ENDPOINT=env(host:port)` to target the compose sshd.
-- **CI runner**: GitHub-hosted `ubuntu-latest` for ssh/local legs. The winrm
-  leg (CON-01) is deferred to Phase 5 (`lab-bare-metal`).
-- **Secrets**: none for gate provisioning (ephemeral keypair generated in-test).
-  The compose path reads `LABDEPLOY_PASSWORD` from a throwaway container
-  credential injected by the compose file's `.env` (non-secret lab value).
-- **Pre-test bootstrap**:
-  `docker compose -f tests/e2e/connectivity/docker-compose.yml up -d --wait`.
-- **Gate provisioning**: when `LD_SSH_ENDPOINT` is **unset**, the suite starts an
-  embedded SSH server in-process (`gliderlabs/ssh`) on `127.0.0.1:0`, generates
-  an ephemeral host + client keypair, exports the private-key PEM into the env
-  var named by `private_key_env`, and points `LD_TARGET_HOST` at the loopback
-  listener. No docker, no pre-provisioned service. The `local` transport legs
-  (CON-05) always run in-process. The compose file's sshd remains the
-  `LD_SSH_ENDPOINT`-set path in CI.
-
-**docker-compose.yml** (`tests/e2e/connectivity/docker-compose.yml`) services:
-- `sshd` -- OpenSSH server (linux target for CON-03/CON-04), exposes 22.
-- `blackhole` -- an iptables-drop sidecar used to simulate a firewall-dropped
-  port for CON-03 (connect stalls, no RST).
+- **Type**: inline
+- **Local**: `go test ./internal/transport/... ./internal/artifact/...
+  -run 'ENC|LCL|ART_FETCH|NUG|TPS|CON_04'`.
+- **CI runner**: GitHub-hosted `ubuntu-latest` (plus `windows-latest` for the
+  PowerShell EncodedCommand and `transport: local` Windows legs). Gate host.
+- **Secrets**: none. The artifact auth-header leg reads a throwaway value from a
+  test-scoped env var name; no real credential is involved.
+- **Pre-test bootstrap**: none.
+- **Gate provisioning**: the artifact fetch cases start a Go
+  `net/http/httptest.Server` on `127.0.0.1:0` (bundled stdlib, no docker) with a
+  200 route, a 404 route, and a bearer-auth route; when `LD_ARTIFACT_URL` is
+  unset this in-process server IS the endpoint. Local round-trip uses the gate's
+  own OS shell via `transport: local` (`service:local-shell`), gated on
+  `runtime.GOOS` matching the pattern OS. EncodedCommand/chunking/NuGet-URL/
+  target-pull-script are compared against committed `.golden` fixtures under
+  `internal/transport/testdata` and `internal/artifact/testdata`. Host-key
+  mismatch is proven against an in-process stub key -- no live sshd, no
+  third-party SSH server dependency.
 
 ### Scenarios
 
-**Feature: Transport connect, auth, and retry semantics**
+**Feature: Transport encoding and local execution (T3, T4)**
 
-  Scenario: CON-01 WinRM HTTPS with self-signed cert (lab)
-    Given a Windows target reachable over `winrm` HTTPS with
-    `insecure_skip_verify = true`
+  Scenario: ENC-01 PowerShell EncodedCommand is byte-exact
+    Given a known script and env map with a quote (`O'Brien`)
+    When the Windows transport builds the `-EncodedCommand` payload
+    Then the base64(UTF-16LE) bytes match the golden
+    And env values are single-quote escaped, never on the command line.
+
+  Scenario: ENC-02 Upload chunk math boundaries
+    Given payloads of 0, 1, 48000, and 48001 bytes
+    When the WinRM chunked-append upload is planned
+    Then the chunk count and offsets match the golden for each size.
+
+  Scenario: LCL-01 Local transport round-trip
+    Given `transport = local` with `os` matching the gate host
+    When `Exec`, `Upload`, and `Download` run against a temp dir
+    Then data round-trips and no network socket is opened.
+
+  Scenario: CON-04 SSH host-key mismatch mapping (in-process)
+    Given a pinned wrong `ssh.host_key` and an in-process stub server key
+    When `Connect` runs
+    Then it errors `[ERR_CONNECT]` with detail `host key mismatch`
+    (no live sshd; per `implementation-plan.md:127`).
+
+**Feature: Artifact fetch and pull-script generation (T5)**
+
+  Scenario: ART_FETCH-01 Sha stream verify and 404 (httptest)
+    Given the httptest server serving a zip with a correct sha and a 404 route
+    When `Fetch` runs against each
+    Then the good sha passes and the 404 yields `[ERR_ARTIFACT_FETCH]`
+    including `404` and the first 256B of the body.
+
+  Scenario: ART_FETCH-02 Header auth is injected
+    Given an http source with `auth.header` and `auth.token_env`
+    When `Fetch` runs against the bearer-auth httptest route
+    Then the request carries the header value from the env var
+    And the value never appears in logs.
+
+  Scenario: NUG-01 NuGet v3 flat-container URL construction
+    Given a `nuget_feed` source with `package_id` and `artifact.version`
+    When the download URL is built
+    Then it matches `<feed>/flatcontainer/<idLower>/<verLower>/<idLower>.<verLower>.nupkg`.
+
+  Scenario: TPS-01 Target-pull script matches golden
+    Given an http source with `fetch_mode = target_pull`
+    When `TargetPullScript` is generated for windows and linux
+    Then each script matches the committed golden (exit 41 on sha mismatch)
+    And `LD_AUTH_VALUE` is injected via `Cmd.Env`, never inline.
+
+---
+
+# Phase 3: Pattern, Engine, and Logs Gate Proofs
+
+Gate-host proofs pinned `golden` and `in-process` (`architecture.md` section 6.1
+T6, T7, T8). Proves pattern script generation (all 5 patterns + winsw + cluster),
+the engine state machine over a fake `Transport` (every DESIGN section 10.2
+rollback row, prune-keeps-previous, stale-vs-fresh lock, idempotent
+short-circuit), and TRX/JUnit counter parsing. Zero external I/O; this is where
+the deterministic core of the live matrix (WSV/CLU/RBK/DRF/IDP/LCK/E2E) is
+proven so the gate never depends on a lab.
+
+### Setup
+- **Type**: inline
+- **Local**: `go test ./internal/pattern/... ./internal/engine/...
+  ./internal/logs/... -run 'PAT|ENG|LOG'`.
+- **CI runner**: GitHub-hosted `ubuntu-latest`. Gate host.
+- **Secrets**: none.
+- **Pre-test bootstrap**: none.
+- **Gate provisioning**: the engine tests inject a fake `Transport` with a
+  scripted `Result` queue through the engine's `NewTransport` seam (no sockets);
+  pattern and logs tests compare generated PowerShell/xml and parsed counters
+  against committed `.golden`/fixture files under `internal/*/testdata`. No
+  docker, no service, no target.
+
+### Scenarios
+
+**Feature: Pattern script generation (T6)**
+
+  Scenario: PAT-01 Fresh vs update S4 scripts for all five patterns
+    Given each of console_app, windows_service, node_web_app, dotnet_api,
+    cluster_generic_service
+    When the S4 switchover script is generated for fresh and update
+    Then each matches its committed golden.
+
+  Scenario: PAT-02 WinSW xml and cluster scripts
+    Given a winsw-wrapped service and a cluster role
+    When the winsw xml and the cluster create/move/rollback scripts are generated
+    Then each matches its golden.
+
+**Feature: Engine state machine over fake transport (T7)**
+
+  Scenario: ENG-01 Rollback matrix rows
+    Given a fake transport scripted to fail at each DESIGN section 10.2 step
+    When Deploy runs
+    Then the resulting machine/state matches the matrix row (fresh vs update)
+    And the `.lock` is released on every error path.
+
+  Scenario: ENG-02 Prune keeps previous and honors keep_releases
+    Given `keep_releases = 2` and a scripted successful finalize
+    When prune runs
+    Then the oldest is removed and `previous_version` is never deleted.
+
+  Scenario: ENG-03 Lock stale vs fresh and idempotent short-circuit
+    Given a scripted existing `.lock` (fresh, then aged beyond timeout) and a
+    manifest whose version+checksum already match
+    When Deploy runs
+    Then fresh lock yields `[ERR_LOCKED]`, aged lock is overridden with a WARN,
+    and the matching manifest short-circuits to a no-op (DESIGN section 10.1).
+
+**Feature: Result parsing (T8)**
+
+  Scenario: LOG-01 TRX and JUnit counter parse
+    Given committed TRX and JUnit fixtures (single and multiple files)
+    When counters are parsed
+    Then total/passed/failed/skipped match the expected sums
+    And `results.format: none` yields counters of `-1`.
+
+---
+
+# Phase 4: Linux and Docker Single-Target Acceptance (lab)
+
+Live acceptance pinned `lab` (`architecture.md` section 6.2 L2;
+`implementation-plan.md:476,483`). Covers the Linux console path (DESIGN 18.4
+CAP-linux), Linux drift/idempotency/lock lifecycle (DESIGN 18.8 subset), and the
+docker patterns (DESIGN 18.3 ART-06 + docker_container). The gate host has no
+docker, so these run only on a Linux lab VM.
+
+### Setup
+- **Type**: lab-bare-metal
+- **Local**: point `LD_L1_HOST` at a personal Linux VM (sshd + docker), set
+  `LABDEPLOY_PASSWORD` (or `LD_SSH_KEY`), then
+  `go test ./test/e2e/linux/... -run 'CAP_03|IDP|LCK|DRF_02|DST_02|ART_06|DKR'
+  -tags acc` with `TF_ACC=1`.
+- **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
+  `[self-hosted, linux, forge-lab-hw]`. L1 Linux VM (Ubuntu 22.04) with sshd and
+  docker preinstalled.
+- **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
+  (ADO variable group `forge-lab-hw-vg`, mapped to `env: LABDEPLOY_PASSWORD`)
+  **and** GitHub environment `lab-linux` secret `LAB_PASSWORD` (mapped to
+  `env: LABDEPLOY_PASSWORD`). Target host and registry come from KeyVault entries
+  `labdeploy-l1-host`/`labdeploy-registry-password` and GitHub environment
+  variables `LD_L1_HOST`/`LD_REGISTRY`.
+- **Pre-test bootstrap**: `bash tests/e2e/linux/verify-l1.sh` -- VERIFIES (does
+  not install) `sshd`, `docker version`, and free disk; fails fast if a
+  prerequisite is missing (targets are pre-provisioned, `tech-spec.md:165-170`).
+- **Gate provisioning**: n/a (lab). These scenarios skip when `LD_L1_HOST` is
+  unset (allowed for `lab-*`); the deterministic slices (fetch, prune, lock,
+  idempotent short-circuit, docker script generation) are proven in Phases 2-3
+  so the gate is never empty.
+
+### Scenarios
+
+**Feature: console_app on Linux and generic lifecycle**
+
+  Scenario: CAP-03 Linux console over ssh uses a symlink
+    Given a fresh apply of `sample-svc` v1.0.0 over `ssh` on linux
+    When I apply
+    Then apply succeeds and `current` is a symlink verified via `readlink`
+    And outputs `deployed_version = 1.0.0`, `service_status = n/a`.
+
+  Scenario: IDP-01 Re-apply of identical spec is a no-op
+    Given an applied deployment (app running)
+    When I re-apply the identical spec
+    Then plan is empty, `-refresh-only` shows no changes, and mtimes are unchanged.
+
+  Scenario: DRF-02 Deleted manifest forces clean recreate
+    Given I delete `manifest.json` on the target
+    When I run `terraform plan`
+    Then the plan is CREATE and apply reinstalls cleanly over the leftovers.
+
+  Scenario: LCK-01 Second concurrent apply fails fast
+    Given apply A is mid-flight holding `.lock` (slow-artifact route)
+    When apply B runs in parallel against the same target
+    Then B fails in < 5s with `[ERR_LOCKED]` naming A's owner; A completes.
+
+  Scenario: LCK-02 Stale lock is overridden
+    Given a planted `.lock` aged beyond `lock_timeout_seconds`
+    When I apply
+    Then apply succeeds with a WARN `stale lock ... overridden`.
+
+  Scenario: DST-02 Destroy mode abandon makes no connection
+    Given `destroy_mode = abandon` and an unroutable `LD_L1_HOST`
+    When I run `terraform destroy`
+    Then destroy succeeds without contacting the target and state is empty.
+
+**Feature: docker_container and docker_registry**
+
+  Scenario: ART-06 docker_registry bad credentials
+    Given a `docker_registry` source whose `password_env` value is wrong
+    When I apply
+    Then it errors `[ERR_ARTIFACT_FETCH]` containing a `docker login` stderr
+    snippet and the container list is unchanged.
+
+  Scenario: DKR-01 Fresh container deploy by tag
+    Given a `docker_container` spec for `sample-svc` with `ports` and a
+    `restart_policy`
+    When I apply
+    Then the container runs, `GET /health` returns 200
+    And `manifest.json` records the running image reference.
+
+  Scenario: DKR-02 Upgrade replaces the container by digest
+    Given a running container at v1.0.0
+    When I apply v1.1.0 pinned by `digest`
+    Then the old container is replaced, `/health` serves `v=1.1.0`, digest verified.
+
+  Scenario: DKR-03 Destroy purge removes the container
+    Given a purge-mode destroy
+    When I run `terraform destroy`
+    Then the container is absent from `docker ps -a` and state is empty.
+
+---
+
+# Phase 5: Windows Single-Target Acceptance (lab)
+
+Live acceptance pinned `lab` (`architecture.md` section 6.2 L1;
+`implementation-plan.md:466,475`). Covers WinRM connectivity (DESIGN 18.2),
+persisted-state artifacts (18.3), Windows console (18.4), all service patterns
+(18.5 WSV, 18.6 NOD/NET), and Windows service drift / downgrade / destroy (18.8
+RBK/DRF/DST). Every scenario mutates a real Windows Server; nothing here is
+gate-provable, so its deterministic core lives in Phases 1-3.
+
+### Setup
+- **Type**: lab-bare-metal
+- **Local**: point `LD_W1_HOST` at a personal Windows Server 2022 VM (WinRM HTTPS
+  enabled), set `LABDEPLOY_PASSWORD`, then
+  `go test ./test/e2e/windows/... -run
+  'CON|ART_0[1-5]|CAP_0[12]|WSV|NOD|NET|RBK|DRF_0[13]|DST_01' -tags acc` with
+  `TF_ACC=1`.
+- **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
+  `[self-hosted, windows, forge-lab-hw]`. W1 Windows Server 2022 with PowerShell
+  5.1, WinRM HTTPS, node 20+npm, .NET 8 runtime + `vstest.console.exe`
+  (all pre-provisioned).
+- **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
+  (ADO variable group `forge-lab-hw-vg`, mapped to `env: LABDEPLOY_PASSWORD`)
+  **and** GitHub environment `lab-windows` secret `LAB_PASSWORD` (mapped to
+  `env: LABDEPLOY_PASSWORD`). Target host from KeyVault entry `labdeploy-w1-host`
+  / GitHub environment variable `LD_W1_HOST`.
+- **Pre-test bootstrap**: `pwsh tests/e2e/windows/verify-w1.ps1` -- VERIFIES (does
+  not install) `$PSVersionTable.PSVersion.Major >= 5`, WinRM HTTPS listener,
+  `node`/`npm`/`dotnet --list-runtimes` (`Microsoft.AspNetCore.App`), and
+  `vstest.console.exe` on PATH; fails fast on a missing prerequisite (targets are
+  pre-provisioned, `tech-spec.md:165-170`). It also removes leftover
+  `sample-svc` services/releases from a prior run.
+- **Gate provisioning**: n/a (lab). Scenarios skip when `LD_W1_HOST` is unset
+  (allowed for `lab-*`); the deterministic slices (transport encoding, pattern
+  script generation, engine rollback matrix, counter parse) are proven in
+  Phases 1-3.
+
+### Scenarios
+
+**Feature: WinRM connectivity and artifact persistence**
+
+  Scenario: CON-01 WinRM HTTPS with self-signed cert
+    Given a Windows target over `winrm` HTTPS with `insecure_skip_verify = true`
     When I apply a minimal `console_app` spec
-    Then apply succeeds
-    And exactly one WARN diagnostic is emitted about insecure TLS.
-    (Runs in Phase 5 lab; skips in the inline gate -- winrm has no embedded
-    server.)
+    Then apply succeeds and exactly one WARN diag about insecure TLS is emitted.
 
   Scenario: CON-02 Wrong password is not retried
     Given credentials whose `password_env` resolves to a wrong value
     When I apply
-    Then it errors `[ERR_AUTH]`
-    And exactly one auth attempt is made (no retry)
-    And wall time < 15s.
+    Then it errors `[ERR_AUTH]`, exactly one auth attempt, wall time < 15s.
 
   Scenario: CON-03 Firewall-dropped port exhausts retries
-    Given `target.hosts = [ env(LD_TARGET_HOST) ]` pointing at the blackhole
-    And `connect_retries = 2`
+    Given `connect_retries = 2` against a dropped port
     When I apply
-    Then it errors `[ERR_CONNECT]`
-    And the log shows `attempts=3` (initial + 2 retries, 5s backoff).
-
-  Scenario: CON-04 SSH host-key mismatch
-    Given `ssh.host_key` pinned to a key that does not match the server
-    When I apply
-    Then it errors `[ERR_CONNECT]` with detail `host key mismatch`.
-
-  Scenario: CON-05 Local transport opens no socket
-    Given `transport = local`, `os` matching the runner, `hosts = [localhost]`
-    When I apply a `console_app` spec
-    Then apply succeeds
-    And no network socket is opened (asserted via a loopback packet counter /
-    `netstat` delta of zero for the target port).
-
----
-
-# Phase 3: Artifact Acquisition
-
-Covers DESIGN section 18.3 (ART): http zip, checksum mismatch, 404, nupkg
-unzip-in-place, `target_pull` vs `runner_push`, and docker-registry auth
-failure. Fetch/verify logic is transport-independent, so the gate stands up an
-in-process HTTP file server rather than requiring the CI artifact host.
-
-### Setup
-- **Type**: compose
-- **Local**: `docker compose -f tests/e2e/artifact/docker-compose.yml up -d`
-  then `go test ./test/e2e/artifact/... -run ART`. Point
-  `LD_ARTIFACT_URL` at the compose nginx and `LD_NUGET_FEED` at the compose
-  registry.
-- **CI runner**: GitHub-hosted `ubuntu-latest`. Deployment/execution uses the
-  embedded SSH target from Phase 2 gate provisioning or `local`.
-- **Secrets**: none for the gate path. The compose path reads
-  `LD_ARTIFACT_TOKEN`, `LD_NUGET_TOKEN`, and `LD_REGISTRY_PASSWORD` for the
-  authenticated-fetch legs; in CI these are non-secret throwaway container
-  credentials from the compose `.env`.
-- **Pre-test bootstrap**:
-  `docker compose -f tests/e2e/artifact/docker-compose.yml up -d --wait`.
-- **Gate provisioning**: when `LD_ARTIFACT_URL` is **unset**, the suite serves
-  the fixture packages from a `net/http/httptest.Server` on `127.0.0.1:0`
-  (with a route returning 404 for ART-03 and an auth-gated route for ART-05),
-  and stands up an in-process NuGet v3 flat-container responder for ART-04.
-  `docker_registry` (ART-06) cannot be embedded without a docker daemon, so it
-  runs only on the compose/lab path (Phase 8) and is skipped in the pure-inline
-  gate. The compose nginx/registry remain the `LD_ARTIFACT_URL`-set path.
-
-**docker-compose.yml** (`tests/e2e/artifact/docker-compose.yml`) services:
-- `artifacts` -- nginx serving `sample-svc` zip/nupkg with a bearer-auth
-  location for ART-05.
-- `nuget` -- BaGetter (NuGet v3 flat container) hosting `sample-svc` nupkg.
-- `registry` -- CNCF `registry:2` (private, htpasswd) for ART-06 docker pulls.
-
-### Scenarios
-
-**Feature: Artifact fetch, checksum, and pull mode**
+    Then it errors `[ERR_CONNECT]` and the log shows `attempts=3`.
 
   Scenario: ART-01 HTTP zip with correct sha, runner_push
-    Given an http zip source with matching `artifact.checksum` and
-    `fetch_mode = runner_push`
+    Given an http zip with matching checksum and `fetch_mode = runner_push`
     When I apply
-    Then apply succeeds
-    And `releases/<ver>/.labdeploy-release.json` records a sha matching the spec.
+    Then `releases/<ver>/.labdeploy-release.json` records a matching sha.
 
   Scenario: ART-02 Checksum mismatch leaves target untouched
     Given `artifact.checksum` off by one hex digit
     When I apply
-    Then it errors `[ERR_CHECKSUM_MISMATCH]`
-    And there is no `releases/<ver>` dir, no manifest change, staging is empty
-    And a pre-existing service (if any) is still Running.
+    Then it errors `[ERR_CHECKSUM_MISMATCH]`, no `releases/<ver>` dir, no manifest
+    change, staging empty, any pre-existing service still Running.
 
   Scenario: ART-03 HTTP 404
-    Given an http url that returns 404
+    Given an http url returning 404
     When I apply
     Then it errors `[ERR_ARTIFACT_FETCH]` including `404`.
 
   Scenario: ART-04 nupkg is unzipped in place
     Given a `nupkg` source for `sample-svc`
     When I apply
-    Then files land under `releases/<ver>/lib/...` (package layout preserved)
-    And the app runs (no nuget client on target).
+    Then files land under `releases/<ver>/lib/...` and the app runs.
 
   Scenario: ART-05 target_pull with auth header does not proxy payload
-    Given `fetch_mode = target_pull` and an auth header env var
+    Given `fetch_mode = target_pull` with an auth header env var
     When I apply (optionally with runner egress to the package host blocked)
-    Then apply succeeds
-    And runner network counters confirm the payload was not proxied.
+    Then apply succeeds and runner counters confirm the payload was not proxied.
 
-  Scenario: ART-06 docker_registry bad credentials (compose/lab only)
-    Given a `docker_registry` source whose `password_env` value is wrong
+**Feature: windows console and service lifecycle**
+
+  Scenario: CAP-01 Fresh Windows console apply with verify_command
+    Given a fresh apply v1.0.0 with `verify_command = sample-svc.exe --version`
     When I apply
-    Then it errors `[ERR_ARTIFACT_FETCH]` containing a `docker login` stderr
-    snippet
-    And the container list is unchanged.
-    (Skipped in the pure-inline gate: no docker daemon.)
+    Then the `current` junction resolves to `releases\1.0.0`
+    And outputs `deployed_version = 1.0.0`, `service_status = n/a`.
 
----
-
-# Phase 4: Console App Deployment and Lifecycle
-
-Covers DESIGN section 18.4 (CAP) plus the pattern-agnostic lifecycle rows of
-section 18.8 that do NOT need a Windows service: idempotency (IDP), locking
-(LCK), manifest-delete drift (DRF-02), and the `abandon` destroy mode (DST-02).
-The `console_app` pattern registers no OS service, so the entire release
-machinery (stage/extract/junction-or-symlink/manifest/prune) is exercised over
-`local` transport on the runner itself -- fully in-process, no docker.
-
-### Setup
-- **Type**: inline
-- **Local**: `go test ./test/e2e/lifecycle/... -run 'CAP|IDP|LCK|DRF_02|DST_02'`.
-  Uses `transport = local`, `hosts = [localhost]`, `os` matching the runner.
-- **CI runner**: matrix of GitHub-hosted `ubuntu-latest` (symlink `current`) and
-  `windows-latest` (junction `current`), so CAP-01/CAP-03 parity is proven.
-- **Secrets**: none (local transport needs no credentials).
-- **Pre-test bootstrap**: none. `install_root` is redirected to a per-test temp
-  dir via `LD_INSTALL_ROOT` so the runner filesystem is never polluted.
-- **Gate provisioning**: dependency-free by construction -- `local` transport
-  plus an `httptest` artifact server (Phase 3 helper) self-provision everything.
-  The optional `LD_SSH_ENDPOINT`-set path re-runs CAP-03 against the compose
-  linux sshd to prove SFTP symlink handling; unset => embedded SSH (Phase 2).
-  For LCK-01 the "slow artifact" is simulated by an httptest handler that
-  sleeps, so no external timing dependency is needed.
-
-### Scenarios
-
-**Feature: console_app releases, pruning, idempotency, and locking**
-
-  Scenario: CAP-01 Fresh console apply with verify_command
-    Given a fresh apply of `sample-svc` v1.0.0 with
-    `verify_command = sample-svc.exe --version`
-    When I apply
-    Then apply succeeds
-    And the `current` junction/symlink resolves to `releases/1.0.0`
-    And outputs `deployed_version = 1.0.0` and `service_status = n/a`.
-
-  Scenario: CAP-02 Prune honors keep_releases and never the previous version
+  Scenario: CAP-02 Prune honors keep_releases and never previous
     Given `keep_releases = 2`
-    When I roll v1.1.0 -> v1.0.0 -> v1.1.0 forward three times
-    Then exactly two dirs remain under `releases` (newest + previous)
-    And the pruned dir is gone.
-
-  Scenario: CAP-03 Linux console over ssh uses a symlink
-    Given the same fresh apply over `ssh` on linux
-    When I apply
-    Then apply succeeds
-    And `current` is a symlink verified via `readlink`.
-
-  Scenario: IDP-01 Re-apply of identical spec is a no-op
-    Given an applied deployment (service/app running)
-    When I re-apply the identical spec
-    Then plan is empty
-    And `-refresh-only` reports no changes
-    And target file mtimes are unchanged (idempotency short-circuit, section 10.1).
-
-  Scenario: DRF-02 Deleted manifest forces clean recreate
-    Given I delete `manifest.json` on the target
-    When I run `terraform plan`
-    Then the plan is CREATE (state removed on refresh)
-    And apply reinstalls cleanly over the leftovers (idempotent create handles
-    the existing release as an update-config).
-
-  Scenario: LCK-01 Second concurrent apply fails fast
-    Given apply A is mid-flight holding `.lock` (slow artifact handler)
-    When apply B runs in parallel against the same target
-    Then B fails in < 5s with `[ERR_LOCKED]` naming A's owner
-    And A completes normally.
-
-  Scenario: LCK-02 Stale lock is overridden
-    Given a planted `.lock` aged beyond `lock_timeout_seconds`
-    When I apply
-    Then apply succeeds
-    And a WARN diagnostic `stale lock ... overridden` is emitted.
-
-  Scenario: DST-02 Destroy mode abandon makes no connection
-    Given `destroy_mode = abandon` and an unroutable `LD_TARGET_HOST`
-    When I run `terraform destroy`
-    Then destroy succeeds without contacting the target
-    And Terraform state is empty
-    And the machine is untouched.
-
----
-
-# Phase 5: Windows Service Patterns and Service Drift
-
-Covers DESIGN section 18.5 (WSV), 18.6 (NOD/NET), and the service-dependent
-lifecycle rows of section 18.8 (RBK, DRF-01, DRF-03, DST-01). These validate
-Windows-only behaviors -- SCM registration, `sc.exe` recovery actions,
-`HKLM\...\Services\<svc>\Environment` (REG_MULTI_SZ) delivery, WinSW wrapping,
-force-kill of a stuck service, event-log 7000/7009 capture, update downtime
-windows, and rollback-on-failure -- that cannot be faithfully embedded. This is
-a dedicated bare-metal Windows Server box (env **W1** in DESIGN section 18).
-
-### Setup
-- **Type**: lab-bare-metal
-- **Local**: developer points `LD_TARGET_HOST` at a personal Windows Server 2022
-  VM (WinRM HTTPS enabled), sets `LABDEPLOY_PASSWORD`, then
-  `go test ./test/e2e/winservice/... -run 'WSV|NOD|NET|RBK|DRF_01|DRF_03|DST_01'
-  -tags acc`.
-- **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
-  `[self-hosted, windows, forge-lab-hw]`. Windows Server 2022, PowerShell 5.1,
-  Node 20+npm, .NET 8 runtime + `vstest.console.exe`, optional docker.
-- **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
-  (ADO variable group `forge-lab-hw-vg` maps it to `LABDEPLOY_PASSWORD`) **and**
-  GitHub environment `lab-windows` secret `LAB_PASSWORD` (mapped to
-  `env: LABDEPLOY_PASSWORD`). The target host comes from KeyVault entry
-  `labdeploy-w1-host` / GH environment variable `LD_TARGET_HOST`.
-- **Pre-test bootstrap**: `pwsh tests/e2e/winservice/bootstrap-w1.ps1` -- enables
-  WinRM HTTPS with a self-signed cert, opens 5986, installs the .NET runtime and
-  vstest, and confirms `node`/`npm` on PATH. Idempotent; safe to re-run.
-- **Gate provisioning**: n/a (lab). Scenarios that require the W1 box skip (the
-  only place a dependency-missing skip is allowed) when `LD_TARGET_HOST` is
-  unset. The pattern-agnostic shapes of these behaviors are also covered
-  in-process in Phase 4 (console_app) so the Forge gate is never empty.
-
-### Scenarios
-
-**Feature: windows_service lifecycle**
+    When I roll v1.1.0 -> v1.0.0 -> v1.1.0 three times
+    Then exactly two dirs remain under `releases` and the pruned dir is gone.
 
   Scenario: WSV-01 Fresh install with health check and env delivery
-    Given a fresh apply of v1.0.0 with an http `/health` check
+    Given a fresh apply v1.0.0 with an http `/health` check
     When I apply
-    Then `sc query` reports RUNNING with `start_type = AUTO_START`
-    And recovery actions are set
-    And `HKLM` Environment contains `LD_VERSION=1.0.0` and the spec env
-    And the health check passes
-    And `app.log` contains an env dump proving delivery.
+    Then `sc query` is RUNNING, `start_type = AUTO_START`, recovery actions set
+    And HKLM Environment has `LD_VERSION=1.0.0` and spec env
+    And health passes and `app.log` proves env delivery.
 
   Scenario: WSV-02 In-place upgrade keeps downtime bounded
     Given v1.0.0 running
     When I apply v1.1.0
-    Then apply is error-free
-    And `/health` body is `v=1.1.0`
-    And the downtime window (1s-poll curl) <= `stop_timeout + 15s`
-    And `releases` holds 1.0.0 and 1.1.0
-    And output `previous_version = 1.0.0`.
+    Then `/health` body is `v=1.1.0`, downtime <= `stop_timeout + 15s`
+    And `releases` holds 1.0.0 and 1.1.0, output `previous_version = 1.0.0`.
 
   Scenario: WSV-03 Failed start rolls back to previous version
     Given v1.1.0 running
     When I apply v1.2.0-bad (fail-start)
-    Then apply errors `[ERR_SERVICE_START]` including an event-log 7000/7009 line
-    And the service is RUNNING on v1.1.0 with `/health` `v=1.1.0`
-    And the junction points to 1.1.0
-    And TF state `deployed_version = 1.1.0`
-    And the subsequent plan is empty.
+    Then apply errors `[ERR_SERVICE_START]` with an event-log 7000/7009 line
+    And the service is RUNNING on v1.1.0 (`/health` `v=1.1.0`), junction -> 1.1.0
+    And TF `deployed_version = 1.1.0` and the next plan is empty.
 
   Scenario: WSV-04 Failing health check rolls back
     Given v1.0.0 running and `rollback_on_failure = true`
     When I apply v1.1.0 built with `--health 500`
-    Then apply errors `[ERR_HEALTH_CHECK]`
-    And the prior version is restored and healthy (WSV-03 shape).
+    Then apply errors `[ERR_HEALTH_CHECK]` and the prior version is restored healthy.
 
-  Scenario: WSV-05 Rollback disabled leaves drift for the next apply
+  Scenario: WSV-05 Rollback disabled leaves drift
     Given the WSV-03 setup but `rollback_on_failure = false`
     When I apply v1.2.0-bad
-    Then apply errors
-    And the service is stopped/crashed on 1.2.0-bad
-    And `manifest.last_operation.result = failed`
-    And the next plan is non-empty (drift, section 10.4)
-    And a follow-up apply of 1.1.0 repairs it.
+    Then apply errors, service stopped/crashed on 1.2.0-bad,
+    `manifest.last_operation.result = failed`, next plan non-empty, a follow-up
+    apply of 1.1.0 repairs it.
 
   Scenario: WSV-06 WinSW wrapper for a console build
     Given `wrapper = winsw` wrapping the console build
     When I apply fresh then upgrade
-    Then both succeed
-    And the WinSW xml is regenerated on upgrade (slow-stop honored and measured).
+    Then both succeed and the WinSW xml is regenerated on upgrade (slow-stop honored).
 
   Scenario: WSV-07 Stuck service is force-killed within budget
     Given a slow-stop build and `stop_timeout_seconds = 10`
     When I deploy
-    Then deploy succeeds
-    And logs contain the `FORCE_KILL` step
-    And the total STOP phase is < 25s.
+    Then deploy succeeds, logs contain `FORCE_KILL`, total STOP phase < 25s.
 
-  Scenario: WSV-08 Non-builtin service account, secret never logged
+  Scenario: WSV-08 Non-builtin account, secret never logged
     Given account `.\svcuser` with `password_env`
     When I apply
-    Then the service `ObjectName = .\svcuser`
-    And the secret is absent from any `sc qc` capture in TF logs at TRACE.
+    Then `ObjectName = .\svcuser` and the secret is absent from any TRACE `sc qc`.
 
-**Feature: node_web_app and dotnet_api patterns**
+**Feature: node_web_app and dotnet_api**
 
   Scenario: NOD-01 Bundled node modules
-    Given a node app with bundled `node_modules`, `install_deps = false`,
-    port from `LD_NODE_PORT`
+    Given a node app with bundled `node_modules`, `install_deps = false`, port
+    from `LD_NODE_PORT`
     When I apply
-    Then the service runs and `GET /health` returns 200
-    And env `PORT` is visible in `app.log`.
+    Then the service runs, `GET /health` returns 200, env `PORT` in `app.log`.
 
   Scenario: NOD-02 install_deps without a lockfile
-    Given `install_deps = true` and an artifact lacking `package-lock.json`
+    Given `install_deps = true` and no `package-lock.json`
     When I apply
-    Then it errors `[ERR_SERVICE_INSTALL]` mentioning the lockfile
-    And no service is created (fresh install).
+    Then it errors `[ERR_SERVICE_INSTALL]` mentioning the lockfile, no service created.
 
   Scenario: NOD-03 install_deps with a lockfile
-    Given `install_deps = true` with a lockfile present
+    Given `install_deps = true` with a lockfile
     When I apply
     Then `node_modules` exists in the release dir and the app is healthy.
 
   Scenario: NET-01 dotnet self-contained, native hosting
-    Given a self-contained dotnet app, `hosting = windows_service_native`,
-    urls from `LD_ASPNET_URLS`
+    Given a self-contained dotnet app, native hosting, urls from `LD_ASPNET_URLS`
     When I apply
-    Then it runs, health passes, and `ASPNETCORE_URLS` is present in HKLM env.
+    Then it runs, health passes, `ASPNETCORE_URLS` present in HKLM env.
 
   Scenario: NET-02 dotnet_dll without the ASP.NET runtime
     Given `launcher = dotnet_dll` on a box lacking `Microsoft.AspNetCore.App`
     When I apply
-    Then it errors `[ERR_PREFLIGHT]` naming `Microsoft.AspNetCore.App`
-    And the error occurs before any file is copied.
+    Then it errors `[ERR_PREFLIGHT]` naming `Microsoft.AspNetCore.App` before any
+    file is copied.
 
-**Feature: service drift, explicit rollback, and destroy**
+**Feature: service drift, downgrade, and destroy**
 
   Scenario: RBK-01 Explicit downgrade reuses the release cache
     Given the post-WSV-02 state (1.1.0 running, 1.0.0 cached)
     When I apply `-var version=1.0.0` with egress to the artifact host blocked
-    Then apply succeeds with FETCH log `cache_hit=true`
-    And `/health` `v=1.0.0` and output `previous_version = 1.1.0`.
+    Then apply succeeds with FETCH `cache_hit=true`, `/health` `v=1.0.0`,
+    `previous_version = 1.1.0`.
 
   Scenario: RBK-02 Downgrade re-fetches when cache pruned
     Given `keep_releases = 1` so 1.0.0 was pruned
@@ -511,111 +587,102 @@ a dedicated bare-metal Windows Server box (env **W1** in DESIGN section 18).
   Scenario: DRF-01 Manual Stop-Service drives a Start-only converge
     Given a running service that I stop manually
     When I run `terraform plan`
-    Then the plan shows a `service_status running -> stopped` update
-    And apply performs Start ONLY (no FETCH/SWITCH steps) and converges.
+    Then the plan shows `service_status running -> stopped`
+    And apply performs Start ONLY (no FETCH/SWITCH) and converges.
 
   Scenario: DRF-03 Manually repointed junction converges without fetch
     Given state says 1.1.0 but I repoint the junction to 1.0.0
     When I run `terraform plan`
-    Then the plan shows `deployed_version` drift
-    And apply converges to 1.1.0 without an artifact fetch.
+    Then the plan shows `deployed_version` drift and apply converges to 1.1.0
+    without an artifact fetch.
 
   Scenario: DST-01 Destroy purge removes service, files, and state
     Given a purge-mode destroy of a WSV deployment
     When I run `terraform destroy`
-    Then `sc query` returns 1060 (absent)
-    And the app dir is gone and Terraform state is empty.
+    Then `sc query` returns 1060 (absent), the dir is gone, state is empty.
 
 ---
 
-# Phase 6: Failover Cluster Deployment
+# Phase 6: Failover Cluster Acceptance (lab)
 
-Covers DESIGN section 18.7 (CLU). Validates `cluster_generic_service`: a Windows
-service registered identically on every node, a WSFC Generic Service role,
-rolling update with a single `Move-ClusterGroup`, rollback-on-failure that
-returns the role to its original owner, mid-test node isolation, role/service
-conflict detection, and `preferred_owner` placement. Requires a real Windows
-Server Failover Cluster; nothing here can be embedded.
+Live acceptance pinned `lab` (`architecture.md` section 6.2 L3;
+`implementation-plan.md:481`). Covers DESIGN section 18.7 (CLU-01..08):
+`cluster_generic_service` on a real WSFC -- rolling update with a single
+`Move-ClusterGroup`, rollback-on-failure back to the original owner, mid-test
+node isolation, role/service conflict, and `preferred_owner` placement.
 
 ### Setup
 - **Type**: lab-wsfc
-- **Local**: developer points `LD_CN1_HOST`/`LD_CN2_HOST` at a personal two-node
-  WSFC (nodes `cn1`,`cn2`, no CSV), sets `LABDEPLOY_PASSWORD`, then
-  `go test ./test/e2e/cluster/... -run CLU -tags acc`.
-- **CI runner**: ADO agent pool `forge-lab-wsfc`; GitHub self-hosted runner
-  labels `[self-hosted, windows, wsfc, forge-lab]`. Runner sits outside the
-  cluster and reaches both nodes over WinRM HTTPS. C3 scenarios (CLU-03) need a
-  three-node cluster labeled additionally `wsfc-3node`.
+- **Local**: point `LD_CN1_HOST`/`LD_CN2_HOST` at a personal two-node WSFC (no
+  CSV), set `LABDEPLOY_PASSWORD`, then
+  `go test ./test/e2e/cluster/... -run CLU -tags acc` with `TF_ACC=1`.
+- **CI runner**: ADO agent pool `forge-lab-wsfc`; GitHub self-hosted runner labels
+  `[self-hosted, windows, wsfc, forge-lab]`. Runner sits outside the cluster and
+  reaches both nodes over WinRM HTTPS; C3 (CLU-03) additionally needs a runner
+  labeled `wsfc-3node`.
 - **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
-  (ADO variable group `forge-lab-wsfc-vg` maps it to `LABDEPLOY_PASSWORD`)
+  (ADO variable group `forge-lab-wsfc-vg`, mapped to `env: LABDEPLOY_PASSWORD`)
   **and** GitHub environment `lab-wsfc` secret `LAB_PASSWORD` (mapped to
-  `env: LABDEPLOY_PASSWORD`). Node hostnames come from KeyVault entries
-  `labdeploy-cn1-host`/`labdeploy-cn2-host` and GH environment variables
+  `env: LABDEPLOY_PASSWORD`). Node hostnames from KeyVault entries
+  `labdeploy-cn1-host`/`labdeploy-cn2-host` and GitHub environment variables
   `LD_CN1_HOST`/`LD_CN2_HOST`.
-- **Pre-test bootstrap**: `pwsh tests/e2e/cluster/bootstrap-wsfc.ps1` -- verifies
-  the `FailoverClusters` PowerShell module, the cluster is Up, both nodes are Up,
-  and removes any leftover `sample-role`/`sample-svc` from a prior run.
-- **Gate provisioning**: n/a (lab). CLU scenarios skip when
-  `LD_CN1_HOST`/`LD_CN2_HOST` are unset (allowed for `lab-*`). The engine's
-  cluster state machine (hosts-order updates, single MOVE_GROUP, rollback to
-  original owner) is additionally covered by fake-transport unit tests
-  (DESIGN section 17) so cluster logic still has gate coverage.
+- **Pre-test bootstrap**: `pwsh tests/e2e/cluster/verify-wsfc.ps1` -- VERIFIES
+  (does not install) the `FailoverClusters` module, that the cluster and both
+  nodes are Up, and removes any leftover `sample-role`/`sample-svc`; fails fast
+  if the cluster is not pre-provisioned.
+- **Gate provisioning**: n/a (lab). CLU scenarios skip when `LD_CN1_HOST` /
+  `LD_CN2_HOST` are unset (allowed for `lab-*`); the cluster state machine
+  (hosts-order update, single MOVE_GROUP, rollback to original owner) is proven
+  in Phase 3 (ENG/PAT golden + fake transport).
 
 ### Scenarios
 
 **Feature: cluster_generic_service rollout and rollback**
 
   Scenario: CLU-01 Fresh cluster role install
-    Given a fresh apply of v1.0.0 for role `sample-role`
+    Given a fresh apply v1.0.0 for role `sample-role`
     When I apply
     Then the service exists on cn1 and cn2 (`start_type = DEMAND`)
-    And `Get-ClusterGroup sample-role` is Online with owner in {cn1, cn2}
-    And health on the owner passes
-    And both manifests read `current = 1.0.0`
-    And TF `service_status = online`.
+    And `Get-ClusterGroup sample-role` is Online, owner in {cn1, cn2}
+    And health on the owner passes, both manifests `current = 1.0.0`,
+    TF `service_status = online`.
 
   Scenario: CLU-02 Rolling update keeps a single short outage
     Given v1.0.0 Online and a 1 Hz `/health` probe loop for 120s
     When I apply v1.1.0
-    Then apply succeeds
-    And the probe sees at most ONE gap, drain-induced, <= 30s
-    And the final owner is the pre-update PASSIVE node
-    And both nodes' junctions point to 1.1.0 and the role is Online.
+    Then the probe sees at most ONE drain-induced gap <= 30s
+    And the final owner is the pre-update PASSIVE node, both junctions -> 1.1.0.
 
   Scenario: CLU-03 Three-node update order (C3)
     Given a three-node cluster on v1.0.0
     When I apply v1.1.0
-    Then passives update in hosts order (asserted via log order)
-    And the former owner updates last
-    And there is exactly one MOVE_GROUP (plus an optional preferred move).
+    Then passives update in hosts order (log order asserts), the former owner
+    updates last, exactly one MOVE_GROUP (plus optional preferred move).
 
   Scenario: CLU-04 Failed health rolls the role back to the original owner
     Given v1.0.0 Online
     When I apply v1.1.0 built with `--health 500`
-    Then apply errors `[ERR_HEALTH_CHECK]`
-    And the role is Online back on the ORIGINAL owner serving `v=1.0.0`
-    And both nodes' junctions point to 1.0.0
-    And manifests read `last_operation = rolled_back`
-    And the next plan shows a pending change to 1.1.0.
+    Then apply errors `[ERR_HEALTH_CHECK]`, role Online on the ORIGINAL owner
+    serving `v=1.0.0`, both junctions -> 1.0.0, manifests `last_operation =
+    rolled_back`, next plan shows a pending change to 1.1.0.
 
   Scenario: CLU-05 Node isolation mid-apply causes no partial switch
-    Given WinRM to cn2 is blocked before apply
+    Given WinRM to cn2 blocked before apply
     When I apply v1.1.0
-    Then it errors `[ERR_CONNECT]` `host=cn2` during CONNECT/U0
-    And cn1 is untouched (junction and role owner unchanged, no partial switch).
+    Then it errors `[ERR_CONNECT]` `host=cn2` during CONNECT/U0 and cn1 is
+    untouched (junction and role owner unchanged).
 
   Scenario: CLU-06 Role bound to a foreign service is rejected
-    Given a pre-created `sample-role` bound to service `other-svc`
+    Given a pre-created `sample-role` bound to `other-svc`
     When I apply
     Then it errors `[ERR_SERVICE_INSTALL]` naming both `sample-role` and
-    `other-svc`
-    And nothing is modified.
+    `other-svc` and nothing is modified.
 
   Scenario: CLU-07 Destroy purge removes the role and services on all nodes
     Given a purge-mode destroy
     When I run `terraform destroy`
-    Then the role is absent, services are deleted on both nodes
-    And `<root>\sample-svc` is gone on both nodes.
+    Then the role is absent, services deleted on both nodes, `<root>\sample-svc`
+    gone on both nodes.
 
   Scenario: CLU-08 preferred_owner placement
     Given `preferred_owner = cn2`
@@ -624,39 +691,33 @@ Server Failover Cluster; nothing here can be embedded.
 
 ---
 
-# Phase 7: E2E Test Resource and Result Collection
+# Phase 7: E2E Test Resource Acceptance (lab)
 
-Covers DESIGN section 18.9 (E2E) for the `labdeploy_e2e_test` resource: run a
-test binary on the target, parse TRX/JUnit counters, evaluate `pass_criteria`,
-enforce `fail_on_test_failure`, honor `triggers` replace semantics, kill a
-runaway test tree on timeout, filter Windows event logs by test-start time, and
-ALWAYS collect results before returning a failure. Runner and vstest logic is
-transport-independent, so results parsing runs in the gate; a real target
-executes the binary.
+Live acceptance pinned `lab` (`architecture.md` section 6.2 L1;
+`implementation-plan.md:482`). Covers DESIGN section 18.9 (E2E-01..07) for the
+`labdeploy_e2e_test` resource against W1: run `sample-tests` on the target, parse
+TRX counters, enforce `pass_criteria` and `fail_on_test_failure`, honor
+`triggers` replace, kill a runaway tree on timeout, filter Windows event logs,
+and ALWAYS collect before failing. TRX/JUnit parsing itself is already proven
+in-process (Phase 3, LOG-01); these scenarios add the live-target execution.
 
 ### Setup
-- **Type**: compose
-- **Local**: `docker compose -f tests/e2e/testrun/docker-compose.yml up -d` then
-  `go test ./test/e2e/testrun/... -run E2E`. Point `LD_TEST_ENDPOINT` at the
-  compose target.
-- **CI runner**: GitHub-hosted `ubuntu-latest` for the `exec`/`npm`/`dotnet_test`
-  legs against a linux target; the `vstest` + Windows-event-log legs (E2E-05)
-  run on the Phase 5 `lab-bare-metal` W1 box.
-- **Secrets**: none for the gate path. The compose path reads
-  `LABDEPLOY_PASSWORD` from the compose `.env` (throwaway container credential).
-- **Pre-test bootstrap**:
-  `docker compose -f tests/e2e/testrun/docker-compose.yml up -d --wait`.
-- **Gate provisioning**: when `LD_TEST_ENDPOINT` is **unset**, the suite runs the
-  test binary over `local` transport on the runner (or the Phase 2 embedded SSH
-  target) and serves `sample-tests` from the `httptest` artifact server. The
-  TRX/JUnit fixtures in `internal/logs/testdata` are parsed in-process, so
-  counter math (E2E-07) needs no target at all. `vstest.console.exe` and Windows
-  event logs are Windows-only; E2E-05 defers to the lab and skips inline.
-
-**docker-compose.yml** (`tests/e2e/testrun/docker-compose.yml`) services:
-- `target` -- OpenSSH linux container with the .NET SDK (`dotnet test`) and Node
-  (`npm test`) toolchains for running `sample-tests`.
-- `artifacts` -- nginx serving the `sample-tests` package (reused from Phase 3).
+- **Type**: lab-bare-metal
+- **Local**: point `LD_W1_HOST` at a Windows Server 2022 VM with
+  `vstest.console.exe`, set `LABDEPLOY_PASSWORD`, then
+  `go test ./test/e2e/testrun/... -run E2E -tags acc` with `TF_ACC=1`.
+- **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
+  `[self-hosted, windows, forge-lab-hw]`. Same W1 class as Phase 5.
+- **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
+  (ADO variable group `forge-lab-hw-vg`, mapped to `env: LABDEPLOY_PASSWORD`)
+  **and** GitHub environment `lab-windows` secret `LAB_PASSWORD` (mapped to
+  `env: LABDEPLOY_PASSWORD`). Target host from KeyVault `labdeploy-w1-host` /
+  GitHub environment variable `LD_W1_HOST`.
+- **Pre-test bootstrap**: reuse `pwsh tests/e2e/windows/verify-w1.ps1` (VERIFIES
+  `vstest.console.exe` and .NET; installs nothing).
+- **Gate provisioning**: n/a (lab). E2E scenarios skip when `LD_W1_HOST` is unset
+  (allowed for `lab-*`); counter math (E2E-07 shape) is proven in Phase 3
+  (LOG-01) on committed fixtures.
 
 ### Scenarios
 
@@ -666,36 +727,30 @@ executes the binary.
     Given a deployed 1.1.0 and a vstest TestRun (all pass), `triggers.run = 1`
     When I apply
     Then outputs `total = 3`, `passed_tests = 3`, `failed_tests = 0`,
-    `passed = true`
-    And `results_dir/results/*.trx` exists and `summary.json` matches
-    And the logs dir contains `app.log` copied from the shared dir.
+    `passed = true`, `results_dir/results/*.trx` exists, `summary.json` matches,
+    and the logs dir contains `app.log` from the shared dir.
 
   Scenario: E2E-02 Test failure still collects, leaves no test state
     Given `FAIL_ONE=1` and `fail_on_test_failure = true`
     When I apply
-    Then it errors `[ERR_TEST_FAILED]`
-    And `results_dir` is fully populated anyway
-    And no TF state exists for the test resource (Create failed)
-    And the deployment resource is unaffected.
+    Then it errors `[ERR_TEST_FAILED]`, `results_dir` is fully populated anyway,
+    no TF state exists for the test resource, deployment resource unaffected.
 
   Scenario: E2E-03 Reporting mode surfaces failure without failing apply
     Given `FAIL_ONE=1` and `fail_on_test_failure = false`
     When I apply
-    Then apply succeeds with `passed = false`, `failed_tests = 1`
-    And a pipeline gate can consume the output.
+    Then apply succeeds with `passed = false`, `failed_tests = 1`.
 
   Scenario: E2E-04 Timeout kills the test process tree
     Given `runner.timeout_seconds = 10` against a sleep-forever test
     When I apply
-    Then it errors `[ERR_TIMEOUT]`
-    And the test process tree on the target is dead (asserted via process list)
-    And partial logs are collected.
+    Then it errors `[ERR_TIMEOUT]`, the test process tree on the target is dead,
+    partial logs are collected.
 
-  Scenario: E2E-05 Event-log collection is time-filtered (lab)
+  Scenario: E2E-05 Event-log collection is time-filtered
     Given `collect.windows_event_logs` with a provider filter
     When I apply
-    Then the events json in the logs dir contains ONLY events at/after test start.
-    (Runs on the W1 lab; skips inline -- Windows event logs.)
+    Then the events json contains ONLY events at/after test start.
 
   Scenario: E2E-06 Bumping triggers.run re-runs the tests
     Given a passing TestRun with `triggers.run = 1`
@@ -705,150 +760,95 @@ executes the binary.
   Scenario: E2E-07 Exit-code-only runner with results.format none
     Given `results.format = none` and an `exec` runner
     When I apply
-    Then `passed` reflects the `pass_criteria.exit_codes` list
-    And the counters are `-1`.
+    Then `passed` reflects `pass_criteria.exit_codes` and counters are `-1`.
 
 ---
 
-# Phase 8: Docker Container Pattern
+# Phase 8: Pipeline Integration Acceptance (lab)
 
-Covers the P1 `docker_container` pattern (DESIGN section 6.4, section 14 docker
-preflight, D14) and the docker-registry artifact leg (ART-06). A docker daemon
-is mandatory, so this phase is compose-based; there is no embedded substitute for
-a container runtime.
-
-### Setup
-- **Type**: compose
-- **Local**: `docker compose -f tests/e2e/docker/docker-compose.yml up -d` then
-  `go test ./test/e2e/docker/... -run 'DKR|ART_06'`. Point
-  `LD_DOCKER_HOST` at the compose Docker-in-Docker endpoint and `LD_NUGET_FEED`
-  /`LD_REGISTRY` at the compose registry.
-- **CI runner**: GitHub-hosted `ubuntu-latest` (docker preinstalled). A
-  `windows-latest` leg validates the Windows docker preflight (D14) when a
-  Windows docker daemon is available; otherwise that single case skips.
-- **Secrets**: none for the gate path; the compose registry uses a throwaway
-  htpasswd credential from the compose `.env` mapped to `LD_REGISTRY_PASSWORD`.
-- **Pre-test bootstrap**:
-  `docker compose -f tests/e2e/docker/docker-compose.yml up -d --wait`.
-- **Gate provisioning**: this phase's Type is `compose` precisely because the
-  dependency (a container runtime) cannot be self-provisioned in-process. The
-  `LD_DOCKER_HOST`-set path uses the compose DinD service. When unset on a runner
-  that itself has a usable docker socket, the suite falls back to that local
-  socket (still no pre-provisioned application container -- it `docker run`s
-  `sample-svc` itself). On a runner with no docker at all, the docker scenarios
-  skip (documented P1 limitation; the pattern's script generation is covered by
-  golden-file unit tests per DESIGN section 17).
-
-**docker-compose.yml** (`tests/e2e/docker/docker-compose.yml`) services:
-- `dind` -- Docker-in-Docker daemon exposed as `LD_DOCKER_HOST`.
-- `registry` -- private `registry:2` (htpasswd) hosting the `sample-svc` image.
-
-### Scenarios
-
-**Feature: docker_container lifecycle**
-
-  Scenario: DKR-01 Fresh container deploy by tag
-    Given a `docker_container` spec for `sample-svc` with `ports` mapping and a
-    `restart_policy`
-    When I apply
-    Then the container runs, `GET /health` returns 200
-    And `manifest.json` records the running image reference.
-
-  Scenario: DKR-02 Upgrade replaces the container by digest
-    Given a running container at v1.0.0
-    When I apply v1.1.0 pinned by `digest`
-    Then the old container is replaced, `/health` serves `v=1.1.0`
-    And the pull verified the digest.
-
-  Scenario: DKR-03 Destroy purge removes the container
-    Given a purge-mode destroy
-    When I run `terraform destroy`
-    Then the container is absent from `docker ps -a` and state is empty.
-
-  Scenario: ART-06 docker_registry bad credentials
-    Given a `docker_registry` source whose `password_env` value is wrong
-    When I apply
-    Then it errors `[ERR_ARTIFACT_FETCH]` with a `docker login` stderr snippet
-    And the container list is unchanged.
-
----
-
-# Phase 9: Pipeline Integration Acceptance Gate
-
-Covers DESIGN section 18.10 (PIP): the shipped reference pipelines in
-`examples/pipelines/` driving the provider end to end -- GitHub Actions and Azure
-DevOps -- including artifact publishing on `always()`/`condition: always`, and
-the auto-rollback job/stage on a failed deploy. This is the final acceptance
-gate and exercises real filesystem-mirror provider distribution (section 16.1)
-against the W1 lab box.
+Live acceptance pinned `lab` (`architecture.md` section 6.2 L4;
+`implementation-plan.md:484`). Covers DESIGN section 18.10 (PIP-01..03): the
+shipped reference pipelines in `examples/pipelines/` driving the provider end to
+end via GitHub Actions and Azure DevOps, including `always()` artifact publishing
+and the auto-rollback job/stage, against the W1 lab and filesystem-mirror
+provider distribution (DESIGN section 16.1).
 
 ### Setup
 - **Type**: lab-bare-metal
-- **Local**: not typically run locally; a developer can trigger
+- **Local**: not typically run locally; a developer can
   `gh workflow run github-deploy.yml -f version=1.1.0` against a personal W1 and
-  self-hosted runner. The ADO leg runs via a manual pipeline queue.
+  self-hosted runner, or queue the ADO pipeline manually.
 - **CI runner**: ADO agent pool `forge-lab-hw`; GitHub self-hosted runner labels
   `[self-hosted, windows, forge-lab-hw]` (same W1 class as Phase 5). The runner
-  installs the provider into its filesystem mirror per section 16.1 before the
+  lays the provider into its filesystem mirror per DESIGN section 16.1 before the
   workflow runs.
 - **Secrets**: Azure Key Vault `kv-forge-lab` entry `labdeploy-lab-password`
   (ADO variable group `forge-lab-hw-vg`, mapped to
   `env: LABDEPLOY_PASSWORD: $(LabPassword)`) **and** GitHub environment
   `lab-windows` secret `LAB_PASSWORD` (mapped to `env: LABDEPLOY_PASSWORD`).
-  Target host via KeyVault `labdeploy-w1-host` / GH environment variable
-  `LD_TARGET_HOST`.
+  Target host from KeyVault `labdeploy-w1-host` / GitHub environment variable
+  `LD_W1_HOST`.
 - **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds
-  or downloads `terraform-provider-labdeploy_v<version>` and lays it into
-  `%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\...` with the
-  `~/.terraformrc` filesystem mirror, then reuses `bootstrap-w1.ps1`.
-- **Gate provisioning**: n/a (lab). PIP scenarios skip when `LD_TARGET_HOST` /
-  the self-hosted runner are unavailable (allowed for `lab-*`). The provider
-  binary and spec substitution are covered in earlier inline phases, so the gate
-  still validates provider behavior without the pipeline harness.
+  or downloads `terraform-provider-labdeploy_v<version>` and lays it into the
+  `%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\...` mirror
+  with the `~/.terraformrc` filesystem_mirror block; then reuses `verify-w1.ps1`.
+  This provisions the PROVIDER binary only; the target OS tooling is
+  pre-provisioned.
+- **Gate provisioning**: n/a (lab). PIP scenarios skip when `LD_W1_HOST` / the
+  self-hosted runner are unavailable (allowed for `lab-*`); provider binary
+  behavior and spec substitution are proven in Phases 1-3.
 
 ### Scenarios
 
 **Feature: reference pipeline integration**
 
   Scenario: PIP-01 GitHub deploy workflow publishes results
-    Given the `github-deploy.yml` workflow dispatched with `version=1.1.0`
+    Given `github-deploy.yml` dispatched with `version=1.1.0`
     When the workflow runs
-    Then it is green
-    And the uploaded `e2e-results` artifact contains trx + summary + logs
-    And the job summary echoes the `summary` output.
+    Then it is green, the uploaded `e2e-results` artifact contains
+    trx + summary + logs, and the job summary echoes the `summary` output.
 
   Scenario: PIP-02 GitHub deploy failure triggers auto-rollback
     Given dispatch with `version=1.2.0-bad`, `auto_rollback=true`,
     `rollback_to=1.1.0`
     When the workflow runs
-    Then the deploy job fails with `[ERR_SERVICE_START]`
-    And the rollback job runs and ends green
-    And the final target serves `v=1.1.0`.
+    Then the deploy job fails with `[ERR_SERVICE_START]`, the rollback job runs
+    and ends green, and the final target serves `v=1.1.0`.
 
   Scenario: PIP-03 Azure DevOps pass case publishes to the Tests tab
     Given a run of `azure-pipelines.yml` (pass case)
     When the pipeline runs
-    Then the Tests tab shows 3 VSTest results
-    And the pipeline artifact `labdeploy-logs` is present.
+    Then the Tests tab shows 3 VSTest results and the pipeline artifact
+    `labdeploy-logs` is present.
 
 ---
 
 ## Traceability
 
-Every scenario ID above is drawn from DESIGN section 18 and MUST appear verbatim
-in the corresponding acceptance test name (`terraform-plugin-testing` /
-terratest), satisfying the "Scenario IDs MUST appear in test names 1:1"
-requirement. Phase numbers align with `implementation-plan.md` so each phase's
-tests are authored in the same iteration that builds the code under test.
+Every scenario ID is drawn from DESIGN section 18 and MUST appear verbatim in the
+corresponding test name (`go test` unit/golden for the gate tier;
+`terraform-plugin-testing` / terratest for the lab tier), satisfying the
+"Scenario IDs MUST appear in test names 1:1" requirement. Each row cites its
+`architecture.md` section 6 proof pin so phase Type never contradicts the
+authoritative contract.
 
-| Phase | Scenario IDs | Setup type |
-|---|---|---|
-| 1 Spec Validation | VAL-01..10 | inline |
-| 2 Connectivity | CON-01..05 | compose |
-| 3 Artifact | ART-01..06 | compose |
-| 4 Console + Lifecycle | CAP-01..03, IDP-01, DRF-02, LCK-01..02, DST-02 | inline |
-| 5 Windows Services | WSV-01..08, NOD-01..03, NET-01..02, RBK-01..02, DRF-01/03, DST-01 | lab-bare-metal |
-| 6 Failover Cluster | CLU-01..08 | lab-wsfc |
-| 7 E2E Test Resource | E2E-01..07 | compose |
-| 8 Docker | DKR-01..03, ART-06 | compose |
-| 9 Pipeline | PIP-01..03 | lab-bare-metal |
+| Phase | Tier | Scenario IDs | Type | Proof pin |
+|---|---|---|---|---|
+| 1 Spec/Schema | gate | VAL-01..10, HSH-01 | inline | T1, T2, T9 |
+| 2 Transport/Artifact proofs | gate | ENC-01..02, LCL-01, CON-04, ART_FETCH-01..02, NUG-01, TPS-01 | inline | T3, T4, T5 |
+| 3 Pattern/Engine/Logs proofs | gate | PAT-01..02, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
+| 4 Linux + Docker | lab | CAP-03, IDP-01, DRF-02, LCK-01..02, DST-02, ART-06, DKR-01..03 | lab-bare-metal | L2 |
+| 5 Windows single-target | lab | CON-01..03, ART-01..05, CAP-01..02, WSV-01..08, NOD-01..03, NET-01..02, RBK-01..02, DRF-01/03, DST-01 | lab-bare-metal | L1 |
+| 6 Failover cluster | lab | CLU-01..08 | lab-wsfc | L3 |
+| 7 E2E test resource | lab | E2E-01..07 | lab-bare-metal | L1 |
+| 8 Pipeline integration | lab | PIP-01..03 | lab-bare-metal | L4 |
+
+Notes:
+- CON-04 (host-key mismatch) and CON-05 (local, proven as LCL-01) are gate-tier
+  `in-process`/`service:local-shell` per `implementation-plan.md:127` and
+  `architecture.md` T4; the live WinRM legs CON-01..03 are lab-tier (Phase 5).
+- ART fetch/404/header (ART_FETCH-01..02, `service:httptest`, T5) are gate-tier;
+  the persisted-state legs ART-01..05 and the docker leg ART-06 are lab-tier
+  (Phases 4-5). ART-06 appears exactly once (Phase 4).
+- No phase uses `compose`: the gate host has no docker (`architecture.md:363`),
+  so docker-backed acceptance (docker_container, ART-06) is lab-only (Phase 4).
