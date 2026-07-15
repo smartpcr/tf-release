@@ -319,7 +319,8 @@ performs Start ONLY (no FETCH/SWITCH) and converges.
 
 ```
 provider.Create (e2e_test_resource.go) -> eng.RunTest(ctx, tr) (engine/testrun.go):
- CONNECT + LOCK-free test dir <install_root>/_tests/<name>/releases/<version>
+ CONNECT + LOCK-free test workspace: layout.NewPaths(os, tr.EffectiveWorkRoot(os),
+   <name>-tests, <version>) -> <work_root>/<name>-tests/releases/<version>
  FETCH+EXTRACT test package -> run runner (exec|vstest|dotnet_test|npm), timeout
    -> ERR_TIMEOUT kills process tree
  ALWAYS: logs.CollectFiles + logs.CollectEventLogs -> download _results + globbed
