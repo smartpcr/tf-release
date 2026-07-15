@@ -12,13 +12,14 @@ terraform-plugin-framework, plugin protocol v6).
   test names MUST carry the same ID (e.g. `TestAcc_WSV_03_FailStartRollback`), per
   `tech-spec.md:294`.
 - **Supplemental gate-proof IDs** (`HSH-`, `RRP-`, `SRT-`, `ENC-`, `LCL-`,
-  `ART_FETCH-`, `NUG-`, `TPS-`, `PAT-`, `ENG-`, `LOG-`) are NOT DESIGN section 18
-  IDs. They name the deterministic gate-host proofs that implement
+  `ART_FETCH-`, `NUG-`, `TPS-`, `PAT-`, `ENG-`, `LOG-`, `PIP_LINT-`) are NOT DESIGN
+  section 18 IDs. They name the deterministic gate-host proofs that implement
   `architecture.md` section 6.1 pins T1-T9 -- in particular `RRP-`/`SRT-` cover T9
-  (RequiresReplace on each immutable path + schema state round-trip), which the
-  DESIGN section 18 matrix does not enumerate. They exist so the gate has coverage
-  without a lab; they are marked "supplemental (T#)" wherever they appear and are
-  listed separately in the Traceability table.
+  (RequiresReplace on each immutable path + schema state round-trip), and
+  `PIP_LINT-` is the structural pipeline-YAML proof (`implementation-plan.md:438`),
+  which the DESIGN section 18 matrix does not enumerate. They exist so the gate has
+  coverage without a lab; they are marked "supplemental (T#)" wherever they appear
+  and are listed separately in the Traceability table.
 
 ## Proof-tier model (why phases are typed the way they are)
 
@@ -890,79 +891,104 @@ in-process (Phase 3, LOG-01); these scenarios add the live-target execution.
 # Phase 8: Pipeline Integration Acceptance (lab)
 
 Live acceptance pinned `lab` (`architecture.md` section 6.2 L4;
-`implementation-plan.md:484`). Covers DESIGN section 18.10 (PIP-01..03): the
-shipped reference pipelines in `examples/pipelines/github-deploy.yml` (workflow
+`implementation-plan.md:484`,`:494`). Covers DESIGN section 18.10 (PIP-01..03):
+the shipped reference pipelines `examples/pipelines/github-deploy.yml` (workflow
 `name: deploy-lab`) and `examples/pipelines/azure-pipelines.yml` driving the
 provider end to end, including `always()` artifact publishing and the
 `if: failure()` / `condition: failed()` rollback job/stage, against the W1 lab
-and filesystem-mirror provider distribution (DESIGN section 16.1). Scenario
-inputs, secret names, and artifact names are taken verbatim from those two
-shipped files, which are the concrete, executable realization of the DESIGN
-section 18.10 intent (see the reconciliation note under Traceability).
+and filesystem-mirror provider distribution (DESIGN section 16.1).
+
+This phase does NOT invent any repository or workflow. The dispatchable workflow
+`.github/workflows/deploy-lab.yml` is a REPOSITORY ASSET owned by
+`implementation-plan.md` Stage 8.2 (line 428, "Author `examples/pipelines/...`");
+that stage promotes the example into `.github/workflows/deploy-lab.yml` on this
+repo's default branch (the only place `workflow_dispatch` registers), identical
+to the example except for an added `environment: lab` job binding. The gate-tier
+`PIP_LINT-01` scenario mechanically proves that asset stays step-for-step equal
+to the example so the reference workflow cannot silently drift
+(`implementation-plan.md:438`, "Pipeline YAML well-formed", proof golden). The
+example under `examples/pipelines/` intentionally omits `environment:` because it
+is a user-copyable template; the repo's own CI asset adds the binding so the
+GitHub environment `lab` secrets resolve.
 
 ### Setup
 - **Type**: lab-bare-metal
-- **Local**: not typically run locally. `workflow_dispatch` only registers a
-  workflow that lives on the repository DEFAULT BRANCH, so the GitHub leg runs
-  from a committed harness, not a throwaway branch: the E2E harness commits
-  `.github/workflows/deploy-lab.yml` -- a thin wrapper that runs the same steps as
-  `examples/pipelines/github-deploy.yml` and additionally binds `environment: lab`
-  on both jobs -- to the default branch of the dedicated E2E fixture fork
-  `smartpcr/labdeploy-e2e-fixture`. A developer then runs
-  `gh workflow run deploy-lab.yml -R smartpcr/labdeploy-e2e-fixture
-  -f version=1.1.0 -f checksum=sha256:<hex>` (BOTH `version` and `checksum` are
-  required inputs per `github-deploy.yml:5-11`). The ADO leg is queued manually
-  with the same `version` + `checksum` parameters.
+- **Local**: not typically run locally. Because the dispatchable workflow is a
+  committed default-branch asset (owned by `implementation-plan.md` Stage 8.2), no
+  runtime repository mutation is needed: a developer runs
+  `gh workflow run deploy-lab.yml -f version=1.1.0 -f checksum=sha256:<hex>`
+  (BOTH `version` and `checksum` are required inputs per `github-deploy.yml:5-11`).
+  The ADO leg is queued manually with the same `version` + `checksum` parameters.
+  The gate-tier `PIP_LINT-01` needs no runner and runs in Forge's gate.
 - **CI runner**: ADO agent pool `LabAgents` (the pool named in
   `azure-pipelines.yml:13`); GitHub self-hosted runner labels `[self-hosted, lab]`
   (the labels in `github-deploy.yml:17`), same W1 class as Phase 5. The runner
   lays the provider into its filesystem mirror via `make install`
   (`github-deploy.yml:28`) before the workflow runs.
-- **Secrets**: Azure Key Vault `kv-forge-lab` entries `labdeploy-lab-password`
-  and `labdeploy-nuget-pat`, surfaced through the ADO variable group
-  `lab-secrets` (referenced at `azure-pipelines.yml:11`) as secret variables
-  `LABDEPLOY_PASSWORD` and `NUGET_PAT` **and** through the GitHub environment
-  `lab` -- bound via `environment: lab` on the committed harness wrapper's
-  `deploy`/`rollback` jobs (the reference example under `examples/pipelines/`
-  omits the binding, so the harness adds it; without an `environment:` binding
-  GitHub environment secrets do not resolve) -- with secrets `LABDEPLOY_PASSWORD`
-  and `NUGET_PAT` (the exact names read at `github-deploy.yml:21-22` /
+- **Secrets**: Azure Key Vault `kv-forge-lab` entries `labdeploy-lab-password`,
+  `labdeploy-nuget-pat`, and `labdeploy-gh-dispatch-token` (a least-privilege
+  fine-grained GitHub PAT scoped to `actions:write` on this repo only -- used
+  solely to trigger `workflow_dispatch`; it can neither push code nor edit repo
+  variables), surfaced through the ADO variable group `lab-secrets` (referenced at
+  `azure-pipelines.yml:11`) as secret variables `LABDEPLOY_PASSWORD`, `NUGET_PAT`,
+  and `GH_ACTIONS_DISPATCH_TOKEN` **and** through the GitHub environment `lab`
+  (bound via the `environment: lab` job binding on the committed
+  `.github/workflows/deploy-lab.yml` asset -- without an `environment:` binding
+  GitHub environment secrets do not resolve) with secrets `LABDEPLOY_PASSWORD` and
+  `NUGET_PAT` (the exact names read at `github-deploy.yml:21-22` /
   `azure-pipelines.yml:33-34`). Target host from KeyVault `labdeploy-w1-host` /
-  GitHub environment variable `LD_W1_HOST`. Rollback inputs come from GitHub/ADO
-  variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM` (`github-deploy.yml:61-62`,
-  `azure-pipelines.yml:61-62`).
-- **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-workflow.ps1` (commits
-  the `deploy-lab.yml` harness wrapper to the DEFAULT BRANCH of the
-  `labdeploy-e2e-fixture` fork so `workflow_dispatch` is registered, binds
-  `environment: lab`, and seeds repo variables `LAST_GOOD_VERSION=1.1.0` /
-  `LAST_GOOD_CHECKSUM=sha256:<hex>` for the rollback path) then
-  `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds or downloads
-  `terraform-provider-labdeploy_v<version>` and lays it into the
+  GitHub environment variable `LD_W1_HOST`. Rollback inputs are read from
+  pre-existing GitHub/ADO variables `LAST_GOOD_VERSION` / `LAST_GOOD_CHECKSUM`
+  (maintained by the release process, `github-deploy.yml:61-62`,
+  `azure-pipelines.yml:61-62`); the test never writes them.
+- **Pre-test bootstrap**: `pwsh tests/e2e/pipeline/install-provider.ps1` -- builds
+  or downloads `terraform-provider-labdeploy_v<version>` and lays it into the
   `%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\...` mirror
   with the `~/.terraformrc` filesystem_mirror block; then reuses `verify-w1.ps1`.
-  This provisions the PROVIDER binary and the dispatchable harness workflow only;
-  the target OS tooling is pre-provisioned.
-- **Gate provisioning**: n/a (lab). PIP scenarios skip when `LD_W1_HOST` / the
-  self-hosted runner are unavailable (allowed for `lab-*`); provider binary
-  behavior and spec substitution are proven in Phases 1-3.
+  This provisions the PROVIDER binary only; the dispatchable workflow is a
+  committed repo asset (no runtime commit, no repo-write token) and the target OS
+  tooling is pre-provisioned. `PIP_LINT-01` needs no bootstrap (reads files from
+  the checkout).
+- **Gate provisioning**: `PIP_LINT-01` is the in-gate proof -- it parses the two
+  committed `examples/pipelines/*.yml` plus the `.github/workflows/deploy-lab.yml`
+  asset from the checkout (deps: none, no docker, no runner) and runs in Forge's
+  gate every time. The live PIP-01..03 skip when `LD_W1_HOST` / the self-hosted
+  runner are unavailable (allowed for `lab-*`); provider binary behavior and spec
+  substitution are additionally proven in Phases 1-3.
 
 ### Scenarios
 
-**Feature: reference pipeline integration**
+**Feature: reference pipeline contract (gate-tier structural proof)**
+
+  Scenario: PIP_LINT-01 Shipped pipelines are well-formed and drift-free (gate)
+    Given the committed `examples/pipelines/github-deploy.yml`,
+    `examples/pipelines/azure-pipelines.yml`, and the promoted
+    `.github/workflows/deploy-lab.yml` asset
+    When each is parsed with a YAML parser in `go test ./test/pipeline`
+    Then all are well-formed; the GH files declare required `version`+`checksum`
+    inputs, `concurrency`, an `always()` upload step, and an `if: failure()`
+    rollback job reading `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM`; the ADO file
+    declares a `condition: always()` publish and a `condition: failed()` Rollback
+    stage; AND `deploy-lab.yml` is step-for-step identical to
+    `github-deploy.yml` except for the added `environment: lab` binding (a
+    mechanical equality assertion so the dispatchable asset cannot drift from the
+    shipped reference). (`implementation-plan.md:438`.)
+
+**Feature: reference pipeline integration (live lab)**
 
   Scenario: PIP-01 GitHub deploy workflow publishes results
-    Given the `deploy-lab.yml` harness (wrapping `github-deploy.yml`, bound to
-    `environment: lab`) on the `labdeploy-e2e-fixture` default branch, dispatched
-    with `version=1.1.0` and `checksum=sha256:<good-hex>`
-    When the workflow runs
+    Given the committed `.github/workflows/deploy-lab.yml` asset (`name:
+    deploy-lab`, bound to `environment: lab`), dispatched with `version=1.1.0` and
+    `checksum=sha256:<good-hex>`
+    When the workflow runs on a `[self-hosted, lab]` runner
     Then the `deploy` job is green and the `always()` step uploads the
     `labdeploy-results-1.1.0` artifact containing trx + summary + logs from
     `examples/labdeploy-results/**`.
 
   Scenario: PIP-02 GitHub deploy failure triggers auto-rollback
-    Given repo variables `LAST_GOOD_VERSION=1.1.0` /
-    `LAST_GOOD_CHECKSUM=sha256:<good-hex>` are set, dispatched with
-    `version=1.2.0-bad` and its `checksum`
+    Given pre-existing repo variables `LAST_GOOD_VERSION=1.1.0` /
+    `LAST_GOOD_CHECKSUM=sha256:<good-hex>`, dispatched with `version=1.2.0-bad`
+    and its `checksum`
     When the workflow runs
     Then the `deploy` job fails with `[ERR_SERVICE_START]`, the `rollback` job
     (`if: failure()`) applies `app_version=${{ vars.LAST_GOOD_VERSION }}` /
@@ -1009,6 +1035,7 @@ the authoritative contract.
 | 1 Spec/Schema | HSH-01, RRP-01..02, SRT-01 | inline | T2, T9 |
 | 2 Transport/Artifact proofs | ENC-01..02, LCL-01, CON-04, ART_FETCH-01..02, NUG-01, TPS-01 | compose | T3, T4, T5 |
 | 3 Pattern/Engine/Logs proofs | PAT-01..03, ENG-01..03, LOG-01 | inline | T6, T7, T8 |
+| 8 Pipeline contract (in-gate) | PIP_LINT-01 | lab-bare-metal (gate-runnable) | golden (`implementation-plan.md:438`) |
 
 Notes:
 - CON-04 (host-key mismatch, in-process stub) and LCL-01 (local round-trip) are
@@ -1038,15 +1065,24 @@ Notes:
   the gate-tier script-generation proof for the docker engine; the live docker
   run/rollback legs are DKR-01..03 (Phase 4).
 - Phase 8 PIP-01..03 assert against the SHIPPED assets
-  `examples/pipelines/github-deploy.yml` and `azure-pipelines.yml`, which use
-  `version`+`checksum` inputs, `[self-hosted, lab]` / `LabAgents`, secrets
-  `LABDEPLOY_PASSWORD`+`NUGET_PAT`, `LAST_GOOD_VERSION`/`LAST_GOOD_CHECKSUM`
-  rollback variables, and artifact `labdeploy-results-<version>`. RESOLUTION
-  (authoritative, no open question): the shipped example pipelines ARE the
-  concrete implementation of the DESIGN section 18.10 intent, so they govern the
-  executable contract; the DESIGN 18.10 matrix's illustrative label text
-  (`e2e-results`/`labdeploy-logs` artifacts, `auto_rollback`/`rollback_to` inputs)
-  is treated as non-normative naming and is superseded by the assets. PIP-01..03
-  follow the assets consistently. A DESIGN 18.10 wording refresh to match the
-  assets is a documentation-only follow-up owned by the DESIGN maintainer; it does
-  not change any scenario here, so no operator decision is pending.
+  `examples/pipelines/github-deploy.yml` and `azure-pipelines.yml` (promoted to
+  the dispatchable `.github/workflows/deploy-lab.yml` by `implementation-plan.md`
+  Stage 8.2), which use `version`+`checksum` inputs, `[self-hosted, lab]` /
+  `LabAgents`, secrets `LABDEPLOY_PASSWORD`+`NUGET_PAT`, `LAST_GOOD_VERSION`/
+  `LAST_GOOD_CHECKSUM` rollback variables, and artifact `labdeploy-results-<version>`.
+  These asset names DIVERGE from the DESIGN section 18.10 matrix wording
+  (`e2e-results`/`labdeploy-logs` artifacts, `auto_rollback`/`rollback_to` inputs).
+  This e2e doc does not unilaterally pick a winner: the divergence is a genuine
+  upstream conflict (DESIGN is treated as normative-and-resolved by
+  `architecture.md` and `tech-spec.md`, yet the shipped assets differ), so it is
+  escalated for an operator pin as open question `pip-design-vs-assets` below. The
+  scenarios currently follow the shipped assets because those are what exists and
+  runs; if the operator pins DESIGN as authoritative, the assets and PIP-01..03
+  Then-clauses update together in the next iteration.
+- PIP_LINT-01 is the gate-tier structural proof (`implementation-plan.md:438`,
+  proof golden, deps none): it parses the two committed `examples/pipelines/*.yml`
+  and the promoted `.github/workflows/deploy-lab.yml`, asserting well-formedness,
+  the required input/step/rollback contract, and step-for-step equality between
+  the asset and the example modulo the `environment: lab` binding. It runs in
+  Forge's gate so Phase 8 always has non-skippable coverage even when the lab is
+  offline.
