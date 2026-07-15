@@ -205,7 +205,8 @@ storyId: "release:RELEASE-PROVIDER"
 
 ### Implementation Steps
 - [x] Define the `pattern.Pattern` seam interface and `ReleaseCtx` in `internal/pattern/pattern.go` (`Configure`/`Preflight`/`Stop`/`Start`/`Status`/`Uninstall`) plus the `pattern.For(type)` factory, so the engine orchestrates against a compile-safe interface before any concrete pattern lands (breaks the engine<->pattern cycle; concrete patterns follow in Phase 4).
-- [x] Implement `engine/engine.go` `Deploy` orchestration emitting the exact named steps (VALIDATE..UNLOCK) via tflog with `app/host/step/version/duration_ms` fields, calling patterns through the `pattern.Pattern` seam.
+- [x] `engine/engine.go` `Deploy` orchestration runs the fresh/update sequence and calls patterns through the `pattern.Pattern` seam (tflog is used for a few milestones).
+- [ ] Complete structured step logging: emit EVERY fixed step VALIDATE/CONNECT/PREFLIGHT/LOCK/FETCH/CHECKSUM/STAGE/EXTRACT/RENDER/CONFIGURE/STOP/SWITCH/START/HEALTH/FINALIZE/PRUNE/UNLOCK through `tflog` with `app/host/step/version/duration_ms` fields (engine currently logs only ad-hoc messages and has no `duration_ms` field -- confirmed absent in `internal/engine`).
 - [x] Implement the idempotency short-circuit (DESIGN sec 10.1): current version + checksum + healthy status -> NO-OP with no fetch/restart.
 - [x] Implement the single-target rollback matrix (DESIGN sec 10.2) for fresh vs update, and `ERR_ROLLBACK_FAILED` (sec 10.6) with detail starting `MACHINE IN UNKNOWN STATE host=<h>`.
 - [x] Implement `Destroy` modes (purge/unregister/abandon) and `ReadStatus` reconciliation.
@@ -276,7 +277,8 @@ storyId: "release:RELEASE-PROVIDER"
 
 ### Implementation Steps
 - [x] Implement `provider.go` with the optional `default_target` block and `Configure` passing defaults into resources.
-- [x] Implement the `labdeploy_deployment` schema (arguments + computed attributes per DESIGN sec 5.2) with a `spec`/`spec_file` exactly-one-of validator.
+- [x] `labdeploy_deployment` schema (arguments + computed attributes per DESIGN sec 5.2) is defined in `deployment_resource.go` `Schema`.
+- [ ] Add a schema-level `spec`/`spec_file` exactly-one-of validator: `Schema` (lines 50-71) declares both as plain optional attributes with NO attribute validator; the one-of check exists only at runtime in `resolveSpec` (lines 83-86). Move it to a schema `Validators`/`ConfigValidators` so `terraform validate` fails before apply.
 - [x] Implement `spec_file` content hashing into the plan so file edits produce a diff.
 
 ### Dependencies
@@ -289,10 +291,13 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 5.2: Deployment Resource CRUD and Plan Modifiers
 
 ### Implementation Steps
-- [x] Implement `Create`/`Update`/`Delete` calling engine `Deploy`/`Destroy`, mapping every engine error to a diagnostic whose Summary is `[<CODE>] <short>`.
-- [x] Implement the RequiresReplace plan modifier that parses old+new spec and compares the immutable paths from Stage 1.4.
-- [x] Populate computed outputs (`id`, `deployed_version`, `previous_version`, `hosts`, `release_path`, `service_status`, `spec_hash`).
-- [x] Implement the timeouts block (create/update 30m, delete 15m) and the import-unsupported error `import is not supported; adopt via apply`.
+- [x] `Create`/`Update`/`Delete` call engine `Deploy`/`Destroy` and surface warnings.
+- [ ] Fix diagnostic Summary contract: map every engine error to Summary `[<CODE>] <short>` (DESIGN sec 12). Current `Create` emits `diags.AddError("Deploy failed", ...)` (line ~196) and `Delete` emits `"Destroy failed"` -- neither carries the `[<CODE>]` prefix pipelines grep for.
+- [x] RequiresReplace plan modifier that parses old+new spec and compares the immutable paths from Stage 1.4.
+- [ ] Fix computed `id` to the authoritative formula `sha1(sorted(hosts)+"/"+name)[0:12] + ":" + name` (architecture line 78); `deploymentID` (lines 266-267) currently returns `name@hosts`, which is wrong and unstable across host order.
+- [ ] Populate remaining computed outputs verified against state: `deployed_version`, `previous_version`, `hosts`, `release_path`, `service_status`, `spec_hash` (present) plus the corrected `id` above.
+- [ ] Add the create/update (30m) and delete (15m) timeouts block: no `timeouts` schema or resource-timeout handling exists under `internal/provider`.
+- [ ] Fix the import-unsupported message to the pinned string `import is not supported; adopt via apply`; `ImportState` (lines 254-256) currently emits `"labdeploy_deployment cannot be imported ..."` instead.
 
 ### Dependencies
 - phase-terraform-provider-surface/stage-provider-and-deployment-resource-schema
@@ -304,9 +309,10 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 5.3: Read Drift Reconciliation and Destroy Modes
 
 ### Implementation Steps
-- [x] Implement `Read` refresh from the target manifest: absent -> `RemoveResource`; `last_operation.result==failed` -> `<version>!failed` marker forcing a converging plan; `service_status` from `pattern.Status`.
-- [x] Implement `destroy_mode` purge/unregister/abandon in `Delete`.
-- [x] Emit a once-per-apply WARN diag for insecure transport (`winrm.insecure_skip_verify=true` or `ssh.host_key=""`).
+- [x] `Read` refresh from the target manifest: absent -> `RemoveResource`; `last_operation.result==failed` -> `<version>!failed` marker; `service_status` from `pattern.Status`.
+- [x] `destroy_mode` purge/unregister/abandon in `Delete`.
+- [ ] Fix `Read` unreachable-target semantics to fail loudly: `Read` (lines 217-221) currently converts a `ReadStatus` error into a WARN and returns, but DESIGN sec 10.4 / architecture lines 308-314 require Read to return an ERROR on network failure (never silently drop drift).
+- [ ] Complete insecure-transport warnings: source warns only for an unpinned SSH `host_key`; add the `winrm.insecure_skip_verify=true` warning and guarantee exactly one WARN diag per apply (DESIGN sec 11).
 
 ### Dependencies
 - phase-terraform-provider-surface/stage-deployment-resource-crud-and-plan-modifiers
@@ -371,7 +377,8 @@ storyId: "release:RELEASE-PROVIDER"
 ## Stage 7.2: E2E Test Resource and Collection
 
 ### Implementation Steps
-- [x] Implement the `labdeploy_e2e_test` schema (`spec`/`spec_file`, `deployment_id` edge, `triggers` RequiresReplace, `fail_on_test_failure`, computed outputs).
+- [x] `labdeploy_e2e_test` schema with `spec`/`spec_file`, `triggers` RequiresReplace, `fail_on_test_failure`, and computed outputs.
+- [ ] Add the `deployment_id` attribute + dependency edge to the e2e schema: `e2e_test_resource.go` has no `deployment_id` field, so pipelines cannot order the test after its deployment.
 - [x] Implement `Create` running tests with process-tree kill on `runner.timeout_seconds` (`ERR_TIMEOUT`) and collection always before returning a test-failure error.
 - [x] Implement results download/unzip into `destination_dir`, log + `windows_event_logs` collection since test start, and best-effort `Delete`.
 
