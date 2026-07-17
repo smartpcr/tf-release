@@ -54,11 +54,11 @@ var reRmOne = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContin
 var reMklink = regexp.MustCompile(`mklink /J "([^"]+)" "([^"]+)"`)
 var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 
-// reMove captures the atomic rename primitive used by claimByRename/restoreLock:
-// `[IO.File]::Move('<from>','<to>')`. The trailing catch code distinguishes a
-// seize (`catch { exit 3 }`, source-gone tolerant) from a no-replace restore
-// (`catch { exit 1 }`, dest-exists tolerant).
-var reMove = regexp.MustCompile(`\[IO\.File\]::Move\('([^']+)','([^']+)'\)`)
+// reReplace captures the atomic in-place replace primitive used by
+// replaceInPlace: `[IO.File]::Replace('<tmp>','<lock>',$null)`. It overwrites the
+// destination without ever leaving it absent (the canonical lock slot is never
+// emptied during a stale takeover).
+var reReplace = regexp.MustCompile(`\[IO\.File\]::Replace\('([^']+)','([^']+)',\$null\)`)
 
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
@@ -67,19 +67,14 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
-	case reMove.MatchString(s): // claimByRename (seize) / restoreLock (no-replace)
-		m := reMove.FindStringSubmatch(s)
+	case reReplace.MatchString(s): // replaceInPlace atomic overwrite
+		m := reReplace.FindStringSubmatch(s)
 		from, to := m[1], m[2]
-		if strings.Contains(s, "catch { exit 1 }") { // restore: fail if dest exists
-			if _, exists := f.files[to]; exists {
-				return transport.Result{ExitCode: 1}, nil
-			}
-		}
 		src, exists := f.files[from]
-		if !exists { // source gone: another contender seized it first
-			return transport.Result{ExitCode: 3}, nil
+		if !exists {
+			return transport.Result{ExitCode: 1, Stderr: "temp missing"}, nil
 		}
-		f.files[to] = src
+		f.files[to] = src // atomic: dst present throughout
 		delete(f.files, from)
 		return ok(""), nil
 

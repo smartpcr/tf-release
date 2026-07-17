@@ -189,13 +189,14 @@ type lockInfo struct {
 }
 
 // Lock is the handle returned by AcquireLock. It carries the exact bytes we
-// persisted plus this acquisition's unique token so ReleaseLock can perform an
-// ownership-safe release keyed on an ATOMIC rename (never a cached compare).
+// persisted plus this acquisition's unique token so ReleaseLock can verify
+// ownership (delete only when `.lock` still holds our exact bytes) under the
+// serialization gate, without ever temporarily removing an unowned lock.
 type Lock struct {
 	t       transport.Transport
 	paths   layout.Paths
 	content string // exact JSON persisted for this acquisition
-	token   string // per-acquisition nonce; names the release claim path
+	token   string // per-acquisition nonce
 }
 
 func newToken() string {
@@ -209,18 +210,17 @@ func newToken() string {
 
 // AcquireLock takes the target lock with atomic create-new semantics
 // (DESIGN §13). exit 48 ⇒ held. A held lock is inspected: unparseable metadata
-// or age < timeout ⇒ ERR_LOCKED; a PROVEN stale lock (age ≥ timeout) is taken
-// over via ATOMIC RENAME ARBITRATION — the stale file is seized with a single
-// indivisible rename to a unique per-token path, so among concurrent contenders
-// exactly one seizes it and the rest observe "source gone" (evaluator item 1).
-// On success it returns a *Lock handle for ownership-safe release.
+// or age < timeout ⇒ ERR_LOCKED; a PROVEN stale lock (age >= timeout) is taken
+// over UNDER A SERIALIZATION GATE by REPLACING `.lock` in place with a single
+// atomic rename, so the canonical lock path is NEVER momentarily absent and two
+// operations can never both believe they hold it (evaluator items 1 & 4). On
+// success it returns a *Lock handle for ownership-safe release.
 func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, owner, op string, timeoutSec int) (lk *Lock, staleWarn string, err error) {
 	// A held lock that DISAPPEARS mid-inspection (the holder released) or a lost
-	// create-new race after a legitimate stale takeover are transient states, not
-	// contention — the slot is momentarily free, so we re-evaluate from scratch.
-	// The loop is bounded; a genuinely live lock is judged not-stale on the very
-	// next pass and returns ERR_LOCKED immediately (no spinning).
-	const maxAttempts = 32
+	// gate race is a transient state, not contention, so we re-evaluate from
+	// scratch. The loop is bounded; a genuinely live lock is judged not-stale on
+	// the next pass and returns ERR_LOCKED immediately (no spinning).
+	const maxAttempts = 64
 	for attempt := 0; ; attempt++ {
 		token := newToken()
 		li, _ := json.Marshal(lockInfo{
@@ -271,73 +271,64 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 				fmt.Errorf("held by %s since %s (op=%s)", existing.Owner, existing.StartedUTC, existing.Op))
 		}
 
-		// Proven stale (age >= timeout): take over via ATOMIC RENAME ARBITRATION.
-		// rename(2) / [IO.File]::Move is the only indivisible + exclusive
-		// filesystem primitive: among concurrent contenders renaming the SAME
-		// source to DISTINCT per-token targets, exactly ONE succeeds and every
-		// other observes "source gone". This replaces the racy
-		// read/compare/remove/create guard that let two contenders both
-		// delete-and-recreate the lock (evaluator item 1).
-		claim := p.Lock + ".acq." + token
-		won, cerr2 := claimByRename(ctx, t, p.Lock, claim)
-		if cerr2 != nil {
-			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr2)
+		// Proven stale (age >= timeout): take over UNDER THE SERIALIZATION GATE.
+		// The gate (an exclusive create-new on `<lock>.mx`) admits exactly one
+		// takeover-or-release critical section at a time. While we hold it we
+		// REPLACE `.lock` in place with a single atomic rename — the canonical
+		// path is never absent, so a concurrent fresh CreateNew always observes
+		// exit 48 and no third contender can slip into an empty slot (items 1,2).
+		done, tlk, twarn, terr := takeoverUnderGate(ctx, t, p, raw, existing, content, token)
+		if terr != nil {
+			return nil, "", terr
 		}
-		if !won {
-			// Another contender seized the stale file first (or the owner
-			// released). Race for the now-free slot through the exclusive gate.
-			created2, _, cerr3 := createLockExclusive(ctx, t, p, content)
-			if cerr3 != nil {
-				return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr3)
-			}
-			if created2 {
-				return &Lock{t: t, paths: p, content: content, token: token}, staleWarnMsg(existing, t.Host()), nil
-			}
-			// A winner now holds the slot; re-evaluate it (it may be a fresh,
-			// live lock ⇒ ERR_LOCKED next pass, or already gone ⇒ retry).
-			if attempt < maxAttempts {
-				continue
-			}
-			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-				fmt.Errorf("stale lock from %s taken over by a concurrent contender", existing.Owner))
+		if done {
+			return tlk, twarn, nil
 		}
-		// We seized the bytes under our unique claim path. Re-verify they are
-		// still the ones we judged stale: if a successor took over between our
-		// read and our seize the bytes differ ⇒ we grabbed a LIVE lock ⇒ restore
-		// it (no-replace) and re-evaluate, so we never invalidate a live owner.
-		claimRaw, ok2, rerr2 := readSmallFile(ctx, t, claim)
-		if rerr2 != nil || !ok2 {
-			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("seized claim vanished during takeover"))
-		}
-		if claimRaw != raw {
-			if restored, _ := restoreLock(ctx, t, claim, p.Lock); !restored {
-				_ = deletePath(ctx, t, claim)
-			}
-			if attempt < maxAttempts {
-				continue
-			}
-			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-				fmt.Errorf("stale lock changed under takeover (a successor already claimed it)"))
-		}
-		// Confirmed stale: discard the seized bytes and re-create through the
-		// exclusive gate. A racing creator that grabbed the freed slot wins.
-		if derr := deletePath(ctx, t, claim); derr != nil {
-			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", derr)
-		}
-		created2, _, cerr3 := createLockExclusive(ctx, t, p, content)
-		if cerr3 != nil {
-			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr3)
-		}
-		if created2 {
-			return &Lock{t: t, paths: p, content: content, token: token}, staleWarnMsg(existing, t.Host()), nil
-		}
-		// Lost the freed slot to a concurrent creator — re-evaluate.
+		// Gate was busy, or `.lock` changed/vanished under us — re-evaluate.
 		if attempt < maxAttempts {
 			continue
 		}
 		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-			fmt.Errorf("stale lock from %s taken over by a concurrent contender", existing.Owner))
+			fmt.Errorf("stale lock from %s: takeover repeatedly contended", existing.Owner))
 	}
+}
+
+// takeoverUnderGate attempts a single gated stale-takeover. It acquires the
+// exclusive gate; if busy it returns (done=false) so the caller re-evaluates.
+// While holding the gate — released on EVERY path, including transport errors
+// (evaluator item 4) — it re-reads `.lock`: only when it still holds the exact
+// stale bytes we judged does it REPLACE them in place with our content via one
+// atomic rename (never emptying the canonical slot). Any other state (vanished,
+// or already replaced by a prior successor) yields done=false for re-evaluation.
+func takeoverUnderGate(ctx context.Context, t transport.Transport, p layout.Paths, raw string, existing lockInfo, content, token string) (done bool, lk *Lock, warn string, err error) {
+	gotGate, gexit, gerr := createExclusiveAt(ctx, t, p.Root, gatePath(p.Lock), token)
+	if gerr != nil {
+		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", gerr)
+	}
+	if !gotGate {
+		if gexit == 48 {
+			return false, nil, "", nil // gate busy — caller re-evaluates
+		}
+		return false, nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("takeover gate create failed (exit %d)", gexit))
+	}
+	defer func() { _ = deletePath(ctx, t, gatePath(p.Lock)) }()
+
+	cur, ok, rerr := readSmallFile(ctx, t, p.Lock)
+	if rerr != nil {
+		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", rerr)
+	}
+	if !ok || cur != raw {
+		// Vanished (holder released) or already replaced by a prior successor —
+		// nothing for us to override here. Re-evaluate from the top.
+		return false, nil, "", nil
+	}
+	// Still the exact stale lock we judged: atomically REPLACE it in place. The
+	// canonical `.lock` is never removed, so fresh CreateNew contenders keep
+	// seeing exit 48 and no empty slot is ever exposed.
+	if rerr := replaceInPlace(ctx, t, p, p.Lock, content, token); rerr != nil {
+		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", rerr)
+	}
+	return true, &Lock{t: t, paths: p, content: content, token: token}, staleWarnMsg(existing, t.Host()), nil
 }
 
 func staleWarnMsg(existing lockInfo, host string) string {
@@ -345,20 +336,27 @@ func staleWarnMsg(existing lockInfo, host string) string {
 		existing.Owner, existing.StartedUTC, host)
 }
 
-// createLockExclusive runs the atomic create-new. Returns (created, exitCode,
-// transportErr): created=true on exit 0; exitCode==48 signals the file already
-// existed. DESIGN §13: PowerShell `[IO.File]::Open(CreateNew)`, POSIX `set -C`.
+// createLockExclusive runs the atomic create-new on the canonical lock path.
 func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Paths, content string) (bool, int, error) {
+	return createExclusiveAt(ctx, t, p.Root, p.Lock, content)
+}
+
+// createExclusiveAt runs the atomic create-new at an arbitrary path (used for
+// both the canonical `.lock` and the `<lock>.mx` serialization gate). Returns
+// (created, exitCode, transportErr): created=true on exit 0; exitCode==48 signals
+// the file already existed. DESIGN §13: PowerShell `[IO.File]::Open(CreateNew)`,
+// POSIX `set -C`.
+func createExclusiveAt(ctx context.Context, t transport.Transport, root, path, content string) (bool, int, error) {
 	b64 := base64.StdEncoding.EncodeToString([]byte(content))
 	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
 		script := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
 try { $fs=[IO.File]::Open(%s,'CreateNew'); $b=[Convert]::FromBase64String(%s); $fs.Write($b,0,$b.Length); $fs.Close(); exit 0 }
-catch [System.IO.IOException] { exit 48 }`, psq(p.Root), psq(p.Lock), psq(b64))
+catch [System.IO.IOException] { exit 48 }`, psq(root), psq(path), psq(b64))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
 	} else {
-		script := fmt.Sprintf(`mkdir -p '%s'; (set -C; printf '%%s' '%s' | base64 -d > '%s') 2>/dev/null || exit 48`, p.Root, b64, p.Lock)
+		script := fmt.Sprintf(`mkdir -p '%s'; (set -C; printf '%%s' '%s' | base64 -d > '%s') 2>/dev/null || exit 48`, root, b64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {
@@ -367,49 +365,46 @@ catch [System.IO.IOException] { exit 48 }`, psq(p.Root), psq(p.Lock), psq(b64))
 	return r.ExitCode == 0, r.ExitCode, nil
 }
 
-// claimByRename atomically renames `from` to `to`. rename(2) / [IO.File]::Move
-// is the sole indivisible + exclusive filesystem primitive: among concurrent
-// callers renaming the SAME source to DISTINCT targets, exactly ONE succeeds and
-// the rest observe "source gone". Returns (won, transportErr); won=false when the
-// source no longer exists (another caller seized it first).
-func claimByRename(ctx context.Context, t transport.Transport, from, to string) (bool, error) {
+// gatePath is the per-lock serialization gate: an exclusive create-new file that
+// admits exactly one takeover/release critical section at a time, so the
+// canonical `.lock` is only ever mutated by one gated operation.
+func gatePath(lock string) string { return lock + ".mx" }
+
+// replaceInPlace atomically overwrites `lockPath` with content by writing a
+// unique temp file then renaming it ONTO the destination (POSIX rename / Windows
+// [IO.File]::Replace are atomic and never leave the destination absent). Callers
+// must hold the serialization gate. On any error the temp is cleaned up so no
+// `.tmp.*` residue is stranded (evaluator item 4).
+func replaceInPlace(ctx context.Context, t transport.Transport, p layout.Paths, lockPath, content, token string) error {
+	tmp := lockPath + ".tmp." + token
+	if werr := writeSmallFile(ctx, t, tmp, content); werr != nil {
+		_ = deletePath(ctx, t, tmp)
+		return werr
+	}
 	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`try { [IO.File]::Move(%s,%s); exit 0 } catch { exit 3 }`, psq(from), psq(to))
+		// [IO.File]::Replace atomically swaps tmp onto lockPath (dst must exist,
+		// which the gate guarantees) with no intervening absent state.
+		script := fmt.Sprintf(`[IO.File]::Replace(%s,%s,$null)`, psq(tmp), psq(lockPath))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
 	} else {
-		script := fmt.Sprintf(`if mv '%s' '%s' 2>/dev/null; then exit 0; else exit 3; fi`, from, to)
+		// rename(2) via `mv -f` atomically replaces the destination.
+		script := fmt.Sprintf(`mv -f '%s' '%s'`, tmp, lockPath)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {
-		return false, err
+		_ = deletePath(ctx, t, tmp)
+		return err
 	}
-	return r.ExitCode == 0, nil
+	if r.ExitCode != 0 {
+		_ = deletePath(ctx, t, tmp)
+		return fmt.Errorf("atomic replace of %s failed (exit %d): %s", lockPath, r.ExitCode, r.Stderr)
+	}
+	return nil
 }
 
-// restoreLock moves a previously-seized claim file back to the lock path WITHOUT
-// replacing a lock that a fresh contender may have created in the freed slot.
-// Windows [IO.File]::Move is inherently no-replace (throws if dest exists); POSIX
-// uses `ln` (fails if dest exists) then drops the source. Returns (restored,err);
-// restored=false when the slot is already taken (dest exists).
-func restoreLock(ctx context.Context, t transport.Transport, from, to string) (bool, error) {
-	var r transport.Result
-	var err error
-	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`try { [IO.File]::Move(%s,%s); exit 0 } catch { exit 1 }`, psq(from), psq(to))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
-	} else {
-		script := fmt.Sprintf(`if ln '%s' '%s' 2>/dev/null; then rm -f '%s'; exit 0; else exit 1; fi`, from, to, from)
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
-	}
-	if err != nil {
-		return false, err
-	}
-	return r.ExitCode == 0, nil
-}
-
-// deletePath unconditionally removes a single file (used to drop a seized claim).
+// deletePath unconditionally removes a single file (the gate, or an owned lock).
 func deletePath(ctx context.Context, t transport.Transport, path string) error {
 	var err error
 	if t.OS() == spec.OSWindows {
@@ -422,33 +417,47 @@ func deletePath(ctx context.Context, t transport.Transport, path string) error {
 	return err
 }
 
-// ReleaseLock releases the lock with ATOMIC RENAME ARBITRATION so a caller that
+// ReleaseLock releases the lock UNDER THE SERIALIZATION GATE so a caller that
 // overran the timeout can never delete a successor's lock (evaluator item 2).
-// It first SEIZES the lock path with a single indivisible rename to a unique
-// per-token claim path; if the rename fails the lock is already gone or a
-// successor holds it ⇒ no-op. Only after the seize does it verify ownership: if
-// the seized bytes are ours we delete the claim; otherwise we restore it
-// (no-replace) so the successor's lock survives. Ownership verification and
-// removal are thus one indivisible seize, never a cached compare. Nil ⇒ no-op.
+// It acquires the exclusive gate, then removes `.lock` ONLY when the persisted
+// bytes still equal this handle's exact content; if a successor has legitimately
+// replaced them, the lock is left untouched. Because takeover also holds this
+// gate and replaces `.lock` in place, ownership verification and removal are
+// never interleaved with a takeover and NO unowned lock is ever temporarily
+// removed. A nil handle, a persistently-busy gate, or a transport error is a
+// safe no-op (never an unsafe delete). The gate is released on every path.
 func ReleaseLock(ctx context.Context, lk *Lock) {
 	if lk == nil || lk.t == nil {
 		return
 	}
 	t := lk.t
-	claim := lk.paths.Lock + ".rel." + lk.token
-	won, err := claimByRename(ctx, t, lk.paths.Lock, claim)
-	if err != nil || !won {
-		// Lock already absent or seized by a successor's takeover — nothing ours.
-		return
-	}
-	claimRaw, ok, _ := readSmallFile(ctx, t, claim)
-	if ok && claimRaw == lk.content {
-		_ = deletePath(ctx, t, claim) // it was ours — drop it
-		return
-	}
-	// Not ours (a successor legitimately took over): put it back untouched.
-	if restored, _ := restoreLock(ctx, t, claim, lk.paths.Lock); !restored {
-		_ = deletePath(ctx, t, claim)
+	gate := gatePath(lk.paths.Lock)
+	const gateAttempts = 64
+	for attempt := 0; attempt < gateAttempts; attempt++ {
+		gotGate, gexit, gerr := createExclusiveAt(ctx, t, lk.paths.Root, gate, lk.token)
+		if gerr != nil {
+			return // transport error — do NOT risk an unsafe delete
+		}
+		if gotGate {
+			func() {
+				defer func() { _ = deletePath(ctx, t, gate) }()
+				cur, ok, _ := readSmallFile(ctx, t, lk.paths.Lock)
+				if ok && cur == lk.content {
+					_ = deletePath(ctx, t, lk.paths.Lock) // still ours — release it
+				}
+				// Otherwise a successor owns it (or it is already gone): leave it.
+			}()
+			return
+		}
+		if gexit != 48 {
+			return // unexpected gate failure — safe no-op
+		}
+		// Gate busy (a takeover/release is in flight); brief backoff then retry.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(attempt+1) * time.Millisecond):
+		}
 	}
 }
 
