@@ -172,9 +172,18 @@ func withEnvPS(script string, env map[string]string) string {
 	return b.String()
 }
 
-func withEnvSh(script string, env map[string]string) string {
+// shEnvPrefix renders sorted `K='V' ` inline assignments that PRECEDE `sh -c`
+// so the values populate the environment of the sh process and the script's
+// `$K` expansions observe them (DESIGN §8.1: `sh -c '<script>'` with env
+// prepended `K='V' `). The assignments MUST come before `sh -c`, never inside
+// the quoted script: in a `K=V cmd $K` simple command the shell expands `$K`
+// with the OLD value before the assignment takes effect, so an in-script prefix
+// silently loses the injected value. Sorted order keeps golden output
+// deterministic (DESIGN §17 transport). Values are single-quote escaped so they
+// never reach a command line in clear that a shell could re-interpret.
+func shEnvPrefix(env map[string]string) string {
 	if len(env) == 0 {
-		return script
+		return ""
 	}
 	keys := make([]string, 0, len(env))
 	for k := range env {
@@ -183,10 +192,28 @@ func withEnvSh(script string, env map[string]string) string {
 	sort.Strings(keys)
 	var b strings.Builder
 	for _, k := range keys {
-		fmt.Fprintf(&b, "export %s=%s\n", k, shQuote(env[k]))
+		fmt.Fprintf(&b, "%s=%s ", k, shQuote(env[k]))
 	}
-	b.WriteString(script)
 	return b.String()
+}
+
+// envKV renders env as sorted `K=V` entries for exec.Cmd.Env (local transport).
+// Setting the child process environment directly avoids any shell-quoting or
+// expansion-ordering pitfalls that a string prefix would introduce.
+func envKV(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+env[k])
+	}
+	return out
 }
 
 // EncodePS builds `powershell.exe ... -EncodedCommand <b64(UTF-16LE)>`.
@@ -214,7 +241,8 @@ func BuildCommandLine(osKind spec.OSKind, c Cmd) (string, error) {
 		if osKind != spec.OSLinux {
 			return "", fmt.Errorf("sh shell requires linux target")
 		}
-		return "sh -c " + shQuote(withEnvSh(c.Script, c.Env)), nil
+		// Env assignments precede `sh -c` so the whole script inherits them.
+		return shEnvPrefix(c.Env) + "sh -c " + shQuote(c.Script), nil
 	case ShellCmd:
 		if osKind != spec.OSWindows {
 			return "", fmt.Errorf("cmd shell requires windows target")

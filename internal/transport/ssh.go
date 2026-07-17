@@ -173,9 +173,17 @@ func (s *sshTransport) Upload(ctx context.Context, local io.Reader, size int64, 
 	if err != nil {
 		return fmt.Errorf("sftp create %s: %w", remote, err)
 	}
-	defer f.Close()
-	_, err = io.Copy(f, local)
-	return err
+	if _, err := io.Copy(f, local); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sftp write %s: %w", remote, err)
+	}
+	// Do NOT defer/discard Close: an SFTP CLOSE can fail (e.g. server-side
+	// flush/quota) after every WRITE was ACKed, so a discarded close error
+	// would report a truncated upload as success (DESIGN §8.1 SSH upload).
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("sftp finalize %s: %w", remote, err)
+	}
+	return nil
 }
 
 func (s *sshTransport) Download(ctx context.Context, remote, local string) error {
