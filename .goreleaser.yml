@@ -44,5 +44,6 @@ changelog:
   disable: true
 
 release:
-  # Draft the release so a human can review before publishing.
-  draft: true
+  # Publish the release automatically on tag builds so runners can pull the
+  # filesystem-mirror artifact without a manual publish step (DESIGN §16.1).
+  draft: false

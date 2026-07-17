@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/masterzen/winrm"
+
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
 

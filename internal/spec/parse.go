@@ -85,7 +85,7 @@ type kindProbe struct {
 	Kind       string `json:"kind"`
 }
 
-// ParseDeploymentLenient: substitute → yaml/json → struct → versionOverride →
+// ParseDeploymentLenient runs substitute → yaml/json → struct → versionOverride →
 // canonical hash. NO semantic validation — callers merging provider
 // default_target validate afterwards (DESIGN §6.2 merge-then-validate).
 func ParseDeploymentLenient(raw string, vars map[string]string, versionOverride string) (*Deployment, string, error) {

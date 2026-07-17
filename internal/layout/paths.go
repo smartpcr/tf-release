@@ -1,3 +1,4 @@
+// Package layout resolves per-OS filesystem paths and environment for releases (DESIGN §7.1).
 package layout
 
 import (

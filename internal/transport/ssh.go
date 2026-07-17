@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
-	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
 
 type sshTransport struct {
