@@ -165,6 +165,8 @@ func (e *Engine) clusterAllCurrent(ctx context.Context, cc *clusterCtx) (bool, *
 func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, error) {
 	s := cc.s
 	started := time.Now().UTC()
+	// Best-effort per-node log/event collection on every exit path (DESIGN §6.5).
+	defer e.collectClusterLogs(ctx, cc, started)
 	// C1: stage + switch + register (start=demand) on EVERY node.
 	for _, h := range cc.hosts {
 		p := cc.paths(h, s.Artifact.Version)
@@ -215,6 +217,8 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner string) (*Status, error) {
 	s := cc.s
 	started := time.Now().UTC()
+	// Best-effort per-node log/event collection on every exit path (DESIGN §6.5).
+	defer e.collectClusterLogs(ctx, cc, started)
 	owner = matchHost(cc.hosts, owner)
 	if owner == "" {
 		return nil, coded("ERR_PREFLIGHT", cc.hosts[0], "PREFLIGHT",
@@ -349,6 +353,14 @@ func (e *Engine) clusterRollback(ctx context.Context, cc *clusterCtx, oldOwner s
 	e.clusterFinalizeVersion(ctx, cc, prevVersion, "", started, "rolled_back")
 	// R5: surface original failure.
 	return fmt.Errorf("%w; cluster rolled back to %s (role on %s, healthy)", orig, prevVersion, oldOwner)
+}
+
+// collectClusterLogs runs best-effort deployment log/event collection on every
+// cluster node (DESIGN §6.5); no-op when logs are unconfigured.
+func (e *Engine) collectClusterLogs(ctx context.Context, cc *clusterCtx, started time.Time) {
+	for _, h := range cc.hosts {
+		e.collectDeploymentLogs(ctx, cc.tr[h], cc.s, cc.paths(h, cc.s.Artifact.Version), started)
+	}
 }
 
 func (e *Engine) clusterHealthOnOwner(ctx context.Context, cc *clusterCtx) error {

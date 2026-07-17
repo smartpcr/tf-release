@@ -107,6 +107,10 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 		prev = m.CurrentVersion
 	}
 	started := time.Now().UTC()
+	// Best-effort collection of logs.paths + windows_event_logs since operation
+	// start, on EVERY exit path from here (success, staging failure, rollback) —
+	// DESIGN §6.5. No-op when nothing is configured.
+	defer e.collectDeploymentLogs(ctx, t, s, p, started)
 
 	// STAGE / FETCH / CHECKSUM / EXTRACT / RENDER — no live mutation yet.
 	if err := e.stageOnHost(ctx, t, s, p, pat, rc); err != nil {
@@ -118,10 +122,6 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	if switchErr == nil {
 		switchErr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Current, rc.Env)
 	}
-	// COLLECT deployment logs + windows events since operation start (DESIGN
-	// §6.5 logs.paths / logs.windows_event_logs). Best-effort, on success AND on
-	// failure so post-mortem logs are captured before any rollback.
-	e.collectDeploymentLogs(ctx, t, s, p, started)
 	if switchErr != nil {
 		return nil, e.rollbackSingle(ctx, t, s, p, pat, prev, started, switchErr)
 	}
@@ -229,6 +229,9 @@ func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spe
 		prev = m.CurrentVersion
 		oldImage = m.Extra["image_id"]
 	}
+	// Best-effort log/event collection on every exit path from here (including
+	// image-pull failure) — DESIGN §6.5. No-op when nothing is configured.
+	defer e.collectDeploymentLogs(ctx, t, s, p, started)
 	if err := dc.Pull(ctx, t, rc); err != nil {
 		return nil, err
 	}
@@ -239,8 +242,6 @@ func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spe
 	if runErr == nil {
 		runErr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rc.Env)
 	}
-	// Collect deployment logs + events since operation start (best-effort).
-	e.collectDeploymentLogs(ctx, t, s, p, started)
 	if runErr != nil {
 		if !s.Strategy.EffectiveRollback() || oldImage == "" {
 			return nil, fmt.Errorf("%w; no docker rollback performed (prev image unknown or rollback disabled)", runErr)

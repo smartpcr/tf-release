@@ -55,37 +55,37 @@ func TestZipScriptGolden(t *testing.T) {
 }
 
 // TestZipScriptQuoting proves the collection script cannot be hijacked by a
-// malicious manifest glob: on Linux the pattern is translated to a POSIX-extended
-// regex and passed as DATA to `find -regex` (single-quoted), never expanded by
-// the shell, so command substitutions are inert; segment-aware `*` becomes
-// `[^/]*`; the archive path is shell/PS quoted; on Windows the glob is
-// PowerShell single-quoted.
+// malicious manifest glob: on Linux the pattern is passed as DATA to portable
+// `find ... -path` (single-quoted), never expanded by the shell, so command
+// substitutions are inert; depth-pinning keeps `*` segment-aware; the archive
+// path is shell/PS quoted; on Windows the glob is PowerShell single-quoted.
 func TestZipScriptQuoting(t *testing.T) {
 	evil := "/var/log/$(touch /tmp/pwned)/*.log"
 	lin := buildZipScript(spec.OSLinux, []string{evil}, "/tmp/x'y.tar.gz").Script
-	// find (not the shell) matches via a POSIX-extended regex.
-	if !strings.Contains(lin, `find "$1" -regextype posix-extended -type f -regex "$2"`) {
-		t.Fatalf("linux should match via find -regex, not shell glob: %s", lin)
+	// find (not the shell) matches via portable, segment-aware depth-pinned -path.
+	if !strings.Contains(lin, `find "$1" -maxdepth "$2" -mindepth "$2" -type f -path "$3"`) {
+		t.Fatalf("linux should match via portable find -path, not shell glob: %s", lin)
 	}
-	// `*` must translate to a segment-aware regex atom (never cross '/').
-	if !strings.Contains(lin, `[^/]*`) {
-		t.Fatalf("glob '*' not translated to segment-aware regex: %s", lin)
+	// GNU-only -regextype/-regex must be gone (BSD/BusyBox portability, item 3).
+	if strings.Contains(lin, "-regextype") || strings.Contains(lin, "-regex ") {
+		t.Fatalf("linux find must not use GNU-only -regextype/-regex: %s", lin)
 	}
-	// The dangerous substitution chars must appear ONLY inside single quotes, with
-	// their regex metacharacters escaped — never as a live command substitution.
-	if !strings.Contains(lin, `'/var/log/\$\(touch /tmp/pwned\)/[^/]*\.log'`) {
-		t.Fatalf("evil glob not passed as escaped single-quoted regex: %s", lin)
+	// The entire evil glob (root arg AND -path arg) must be single-quoted DATA.
+	if !strings.Contains(lin, `'/var/log/$(touch /tmp/pwned)'`) {
+		t.Fatalf("evil glob root not passed as single-quoted data: %s", lin)
 	}
-	// The original shell-glob form (wildcard intact, unescaped) must be absent —
-	// its presence would mean the shell, not find, expands the pattern.
-	if strings.Contains(lin, `$(touch /tmp/pwned)/*.log`) {
-		t.Fatalf("evil glob left in shell-expandable form: %s", lin)
+	if !strings.Contains(lin, `'/var/log/$(touch /tmp/pwned)/*.log'`) {
+		t.Fatalf("evil glob -path not passed as single-quoted data: %s", lin)
+	}
+	// find errors must be surfaced, not silently degraded to NOFILES (item 3).
+	if !strings.Contains(lin, "echo FINDERR") || !strings.Contains(lin, "exit 3") {
+		t.Fatalf("linux find failure not surfaced as FINDERR/exit 3: %s", lin)
 	}
 	// No shell glob-expansion loop over the pattern at all.
 	if strings.Contains(lin, "for f in ") {
 		t.Fatalf("collection must not shell-expand globs: %s", lin)
 	}
-	if !strings.Contains(lin, `tar czf '/tmp/x'\''y.tar.gz' -C "$tmp" .`) {
+	if !strings.Contains(lin, `tar czf '/tmp/x'\''y.tar.gz' -C "$stagedir" .`) {
 		t.Fatalf("linux archive path not safely quoted: %s", lin)
 	}
 	win := buildZipScript(spec.OSWindows, []string{"C:\\a'b"}, "C:\\x.zip").Script
@@ -94,20 +94,40 @@ func TestZipScriptQuoting(t *testing.T) {
 	}
 }
 
-// TestGlobToRegexSegmentAware verifies `*`/`?` never cross '/' (evaluator item 3)
-// and that regex metacharacters in literals are escaped.
-func TestGlobToRegexSegmentAware(t *testing.T) {
-	cases := map[string]string{
-		"/logs/*.log":    `/logs/[^/]*\.log`,
-		"logs/*.log":     `logs/[^/]*\.log`,
-		"a/?.trx":        `a/[^/]\.trx`,
-		"expected/*.trx": `expected/[^/]*\.trx`,
-		"a.b+c(d)":       `a\.b\+c\(d\)`,
-		"[!x]y":          `[^x]y`,
+// TestWindowsDrivePreservesIdentifier proves identically named files on different
+// drives/shares stage under distinct directories (evaluator item 5), so
+// Copy-Item -Force cannot silently overwrite a same-basename cross-drive file.
+func TestWindowsDrivePreservesIdentifier(t *testing.T) {
+	win := buildZipScript(spec.OSWindows, []string{`C:\logs\*.log`, `D:\logs\*.log`}, `C:\x.zip`).Script
+	// Drive letter becomes a top-level staging directory (C\..., D\...).
+	if !strings.Contains(win, `$rel = $Matches[1] + '\' + ($p -replace '^[A-Za-z]:[\\/]+','')`) {
+		t.Fatalf("windows staging must preserve the drive letter as a directory: %s", win)
+	}
+	// UNC paths are namespaced under UNC\ so \\a\share and \\b\share don't collide.
+	if !strings.Contains(win, `$rel = 'UNC\' + ($p -replace '^[\\/]{2}','')`) {
+		t.Fatalf("windows staging must namespace UNC paths: %s", win)
+	}
+	// The old drive-stripping form (which collided C:\ and D:\) must be gone.
+	if strings.Contains(win, `-replace '^[A-Za-z]:[\\/]+','' -replace '^[\\/]+',''`) {
+		t.Fatalf("windows staging still strips drive letters (collision risk): %s", win)
+	}
+}
+
+// TestFindDepth verifies the search depth pinned for each glob equals the number
+// of path components below its non-wildcard root, so `find -path`'s wildcards stay
+// segment-aware without GNU-only -regex (evaluator items 3 & 4).
+func TestFindDepth(t *testing.T) {
+	cases := map[string]int{
+		"/var/log/app/*.log": 1,
+		"/var/*/app.log":     2,
+		"/*.log":             1,
+		"logs/*.log":         1,
+		"*.log":              1,
+		"a/b/c/*.trx":        1,
 	}
 	for in, want := range cases {
-		if got := globToRegex(in); got != want {
-			t.Errorf("globToRegex(%q) = %q, want %q", in, got, want)
+		if got := findDepth(in); got != want {
+			t.Errorf("findDepth(%q) = %d, want %d", in, got, want)
 		}
 	}
 }

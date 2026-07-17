@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -213,8 +214,9 @@ func buildZipScript(os spec.OSKind, globs []string, archive string) transport.Cm
 	if os == spec.OSWindows {
 		// Each glob is single-quoted (psq) and fed to Get-ChildItem as DATA, never
 		// evaluated as code. Matches are staged into a temp dir that PRESERVES each
-		// file's relative path (drive + leading separators stripped) so basenames
-		// from different directories don't collide, then Compress-Archive'd.
+		// file's relative path INCLUDING a drive identifier (C:\a.log -> C\a.log,
+		// \\srv\share\a.log -> UNC\srv\share\a.log) so identically named files on
+		// different drives/shares don't collide, then Compress-Archive'd.
 		items := make([]string, len(globs))
 		for i, g := range globs {
 			items[i] = psq(g)
@@ -226,7 +228,9 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 $paths = @(%s) | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty FullName -Unique
 if(-not $paths){ Remove-Item -Recurse -Force $stage; Write-Output 'NOFILES'; exit 0 }
 foreach($p in $paths){
-  $rel = $p -replace '^[A-Za-z]:[\\/]+','' -replace '^[\\/]+',''
+  if($p -match '^([A-Za-z]):[\\/]+'){ $rel = $Matches[1] + '\' + ($p -replace '^[A-Za-z]:[\\/]+','') }
+  elseif($p -match '^[\\/]{2}'){ $rel = 'UNC\' + ($p -replace '^[\\/]{2}','') }
+  else { $rel = $p -replace '^[\\/]+','' }
   $target = Join-Path $stage $rel
   New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
   Copy-Item -LiteralPath $p -Destination $target -Force
@@ -236,84 +240,73 @@ Remove-Item -Recurse -Force $stage
 Write-Output 'ZIPPED'
 exit 0`, strings.Join(items, ","), psq(archive))}
 	}
-	// Injection-safe Linux staging with SEGMENT-AWARE glob semantics. Each glob is
-	// translated (in Go) to a POSIX-extended regex where `*`/`?` DO NOT cross `/`
-	// (unlike `find -path`, whose `*` spans separators), then passed as DATA to a
-	// `stage` function whose args are BOTH single-quoted (shq); `find -regex` — not
-	// the shell — matches, so command substitutions inside a manifest glob are
-	// inert. Files are copied into a temp dir preserving their relative path.
+	// Injection-safe Linux staging with SEGMENT-AWARE glob semantics using ONLY
+	// portable `find` options (GNU, BSD and BusyBox all accept
+	// -maxdepth/-mindepth/-path/-type). For each glob we pin the search DEPTH to
+	// the exact number of path components below its non-wildcard root, so `-path`'s
+	// `*` cannot span a `/` (a match always has precisely that many components).
+	// The glob is passed as DATA (single-quoted, shq) to a `stage` function; find —
+	// not the shell — matches, so command substitutions inside a manifest glob are
+	// inert. find's exit status is checked and surfaced (FINDERR/exit 3) rather than
+	// silently degrading to NOFILES on an unsupported/failed scan.
 	var b strings.Builder
 	b.WriteString(`set +e
 tmp=$(mktemp -d) || exit 1
+stagedir=$tmp/stage
+mkdir -p "$stagedir"
 n=0
+ferr=0
 stage(){
-  find "$1" -regextype posix-extended -type f -regex "$2" 2>/dev/null | while IFS= read -r f; do
+  find "$1" -maxdepth "$2" -mindepth "$2" -type f -path "$3" > "$tmp/list" 2> "$tmp/err"
+  if [ $? -ne 0 ]; then ferr=1; cat "$tmp/err" >&2; return; fi
+  while IFS= read -r f; do
     rel=${f#/}
     rel=${rel#./}
-    d=$tmp/$(dirname "$rel")
+    d=$stagedir/$(dirname "$rel")
     mkdir -p "$d"
-    cp "$f" "$d"/ 2>/dev/null && echo x
-  done | wc -l
+    cp "$f" "$d"/ 2>/dev/null && n=$((n+1))
+  done < "$tmp/list"
 }
 `)
 	for _, g := range globs {
 		root := globRoot(g)
-		re := globToRegex(g)
+		depth := findDepth(g)
+		patt := g
 		if !strings.HasPrefix(g, "/") {
-			// find prints relative results as ./<path>; anchor the regex to match.
-			re = `\./` + re
+			// find prints relative results as ./<path>; match that form.
+			patt = "./" + g
 		}
-		b.WriteString(fmt.Sprintf("c=$(stage %s %s); n=$((n+c))\n", shq(root), shq(re)))
+		b.WriteString(fmt.Sprintf("stage %s %s %s\n", shq(root), shq(strconv.Itoa(depth)), shq(patt)))
 	}
-	b.WriteString(fmt.Sprintf(`if [ "$n" = "0" ]; then rm -rf "$tmp"; echo NOFILES; exit 0; fi
-tar czf %s -C "$tmp" .
+	b.WriteString(fmt.Sprintf(`if [ "$ferr" -ne 0 ]; then rm -rf "$tmp"; echo FINDERR; exit 3; fi
+if [ "$n" = "0" ]; then rm -rf "$tmp"; echo NOFILES; exit 0; fi
+tar czf %s -C "$stagedir" .
 rm -rf "$tmp"
 echo ZIPPED`, shq(archive)))
 	return transport.Cmd{Shell: transport.ShellSh, TimeoutSec: 300, Script: b.String()}
 }
 
-// globToRegex converts a POSIX shell glob into a POSIX-extended regex that
-// matches a FULL path SEGMENT-AWARELY: `*` and `?` never cross `/`. All other
-// regex metacharacters from the literal portions are escaped so the pattern
-// cannot inject regex (or, being single-quoted downstream, shell) syntax.
-func globToRegex(pattern string) string {
-	var b strings.Builder
-	for i := 0; i < len(pattern); i++ {
-		c := pattern[i]
-		switch c {
-		case '*':
-			b.WriteString("[^/]*")
-		case '?':
-			b.WriteString("[^/]")
-		case '[':
-			j := i + 1
-			if j < len(pattern) && (pattern[j] == '!' || pattern[j] == '^') {
-				j++
-			}
-			if j < len(pattern) && pattern[j] == ']' {
-				j++
-			}
-			for j < len(pattern) && pattern[j] != ']' {
-				j++
-			}
-			if j >= len(pattern) {
-				b.WriteString(`\[`) // no closing ] — treat literally
-			} else {
-				seg := pattern[i : j+1]
-				if strings.HasPrefix(seg, "[!") {
-					seg = "[^" + seg[2:]
-				}
-				b.WriteString(seg)
-				i = j
-			}
-		case '.', '+', '(', ')', '{', '}', '^', '$', '|', '\\':
-			b.WriteByte('\\')
-			b.WriteByte(c)
-		default:
-			b.WriteByte(c)
-		}
+// findDepth returns the number of path components below a glob's non-wildcard
+// root (globRoot). Pinning find's -maxdepth == -mindepth to this value keeps
+// `-path`'s wildcards segment-aware without relying on GNU-only -regex.
+func findDepth(g string) int {
+	trimmed := strings.TrimPrefix(g, "/")
+	gSegs := len(strings.Split(trimmed, "/"))
+	root := globRoot(g)
+	rootTrim := strings.TrimPrefix(root, "/")
+	rootTrim = strings.TrimPrefix(rootTrim, "./")
+	if rootTrim == "." {
+		rootTrim = ""
 	}
-	return b.String()
+	rootN := 0
+	if rootTrim != "" {
+		rootN = len(strings.Split(rootTrim, "/"))
+	}
+	d := gSegs - rootN
+	if d < 1 {
+		d = 1
+	}
+	return d
 }
 
 // globRoot returns the deepest non-wildcard directory prefix of a POSIX glob so

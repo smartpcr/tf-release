@@ -4,7 +4,9 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 $paths = @('C:\app\logs\*.log','C:\app\_results\*.trx') | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty FullName -Unique
 if(-not $paths){ Remove-Item -Recurse -Force $stage; Write-Output 'NOFILES'; exit 0 }
 foreach($p in $paths){
-  $rel = $p -replace '^[A-Za-z]:[\\/]+','' -replace '^[\\/]+',''
+  if($p -match '^([A-Za-z]):[\\/]+'){ $rel = $Matches[1] + '\' + ($p -replace '^[A-Za-z]:[\\/]+','') }
+  elseif($p -match '^[\\/]{2}'){ $rel = 'UNC\' + ($p -replace '^[\\/]{2}','') }
+  else { $rel = $p -replace '^[\\/]+','' }
   $target = Join-Path $stage $rel
   New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
   Copy-Item -LiteralPath $p -Destination $target -Force
