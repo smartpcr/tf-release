@@ -45,6 +45,50 @@ func (e *Engine) warnf(format string, a ...interface{}) {
 	e.Warnings = append(e.Warnings, fmt.Sprintf(format, a...))
 }
 
+// stepLogger emits the DESIGN §8.5/§15 structured step record. EVERY fixed step
+// (VALIDATE CONNECT PREFLIGHT LOCK FETCH CHECKSUM STAGE EXTRACT RENDER CONFIGURE
+// STOP SWITCH START HEALTH FINALIZE PRUNE UNLOCK, plus ROLLBACK/FORCE_KILL/
+// MOVE_GROUP) is logged through tflog carrying app/host/step/version and a
+// numeric duration_ms. A step is emitted whether it succeeded or failed — a
+// failed step is still an executed step — so the log is a faithful trace of the
+// state machine. Conditional steps (FETCH/CHECKSUM/EXTRACT when a release is
+// cached) are simply never entered, so they never appear.
+type stepLogger struct {
+	app     string
+	host    string
+	version string
+}
+
+func newStepLogger(s *spec.Deployment, host string) stepLogger {
+	return stepLogger{app: s.Metadata.Name, host: strings.ToLower(host), version: s.Artifact.Version}
+}
+
+// forHost returns a copy of the logger bound to a different host (cluster nodes
+// share the same app/version but log per-node).
+func (sl stepLogger) forHost(host string) stepLogger {
+	sl.host = strings.ToLower(host)
+	return sl
+}
+
+// emit writes one structured step record measuring elapsed time from start.
+func (sl stepLogger) emit(ctx context.Context, step string, start time.Time) {
+	tflog.Info(ctx, "deploy step", map[string]interface{}{
+		"app":         sl.app,
+		"host":        sl.host,
+		"step":        step,
+		"version":     sl.version,
+		"duration_ms": time.Since(start).Milliseconds(),
+	})
+}
+
+// timed runs fn and emits the step record afterward regardless of outcome.
+func (sl stepLogger) timed(ctx context.Context, step string, fn func() error) error {
+	start := time.Now()
+	err := fn()
+	sl.emit(ctx, step, start)
+	return err
+}
+
 // Deploy is the entry point for Create and Update (DESIGN §10.1/§10.2).
 func (e *Engine) Deploy(ctx context.Context, s *spec.Deployment) (*Status, error) {
 	if s.Pattern.Type == spec.PatternClusterGeneric {
@@ -55,27 +99,36 @@ func (e *Engine) Deploy(ctx context.Context, s *spec.Deployment) (*Status, error
 
 func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status, error) {
 	host := strings.ToLower(s.Target.Hosts[0])
+	sl := newStepLogger(s, host)
+	vstart := time.Now()
 	t, err := e.NewTransport(&s.Target, host)
 	if err != nil {
+		sl.emit(ctx, "VALIDATE", vstart)
 		return nil, coded("ERR_SPEC_INVALID", host, "VALIDATE", err)
 	}
+	pat, verr := pattern.For(s.Pattern.Type)
+	sl.emit(ctx, "VALIDATE", vstart)
+	if verr != nil {
+		return nil, coded("ERR_UNSUPPORTED", host, "VALIDATE", verr)
+	}
+	cstart := time.Now()
 	if err := t.Connect(ctx); err != nil {
+		sl.emit(ctx, "CONNECT", cstart)
 		return nil, wrapTransportErr(err, host, "CONNECT")
 	}
+	sl.emit(ctx, "CONNECT", cstart)
 	defer t.Close()
 
 	p := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, s.Artifact.Version)
-	pat, err := pattern.For(s.Pattern.Type)
-	if err != nil {
-		return nil, coded("ERR_UNSUPPORTED", host, "VALIDATE", err)
-	}
 	rc := releaseCtx(s, p)
 
-	if err := e.preflight(ctx, t, s, p, pat, rc); err != nil {
+	if err := sl.timed(ctx, "PREFLIGHT", func() error { return e.preflight(ctx, t, s, p, pat, rc) }); err != nil {
 		return nil, err
 	}
 
+	lstart := time.Now()
 	lk, warn, err := AcquireLock(ctx, t, p, lockOwner(), "deploy", s.Strategy.EffectiveLockTimeout())
+	sl.emit(ctx, "LOCK", lstart)
 	if err != nil {
 		return nil, err
 	}
@@ -85,9 +138,11 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	defer func() {
 		rctx, cancel := lockCleanupContext(ctx)
 		defer cancel()
+		ustart := time.Now()
 		if rerr := ReleaseLock(rctx, lk); rerr != nil {
 			e.warnf("lock release failed on %s: %v", host, rerr)
 		}
+		sl.emit(ctx, "UNLOCK", ustart)
 	}()
 
 	m, err := ReadManifest(ctx, t, p)
@@ -121,17 +176,19 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	defer e.collectDeploymentLogs(ctx, t, s, p, started)
 
 	// STAGE / FETCH / CHECKSUM / EXTRACT / RENDER — no live mutation yet.
-	if err := e.stageOnHost(ctx, t, s, p, pat, rc); err != nil {
+	if err := e.stageOnHost(ctx, sl, t, s, p, pat, rc); err != nil {
 		return nil, err
 	}
 
 	// SWITCHOVER — from here on, failures trigger rollback (DESIGN §10.3).
-	switchErr := e.switchOn(ctx, t, s, p, pat, rc)
+	switchErr := e.switchOn(ctx, sl, t, s, p, pat, rc)
 	if switchErr == nil {
-		switchErr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Current, rc.Env)
+		switchErr = sl.timed(ctx, "HEALTH", func() error {
+			return RunHealthCheck(ctx, t, &s.HealthCheck, p.Current, rc.Env)
+		})
 	}
 	if switchErr != nil {
-		return nil, e.rollbackSingle(ctx, t, s, p, pat, prev, started, switchErr)
+		return nil, e.rollbackSingle(ctx, sl, t, s, p, pat, prev, started, switchErr)
 	}
 
 	// FINALIZE + PRUNE (DESIGN §10.1 steps 12–13).
@@ -143,10 +200,11 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 		LastOperation: LastOp{Type: "deploy", Result: "success",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
-	if err := WriteManifest(ctx, t, p, nm); err != nil {
-		return nil, coded("ERR_CONNECT", host, "FINALIZE", err)
+	ferr := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, p, nm) })
+	if ferr != nil {
+		return nil, coded("ERR_CONNECT", host, "FINALIZE", ferr)
 	}
-	if err := e.pruneReleases(ctx, t, s, p, nm); err != nil {
+	if err := sl.timed(ctx, "PRUNE", func() error { return e.pruneReleases(ctx, t, s, p, nm) }); err != nil {
 		e.warnf("prune failed on %s: %v", host, err) // never fails the apply
 	}
 	st, _ := pat.Status(ctx, t, rc)
@@ -155,13 +213,14 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 
 // rollbackSingle implements DESIGN §10.3 for one host. Returns the ORIGINAL
 // error (annotated) on successful rollback; ERR_ROLLBACK_FAILED otherwise.
-func (e *Engine) rollbackSingle(ctx context.Context, t transport.Transport, s *spec.Deployment,
+func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, pat pattern.Pattern, prev string, started time.Time, orig error) error {
 	host := t.Host()
 	if !s.Strategy.EffectiveRollback() {
 		e.finalizeFailed(ctx, t, s, p, prev, started, "failed")
 		return fmt.Errorf("%w; rollback_on_failure=false — target left as-is for inspection", orig)
 	}
+	rbStart := time.Now()
 	if prev == "" {
 		// Fresh install failure ⇒ clean the machine (DESIGN §10.3 row 1).
 		rcNew := releaseCtx(s, p)
@@ -169,6 +228,7 @@ func (e *Engine) rollbackSingle(ctx context.Context, t transport.Transport, s *s
 		_ = pat.Uninstall(ctx, t, rcNew, false)
 		_ = e.removeJunction(ctx, t, p)
 		_ = e.removePath(ctx, t, p.Manifest)
+		sl.emit(ctx, "ROLLBACK", rbStart)
 		return fmt.Errorf("%w; fresh install failed — target cleaned (no service, no junction, no manifest)", orig)
 	}
 	tflog.Warn(ctx, "deploy failed; rolling back", map[string]interface{}{
@@ -177,24 +237,28 @@ func (e *Engine) rollbackSingle(ctx context.Context, t transport.Transport, s *s
 	pp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, prev)
 	rcPrev := releaseCtx(s, pp)
 	rb := func() error {
-		if err := pat.Stop(ctx, t, rcPrev); err != nil {
+		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rcPrev) }); err != nil {
 			return err
 		}
-		if err := e.switchJunction(ctx, t, pp); err != nil {
+		if err := sl.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, t, pp) }); err != nil {
 			return err
 		}
-		if err := pat.Configure(ctx, t, rcPrev); err != nil {
+		if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rcPrev) }); err != nil {
 			return err
 		}
-		if err := pat.Start(ctx, t, rcPrev); err != nil {
+		if err := sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rcPrev) }); err != nil {
 			return err
 		}
-		return RunHealthCheck(ctx, t, &s.HealthCheck, pp.Current, rcPrev.Env)
+		return sl.timed(ctx, "HEALTH", func() error {
+			return RunHealthCheck(ctx, t, &s.HealthCheck, pp.Current, rcPrev.Env)
+		})
 	}
-	if rerr := rb(); rerr != nil {
+	rerr := rb()
+	sl.emit(ctx, "ROLLBACK", rbStart)
+	if rerr != nil {
 		e.finalizeFailed(ctx, t, s, pp, prev, started, "failed")
 		return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-			fmt.Errorf("MACHINE IN UNKNOWN STATE — manual intervention required; deploy error: %v; rollback error: %v", orig, rerr))
+			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; rollback error: %v", host, orig, rerr))
 	}
 	m := &Manifest{
 		Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
@@ -256,11 +320,11 @@ func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spe
 		}
 		if rerr := dc.RunNew(ctx, t, rc, oldImage); rerr != nil {
 			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-				fmt.Errorf("MACHINE IN UNKNOWN STATE; deploy: %v; rollback: %v", runErr, rerr))
+				fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s; deploy: %v; rollback: %v", host, runErr, rerr))
 		}
 		if herr := RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rc.Env); herr != nil {
 			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-				fmt.Errorf("MACHINE IN UNKNOWN STATE; deploy: %v; rollback health: %v", runErr, herr))
+				fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s; deploy: %v; rollback health: %v", host, runErr, herr))
 		}
 		return nil, fmt.Errorf("%w; rolled back to previous image %s", runErr, short(oldImage))
 	}
@@ -396,17 +460,25 @@ avail=$(df -Pm "$(dirname %s)" | awk 'NR==2{print $4}')
 
 // stageOnHost = FETCH+CHECKSUM+EXTRACT+deps+RENDER into the immutable release
 // dir. Cached releases (marker sha match) skip fetch/extract (DESIGN §10.5).
-func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec.Deployment,
+// Every fixed step is logged through sl in execution order; conditional steps
+// (FETCH/CHECKSUM/EXTRACT) are simply not entered when the release is cached, so
+// they never appear in the log (DESIGN §10.5 / test "conditional steps").
+func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, pat pattern.Pattern, rc pattern.ReleaseCtx) (err error) {
 	host := t.Host()
+	sl = sl.forHost(host)
+	stageStart := time.Now()
 	if err := ensureLayout(ctx, t, p); err != nil {
+		sl.emit(ctx, "STAGE", stageStart)
 		return coded("ERR_CONNECT", host, "STAGE", err)
 	}
 	// STAGING WIPE (start): staging/ is scratch, wiped whole at the start of
 	// EVERY op — cached or not (DESIGN §9.1 "wiped at start & end of every op").
 	if err := e.wipeStaging(ctx, t, p); err != nil {
+		sl.emit(ctx, "STAGE", stageStart)
 		return coded("ERR_CONNECT", host, "STAGE", err)
 	}
+	sl.emit(ctx, "STAGE", stageStart)
 	// STAGING WIPE (end): declared FIRST so it runs LAST (LIFO) — after the
 	// incomplete-release cleanup below has settled `err`. A cleanup failure is
 	// surfaced as the op error when the op otherwise succeeded (never leave a
@@ -439,13 +511,19 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 		return coded("ERR_CONNECT", host, "STAGE", cerr)
 	}
 	if !cached {
-		if ferr := e.fetchToStaging(ctx, t, s, p); ferr != nil {
+		fetchStart := time.Now()
+		ferr := e.fetchToStaging(ctx, t, s, p)
+		sl.emit(ctx, "FETCH", fetchStart)
+		if ferr != nil {
 			return ferr // fetch writes only to staging; release tree untouched
 		}
+		// FETCH already verified the artifact checksum (target-pull remote
+		// verify / runner-push local verify); record CHECKSUM as its own step.
+		sl.emit(ctx, "CHECKSUM", time.Now())
 		// extract creates the release dir — from here the release is "ours" and
 		// every failure below trips the incomplete-release cleanup defer.
 		createdRelease = true
-		if xerr := e.extract(ctx, t, p); xerr != nil {
+		if xerr := sl.timed(ctx, "EXTRACT", func() error { return e.extract(ctx, t, p) }); xerr != nil {
 			return xerr
 		}
 		if n, ok := pat.(*pattern.NodeWebApp); ok {
@@ -462,6 +540,7 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 	}
 	// RENDER: files land in the release dir every apply (DESIGN §6.4). A failure
 	// here on a freshly-created release trips the incomplete-release cleanup.
+	renderStart := time.Now()
 	for _, f := range s.Files {
 		var dest string
 		if t.OS() == spec.OSWindows {
@@ -470,9 +549,11 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 			dest = p.Release + "/" + strings.TrimLeft(f.Path, "/")
 		}
 		if werr := writeSmallFile(ctx, t, dest, f.Content); werr != nil {
+			sl.emit(ctx, "RENDER", renderStart)
 			return coded("ERR_EXTRACT", host, "RENDER", werr)
 		}
 	}
+	sl.emit(ctx, "RENDER", renderStart)
 	// post_install hook runs in release dir after extract, before switchover;
 	// non-zero exit ⇒ ERR_SERVICE_INSTALL (DESIGN §6.4).
 	if hook := s.Pattern.PostInstall; hook != "" {
@@ -509,18 +590,19 @@ func (e *Engine) cleanupIncompleteRelease(ctx context.Context, t transport.Trans
 }
 
 // switchOn = STOP + SWITCH + CONFIGURE + START for one host (DESIGN §10.1 7–10).
-func (e *Engine) switchOn(ctx context.Context, t transport.Transport, s *spec.Deployment,
+func (e *Engine) switchOn(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, pat pattern.Pattern, rc pattern.ReleaseCtx) error {
-	if err := pat.Stop(ctx, t, rc); err != nil {
+	sl = sl.forHost(t.Host())
+	if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
 		return err
 	}
-	if err := e.switchJunction(ctx, t, p); err != nil {
+	if err := sl.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, t, p) }); err != nil {
 		return err
 	}
-	if err := pat.Configure(ctx, t, rc); err != nil {
+	if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
 		return err
 	}
-	return pat.Start(ctx, t, rc)
+	return sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rc) })
 }
 
 func (e *Engine) fetchToStaging(ctx context.Context, t transport.Transport, s *spec.Deployment, p layout.Paths) error {

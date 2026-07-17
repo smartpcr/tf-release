@@ -37,10 +37,12 @@ func (e *Engine) newClusterCtx(ctx context.Context, s *spec.Deployment) (*cluste
 			cc.closeAll()
 			return nil, err
 		}
+		cstart := time.Now()
 		if err := t.Connect(ctx); err != nil {
 			cc.closeAll()
 			return nil, wrapTransportErr(err, h, "CONNECT")
 		}
+		newStepLogger(s, h).emit(ctx, "CONNECT", cstart)
 		cc.tr[h] = t
 	}
 	return cc, nil
@@ -61,7 +63,9 @@ func (cc *clusterCtx) closeAll() {
 func (e *Engine) lockAll(ctx context.Context, cc *clusterCtx, op string) error {
 	for _, h := range cc.hosts {
 		p := cc.paths(h, cc.s.Artifact.Version)
+		lstart := time.Now()
 		lk, warn, err := AcquireLock(ctx, cc.tr[h], p, lockOwner(), op, cc.s.Strategy.EffectiveLockTimeout())
+		newStepLogger(cc.s, h).emit(ctx, "LOCK", lstart)
 		if err != nil {
 			e.unlockAll(ctx, cc)
 			return err
@@ -82,8 +86,12 @@ func (e *Engine) unlockAll(ctx context.Context, cc *clusterCtx) {
 	// release must not consume a shared deadline for the remaining nodes.
 	for i := len(cc.locked) - 1; i >= 0; i-- {
 		rctx, cancel := lockCleanupContext(ctx)
+		ustart := time.Now()
 		if rerr := ReleaseLock(rctx, cc.locked[i]); rerr != nil {
 			e.warnf("lock release failed: %v", rerr)
+		}
+		if cc.s != nil && i < len(cc.hosts) {
+			newStepLogger(cc.s, cc.hosts[i]).emit(ctx, "UNLOCK", ustart)
 		}
 		cancel()
 	}
@@ -116,7 +124,9 @@ func (e *Engine) deployCluster(ctx context.Context, s *spec.Deployment) (*Status
 				fmt.Errorf("node not Up in cluster (up=%v)", up)) // CLU-05
 		}
 		p := cc.paths(h, s.Artifact.Version)
-		if err := e.preflight(ctx, cc.tr[h], s, p, cc.cg, releaseCtx(s, p)); err != nil {
+		if err := newStepLogger(s, h).timed(ctx, "PREFLIGHT", func() error {
+			return e.preflight(ctx, cc.tr[h], s, p, cc.cg, releaseCtx(s, p))
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -181,13 +191,14 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 	for _, h := range cc.hosts {
 		p := cc.paths(h, s.Artifact.Version)
 		rc := releaseCtx(s, p)
-		if err := e.stageOnHost(ctx, cc.tr[h], s, p, cc.cg, rc); err != nil {
+		sl := newStepLogger(s, h)
+		if err := e.stageOnHost(ctx, sl, cc.tr[h], s, p, cc.cg, rc); err != nil {
 			return nil, err
 		}
-		if err := e.switchJunction(ctx, cc.tr[h], p); err != nil {
+		if err := sl.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[h], p) }); err != nil {
 			return nil, err
 		}
-		if err := cc.cg.Configure(ctx, cc.tr[h], rc); err != nil {
+		if err := sl.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[h], rc) }); err != nil {
 			return nil, err
 		}
 	}
@@ -250,7 +261,7 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 	// U2: stage new bits on every passive (no service impact).
 	for _, h := range passives {
 		p := cc.paths(h, s.Artifact.Version)
-		if err := e.stageOnHost(ctx, cc.tr[h], s, p, cc.cg, releaseCtx(s, p)); err != nil {
+		if err := e.stageOnHost(ctx, newStepLogger(s, h), cc.tr[h], s, p, cc.cg, releaseCtx(s, p)); err != nil {
 			return nil, err
 		}
 	}
@@ -258,37 +269,42 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 	for _, h := range passives {
 		p := cc.paths(h, s.Artifact.Version)
 		rc := releaseCtx(s, p)
-		if err := e.switchJunction(ctx, cc.tr[h], p); err != nil {
+		sl := newStepLogger(s, h)
+		if err := sl.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[h], p) }); err != nil {
 			return nil, err // pre-move failure: role untouched on old owner (CLU-04-safe)
 		}
-		if err := cc.cg.Configure(ctx, cc.tr[h], rc); err != nil {
+		if err := sl.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[h], rc) }); err != nil {
 			return nil, err
 		}
 	}
 	// U4: move role onto first updated passive.
 	firstNew := passives[0]
-	if err := cc.cg.MoveGroup(ctx, cc.coord(), s.Pattern.RoleName, firstNew, drain); err != nil {
+	slFirst := newStepLogger(s, firstNew)
+	if err := slFirst.timed(ctx, "MOVE_GROUP", func() error {
+		return cc.cg.MoveGroup(ctx, cc.coord(), s.Pattern.RoleName, firstNew, drain)
+	}); err != nil {
 		return nil, e.clusterRollback(ctx, cc, owner, passives, prevVersion, started, err)
 	}
 	// U5: settle + health on new owner.
 	time.Sleep(time.Duration(settle) * time.Second)
-	if err := e.clusterHealthOn(ctx, cc, firstNew); err != nil {
+	if err := slFirst.timed(ctx, "HEALTH", func() error { return e.clusterHealthOn(ctx, cc, firstNew) }); err != nil {
 		return nil, e.clusterRollback(ctx, cc, owner, passives, prevVersion, started, err)
 	}
 	// U6: update the old owner (role now elsewhere).
 	{
 		p := cc.paths(owner, s.Artifact.Version)
 		rc := releaseCtx(s, p)
-		if err := e.stageOnHost(ctx, cc.tr[owner], s, p, cc.cg, rc); err != nil {
+		slO := newStepLogger(s, owner)
+		if err := e.stageOnHost(ctx, slO, cc.tr[owner], s, p, cc.cg, rc); err != nil {
 			return nil, e.clusterRollback(ctx, cc, owner, passives, prevVersion, started, err)
 		}
-		if err := cc.cg.Stop(ctx, cc.tr[owner], rc); err != nil { // local instance only
+		if err := slO.timed(ctx, "STOP", func() error { return cc.cg.Stop(ctx, cc.tr[owner], rc) }); err != nil { // local instance only
 			return nil, e.clusterRollback(ctx, cc, owner, passives, prevVersion, started, err)
 		}
-		if err := e.switchJunction(ctx, cc.tr[owner], p); err != nil {
+		if err := slO.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[owner], p) }); err != nil {
 			return nil, e.clusterRollback(ctx, cc, owner, passives, prevVersion, started, err)
 		}
-		if err := cc.cg.Configure(ctx, cc.tr[owner], rc); err != nil {
+		if err := slO.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[owner], rc) }); err != nil {
 			return nil, e.clusterRollback(ctx, cc, owner, passives, prevVersion, started, err)
 		}
 	}
@@ -334,31 +350,43 @@ func (e *Engine) clusterRollback(ctx context.Context, cc *clusterCtx, oldOwner s
 	tflog.Warn(ctx, "cluster deploy failed; rolling back", map[string]interface{}{
 		"role": s.Pattern.RoleName, "to": prevVersion, "cause": orig.Error()})
 	drain := s.Strategy.Cluster.EffectiveDrain()
+	// Rollback step records carry the version being RESTORED (prevVersion).
+	slFor := func(host string) stepLogger {
+		return stepLogger{app: s.Metadata.Name, host: strings.ToLower(host), version: prevVersion}
+	}
+	rbStart := time.Now()
 
 	// R1: move role back to old owner (still on prev junction until U6 ran;
 	// if U6 already switched it, restore its junction FIRST).
 	pPrevOwner := cc.paths(oldOwner, prevVersion)
-	_ = e.switchJunction(ctx, cc.tr[oldOwner], pPrevOwner) // idempotent restore
-	_ = cc.cg.Configure(ctx, cc.tr[oldOwner], releaseCtx(s, pPrevOwner))
-	if err := cc.cg.MoveGroup(ctx, cc.coord(), s.Pattern.RoleName, oldOwner, drain); err != nil {
+	slOwner := slFor(oldOwner)
+	_ = slOwner.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[oldOwner], pPrevOwner) }) // idempotent restore
+	_ = slOwner.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[oldOwner], releaseCtx(s, pPrevOwner)) })
+	if err := slOwner.timed(ctx, "MOVE_GROUP", func() error {
+		return cc.cg.MoveGroup(ctx, cc.coord(), s.Pattern.RoleName, oldOwner, drain)
+	}); err != nil {
+		slOwner.emit(ctx, "ROLLBACK", rbStart)
 		return coded("ERR_ROLLBACK_FAILED", oldOwner, "ROLLBACK",
-			fmt.Errorf("MACHINE IN UNKNOWN STATE — role could not return to %s; deploy: %v; move-back: %v", oldOwner, orig, err))
+			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — role could not return to %s; deploy: %v; move-back: %v", oldOwner, oldOwner, orig, err))
 	}
 	// R2: health on old owner at prev version.
 	time.Sleep(time.Duration(s.Strategy.Cluster.EffectiveSettle()) * time.Second)
-	if err := e.clusterHealthOnVersion(ctx, cc, oldOwner, prevVersion); err != nil {
+	if err := slOwner.timed(ctx, "HEALTH", func() error { return e.clusterHealthOnVersion(ctx, cc, oldOwner, prevVersion) }); err != nil {
+		slOwner.emit(ctx, "ROLLBACK", rbStart)
 		return coded("ERR_ROLLBACK_FAILED", oldOwner, "ROLLBACK",
-			fmt.Errorf("MACHINE IN UNKNOWN STATE — old version unhealthy after move-back; deploy: %v; health: %v", orig, err))
+			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — old version unhealthy after move-back; deploy: %v; health: %v", oldOwner, orig, err))
 	}
 	// R3: restore passive junctions + registration to prev.
 	for _, h := range passives {
 		pp := cc.paths(h, prevVersion)
-		if err := e.switchJunction(ctx, cc.tr[h], pp); err != nil {
+		slp := slFor(h)
+		if err := slp.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[h], pp) }); err != nil {
 			e.warnf("rollback: junction restore failed on %s: %v", h, err)
 			continue
 		}
-		_ = cc.cg.Configure(ctx, cc.tr[h], releaseCtx(s, pp))
+		_ = slp.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[h], releaseCtx(s, pp)) })
 	}
+	slOwner.emit(ctx, "ROLLBACK", rbStart)
 	// R4: manifests reflect rolled_back state.
 	e.clusterFinalizeVersion(ctx, cc, prevVersion, "", started, "rolled_back")
 	// R5: surface original failure.
@@ -403,6 +431,7 @@ func (e *Engine) clusterFinalizeVersion(ctx context.Context, cc *clusterCtx, cur
 	s := cc.s
 	for _, h := range cc.hosts {
 		p := cc.paths(h, current)
+		sl := stepLogger{app: s.Metadata.Name, host: strings.ToLower(h), version: current}
 		m := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
 			CurrentVersion: current, PreviousVersion: prev,
 			CurrentRelease: p.Release, ArtifactChecksum: s.Artifact.Checksum,
@@ -415,12 +444,13 @@ func (e *Engine) clusterFinalizeVersion(ctx context.Context, cc *clusterCtx, cur
 			m.PreviousVersion = ""
 			m.ArtifactChecksum = "" // checksum of prev unknown here; Read tolerates empty
 		}
-		if err := WriteManifest(ctx, cc.tr[h], p, m); err != nil {
-			e.warnf("manifest write failed on %s: %v", h, err)
+		werr := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, cc.tr[h], p, m) })
+		if werr != nil {
+			e.warnf("manifest write failed on %s: %v", h, werr)
 			continue
 		}
 		if result == "success" {
-			if err := e.pruneReleases(ctx, cc.tr[h], s, p, m); err != nil {
+			if err := sl.timed(ctx, "PRUNE", func() error { return e.pruneReleases(ctx, cc.tr[h], s, p, m) }); err != nil {
 				e.warnf("prune failed on %s: %v", h, err)
 			}
 		}
