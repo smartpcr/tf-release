@@ -74,7 +74,9 @@ func (p Paths) Dirs() []string {
 	return []string{p.Releases, p.Shared, p.SharedLogs, p.Staging}
 }
 
-// psQuote single-quotes a string for PowerShell (doubling embedded quotes).
+// psQuote single-quotes a string for PowerShell, doubling any embedded single
+// quote so an UNVALIDATED install_root cannot break out of the quoted argument
+// when it reaches DirScript. See TestPsQuote for the canonical escaped forms.
 func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
 // DirScript renders the idempotent directory-creation script for the target OS
@@ -97,7 +99,10 @@ func DirScript(p Paths) string {
 	return "mkdir -p " + strings.Join(items, " ") + "\n"
 }
 
-// shQuote single-quotes a string for POSIX sh (closing/escaping embedded quotes).
+// shQuote single-quotes a string for POSIX sh, closing and re-escaping any
+// embedded single quote so an UNVALIDATED install_root cannot break out of the
+// quoted argument when it reaches DirScript. See TestShQuote for the canonical
+// escaped forms.
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // BuiltinEnv is merged UNDER spec environment (spec wins) — DESIGN §9.1.
