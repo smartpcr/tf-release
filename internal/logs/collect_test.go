@@ -98,3 +98,34 @@ func TestSumResultsNoDoubleCount(t *testing.T) {
 		t.Fatalf("double-counted counters: %+v", c)
 	}
 }
+
+// TestSumResultsDirectoryAware guards evaluator item 5: a pattern with a
+// directory component (`expected/*.trx`) must NOT match a misplaced file in a
+// different directory (`other/a.trx`), even though basenames would match.
+func TestSumResultsDirectoryAware(t *testing.T) {
+	d := t.TempDir()
+	good := filepath.Join(d, "host-01", "expected")
+	bad := filepath.Join(d, "host-01", "other")
+	_ = os.MkdirAll(good, 0o755)
+	_ = os.MkdirAll(bad, 0o755)
+	write(t, good, "a.trx", trxFixture)
+	write(t, bad, "a.trx", trxFixture) // stale/misplaced — must be ignored
+	c, files, err := SumResults("trx", d, []string{"expected/*.trx"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("want only the expected/ file, got %d: %v", len(files), files)
+	}
+	if c.Total != 10 {
+		t.Fatalf("misplaced file counted: %+v", c)
+	}
+	// A bare basename pattern still matches anywhere (both files).
+	_, files2, err := SumResults("trx", d, []string{"*.trx"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files2) != 2 {
+		t.Fatalf("bare basename should match both, got %d", len(files2))
+	}
+}

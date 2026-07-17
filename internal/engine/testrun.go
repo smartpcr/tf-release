@@ -126,7 +126,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 	}
 
 	// COLLECT (always) — results dirs + configured logs + event logs.
-	dest := tr.Collect.EffectiveDestinationDir()
+	dest := tr.Collect.EffectiveDestinationDir(tr.Metadata.Name)
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir results dir %s: %w", dest, err)
 	}
@@ -146,8 +146,15 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 	collectWarns = append(collectWarns, warns...)
 	localResults := filepath.Join(dest, "results")
 	// 2. Extra log globs — CollectFiles extracts them into results_dir/logs/<host>/.
+	// Relative globs resolve under the named deployment's shared dir when
+	// `collect.app_shared_of` is set (DESIGN §7:373); absolute globs pass through.
 	if len(tr.Collect.Logs) > 0 {
-		_, w := logs.CollectFiles(ctx, t, tr.Collect.Logs, filepath.Join(dest, "logs"))
+		logGlobs := tr.Collect.Logs
+		if tr.Collect.AppSharedOf != "" {
+			sp := layout.NewPaths(t.OS(), tr.EffectiveWorkRoot(t.OS()), tr.Collect.AppSharedOf, "")
+			logGlobs = resolveTargetGlobs(t.OS(), sp.Shared, tr.Collect.Logs)
+		}
+		_, w := logs.CollectFiles(ctx, t, logGlobs, filepath.Join(dest, "logs"))
 		collectWarns = append(collectWarns, w...)
 	}
 	// 3. Windows event logs since test start.

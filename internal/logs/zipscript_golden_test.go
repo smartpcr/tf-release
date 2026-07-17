@@ -55,24 +55,35 @@ func TestZipScriptGolden(t *testing.T) {
 }
 
 // TestZipScriptQuoting proves the collection script cannot be hijacked by a
-// malicious manifest glob: on Linux the pattern is passed as DATA to `find
-// -path` (single-quoted), never expanded by the shell, so command substitutions
-// are inert; the archive path is shell/PS quoted; on Windows the glob is
+// malicious manifest glob: on Linux the pattern is translated to a POSIX-extended
+// regex and passed as DATA to `find -regex` (single-quoted), never expanded by
+// the shell, so command substitutions are inert; segment-aware `*` becomes
+// `[^/]*`; the archive path is shell/PS quoted; on Windows the glob is
 // PowerShell single-quoted.
 func TestZipScriptQuoting(t *testing.T) {
 	evil := "/var/log/$(touch /tmp/pwned)/*.log"
 	lin := buildZipScript(spec.OSLinux, []string{evil}, "/tmp/x'y.tar.gz").Script
-	// find (not the shell) interprets the wildcards; both args are single-quoted.
-	if !strings.Contains(lin, `find "$1" -type f -path "$2"`) {
-		t.Fatalf("linux should match via find -path, not shell glob: %s", lin)
+	// find (not the shell) matches via a POSIX-extended regex.
+	if !strings.Contains(lin, `find "$1" -regextype posix-extended -type f -regex "$2"`) {
+		t.Fatalf("linux should match via find -regex, not shell glob: %s", lin)
 	}
-	// The dangerous pattern must appear ONLY inside single quotes (as data).
-	if !strings.Contains(lin, `'/var/log/$(touch /tmp/pwned)/*.log'`) {
-		t.Fatalf("evil glob not passed as single-quoted data: %s", lin)
+	// `*` must translate to a segment-aware regex atom (never cross '/').
+	if !strings.Contains(lin, `[^/]*`) {
+		t.Fatalf("glob '*' not translated to segment-aware regex: %s", lin)
 	}
-	// It must NOT appear as an unquoted command substitution the shell would run.
-	if strings.Contains(lin, "for f in "+evil) || strings.Contains(lin, "for f in /var/log/$(touch") {
-		t.Fatalf("evil glob left unquoted for shell expansion: %s", lin)
+	// The dangerous substitution chars must appear ONLY inside single quotes, with
+	// their regex metacharacters escaped — never as a live command substitution.
+	if !strings.Contains(lin, `'/var/log/\$\(touch /tmp/pwned\)/[^/]*\.log'`) {
+		t.Fatalf("evil glob not passed as escaped single-quoted regex: %s", lin)
+	}
+	// The original shell-glob form (wildcard intact, unescaped) must be absent —
+	// its presence would mean the shell, not find, expands the pattern.
+	if strings.Contains(lin, `$(touch /tmp/pwned)/*.log`) {
+		t.Fatalf("evil glob left in shell-expandable form: %s", lin)
+	}
+	// No shell glob-expansion loop over the pattern at all.
+	if strings.Contains(lin, "for f in ") {
+		t.Fatalf("collection must not shell-expand globs: %s", lin)
 	}
 	if !strings.Contains(lin, `tar czf '/tmp/x'\''y.tar.gz' -C "$tmp" .`) {
 		t.Fatalf("linux archive path not safely quoted: %s", lin)
@@ -80,5 +91,41 @@ func TestZipScriptQuoting(t *testing.T) {
 	win := buildZipScript(spec.OSWindows, []string{"C:\\a'b"}, "C:\\x.zip").Script
 	if !strings.Contains(win, `'C:\a''b'`) {
 		t.Fatalf("windows glob not safely quoted: %s", win)
+	}
+}
+
+// TestGlobToRegexSegmentAware verifies `*`/`?` never cross '/' (evaluator item 3)
+// and that regex metacharacters in literals are escaped.
+func TestGlobToRegexSegmentAware(t *testing.T) {
+	cases := map[string]string{
+		"/logs/*.log":    `/logs/[^/]*\.log`,
+		"logs/*.log":     `logs/[^/]*\.log`,
+		"a/?.trx":        `a/[^/]\.trx`,
+		"expected/*.trx": `expected/[^/]*\.trx`,
+		"a.b+c(d)":       `a\.b\+c\(d\)`,
+		"[!x]y":          `[^x]y`,
+	}
+	for in, want := range cases {
+		if got := globToRegex(in); got != want {
+			t.Errorf("globToRegex(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestGlobRootBounded verifies the find search root is the deepest non-wildcard
+// dir and is `./`-prefixed for relative globs so find output matches (item 4).
+func TestGlobRootBounded(t *testing.T) {
+	cases := map[string]string{
+		"/var/log/app/*.log": "/var/log/app",
+		"/var/*/app.log":     "/var",
+		"/*.log":             "/",
+		"logs/*.log":         "./logs",
+		"*.log":              ".",
+		"a/b/c/*.trx":        "./a/b/c",
+	}
+	for in, want := range cases {
+		if got := globRoot(in); got != want {
+			t.Errorf("globRoot(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

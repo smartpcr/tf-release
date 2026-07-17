@@ -236,18 +236,20 @@ Remove-Item -Recurse -Force $stage
 Write-Output 'ZIPPED'
 exit 0`, strings.Join(items, ","), psq(archive))}
 	}
-	// Injection-safe Linux staging. Each glob is passed as DATA to a `stage`
-	// function whose args are BOTH single-quoted (shq); `find -path` — not the
-	// shell — interprets the wildcards, so command substitutions/metacharacters
-	// inside a manifest glob are inert. Files are copied into a temp dir that
-	// PRESERVES their relative path (leading '/' stripped) before tar.
+	// Injection-safe Linux staging with SEGMENT-AWARE glob semantics. Each glob is
+	// translated (in Go) to a POSIX-extended regex where `*`/`?` DO NOT cross `/`
+	// (unlike `find -path`, whose `*` spans separators), then passed as DATA to a
+	// `stage` function whose args are BOTH single-quoted (shq); `find -regex` — not
+	// the shell — matches, so command substitutions inside a manifest glob are
+	// inert. Files are copied into a temp dir preserving their relative path.
 	var b strings.Builder
 	b.WriteString(`set +e
 tmp=$(mktemp -d) || exit 1
 n=0
 stage(){
-  find "$1" -type f -path "$2" 2>/dev/null | while IFS= read -r f; do
+  find "$1" -regextype posix-extended -type f -regex "$2" 2>/dev/null | while IFS= read -r f; do
     rel=${f#/}
+    rel=${rel#./}
     d=$tmp/$(dirname "$rel")
     mkdir -p "$d"
     cp "$f" "$d"/ 2>/dev/null && echo x
@@ -256,7 +258,12 @@ stage(){
 `)
 	for _, g := range globs {
 		root := globRoot(g)
-		b.WriteString(fmt.Sprintf("c=$(stage %s %s); n=$((n+c))\n", shq(root), shq(g)))
+		re := globToRegex(g)
+		if !strings.HasPrefix(g, "/") {
+			// find prints relative results as ./<path>; anchor the regex to match.
+			re = `\./` + re
+		}
+		b.WriteString(fmt.Sprintf("c=$(stage %s %s); n=$((n+c))\n", shq(root), shq(re)))
 	}
 	b.WriteString(fmt.Sprintf(`if [ "$n" = "0" ]; then rm -rf "$tmp"; echo NOFILES; exit 0; fi
 tar czf %s -C "$tmp" .
@@ -265,33 +272,72 @@ echo ZIPPED`, shq(archive)))
 	return transport.Cmd{Shell: transport.ShellSh, TimeoutSec: 300, Script: b.String()}
 }
 
-// globRoot returns the deepest non-wildcard directory prefix of a POSIX glob so
-// `find` can start from a bounded root instead of scanning the whole filesystem.
-func globRoot(pattern string) string {
-	if !strings.HasPrefix(pattern, "/") {
-		return "."
+// globToRegex converts a POSIX shell glob into a POSIX-extended regex that
+// matches a FULL path SEGMENT-AWARELY: `*` and `?` never cross `/`. All other
+// regex metacharacters from the literal portions are escaped so the pattern
+// cannot inject regex (or, being single-quoted downstream, shell) syntax.
+func globToRegex(pattern string) string {
+	var b strings.Builder
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch c {
+		case '*':
+			b.WriteString("[^/]*")
+		case '?':
+			b.WriteString("[^/]")
+		case '[':
+			j := i + 1
+			if j < len(pattern) && (pattern[j] == '!' || pattern[j] == '^') {
+				j++
+			}
+			if j < len(pattern) && pattern[j] == ']' {
+				j++
+			}
+			for j < len(pattern) && pattern[j] != ']' {
+				j++
+			}
+			if j >= len(pattern) {
+				b.WriteString(`\[`) // no closing ] — treat literally
+			} else {
+				seg := pattern[i : j+1]
+				if strings.HasPrefix(seg, "[!") {
+					seg = "[^" + seg[2:]
+				}
+				b.WriteString(seg)
+				i = j
+			}
+		case '.', '+', '(', ')', '{', '}', '^', '$', '|', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
 	}
-	segs := strings.Split(pattern, "/")
+	return b.String()
+}
+
+// globRoot returns the deepest non-wildcard directory prefix of a POSIX glob so
+// `find` starts from a bounded root instead of scanning the whole filesystem.
+// The returned root matches how find prints paths: absolute globs yield an
+// absolute root, relative globs yield a `./`-prefixed root.
+func globRoot(pattern string) string {
+	abs := strings.HasPrefix(pattern, "/")
+	segs := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
 	var kept []string
-	for _, s := range segs {
+	// Never include the final (filename) segment as a search-root component.
+	for _, s := range segs[:len(segs)-1] {
 		if strings.ContainsAny(s, "*?[") {
 			break
 		}
 		kept = append(kept, s)
 	}
-	root := strings.Join(kept, "/")
-	if root == "" {
-		return "/"
+	if abs {
+		return "/" + strings.Join(kept, "/")
 	}
-	// Drop the trailing element if it's a filename (i.e. the prefix ended mid-path
-	// with no wildcard yet); keep only the directory portion as the search root.
-	if len(kept) == len(segs) {
-		root = strings.Join(kept[:len(kept)-1], "/")
-		if root == "" {
-			return "/"
-		}
+	if len(kept) == 0 {
+		return "."
 	}
-	return root
+	return "./" + strings.Join(kept, "/")
 }
 
 // CollectEventLogs exports matching Windows events since `since` as JSON lines
@@ -404,15 +450,26 @@ func ParseJUnit(path string) (Counters, error) {
 }
 
 // SumResults walks baseDir recursively and merges counters from every file whose
-// BASENAME matches one of the result patterns' basenames. Both the patterns and
-// the matched paths are DEDUPLICATED so a file is never counted twice even when
-// overlapping/duplicate patterns are supplied (e.g. "*.trx" listed twice, or the
-// archive was extracted into nested directories).
+// PATH matches one of the result patterns DIRECTORY-AWARELY: a pattern's trailing
+// path segments (e.g. `expected/*.trx`) must align with the file's own trailing
+// segments, so a stale/misplaced `other/foo.trx` does NOT satisfy `expected/*.trx`
+// (unlike a bare basename match). Matched paths are DEDUPLICATED so a file is
+// never counted twice even with overlapping/duplicate patterns.
 func SumResults(format string, baseDir string, patterns []string) (Counters, []string, error) {
 	var total Counters
-	wantBase := make(map[string]struct{})
+	// Dedup patterns (as normalized slash strings) and split each into segments.
+	patSegs := make([][]string, 0, len(patterns))
+	seenPat := make(map[string]struct{})
 	for _, pat := range patterns {
-		wantBase[filepath.Base(pat)] = struct{}{}
+		norm := strings.Trim(filepath.ToSlash(pat), "/")
+		if norm == "" {
+			continue
+		}
+		if _, dup := seenPat[norm]; dup {
+			continue
+		}
+		seenPat[norm] = struct{}{}
+		patSegs = append(patSegs, strings.Split(norm, "/"))
 	}
 	seen := make(map[string]struct{})
 	var files []string
@@ -423,9 +480,13 @@ func SumResults(format string, baseDir string, patterns []string) (Counters, []s
 		if d.IsDir() {
 			return nil
 		}
-		base := filepath.Base(path)
-		for want := range wantBase {
-			ok, mErr := filepath.Match(want, base)
+		rel, rerr := filepath.Rel(baseDir, path)
+		if rerr != nil {
+			return nil
+		}
+		fileSegs := strings.Split(filepath.ToSlash(rel), "/")
+		for _, ps := range patSegs {
+			ok, mErr := matchSegmentsSuffix(ps, fileSegs)
 			if mErr != nil {
 				return mErr
 			}
@@ -463,6 +524,29 @@ func SumResults(format string, baseDir string, patterns []string) (Counters, []s
 		total.Skipped += c.Skipped
 	}
 	return total, files, nil
+}
+
+// matchSegmentsSuffix reports whether the pattern segments match the TRAILING
+// segments of the file's path, each segment matched independently (so `*` never
+// crosses a directory boundary). Requires the file to have at least as many
+// segments as the pattern. This enforces `expected/*.trx`-style directory-aware
+// matching while remaining agnostic to any absolute prefix embedded during
+// extraction.
+func matchSegmentsSuffix(patSegs, fileSegs []string) (bool, error) {
+	if len(patSegs) > len(fileSegs) {
+		return false, nil
+	}
+	off := len(fileSegs) - len(patSegs)
+	for i, ps := range patSegs {
+		ok, err := filepath.Match(ps, fileSegs[off+i])
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 var unsafeRe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
