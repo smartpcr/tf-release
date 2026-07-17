@@ -1,6 +1,12 @@
 // Package spec defines the Deployment / TestRun documents (DESIGN §6, §7).
 package spec
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
 type OSKind string
 
 const (
@@ -159,6 +165,228 @@ type Pattern struct {
 	Volumes       []string `json:"volumes,omitempty" yaml:"volumes,omitempty"`
 	RestartPolicy string   `json:"restart_policy,omitempty" yaml:"restart_policy,omitempty"`
 	RunArgs       []string `json:"run_args,omitempty" yaml:"run_args,omitempty"`
+
+	// Concrete discriminated-union members (DESIGN §6.4). They are populated by
+	// Pattern.UnmarshalJSON via type-directed decoding — the member named by Type
+	// is filled and every other member is left nil — and are excluded from JSON
+	// marshaling (json:"-") so the canonical spec hash is unaffected. The flat
+	// fields above remain the source consumed by validate.go and the pattern
+	// implementations; the concrete members give callers a type-safe,
+	// mutually-exclusive view of the union.
+	//
+	// INVARIANT: exactly ONE member is non-nil (the one named by Type) ONLY after
+	// ValidateDeployment / ParseDeployment succeeds. On the non-validating lenient
+	// path (ParseDeploymentLenient, used by the merge-then-validate flow in DESIGN
+	// §6.2) a Pattern whose Type is empty decodes with ALL members nil, because
+	// decodeUnion cannot select a variant; a non-empty but unknown Type is instead
+	// rejected at decode time. pattern.type is required (§6.4) and is NOT sourced
+	// from default_target, so ValidateDeployment is what enforces the discriminant.
+	// Lenient-path callers must therefore switch on the flat Type (which always
+	// says which member to expect) and/or validate before dereferencing a member.
+	ConsoleApp      *ConsoleAppPattern      `json:"-" yaml:"-"`
+	WindowsService  *WindowsServicePattern  `json:"-" yaml:"-"`
+	NodeWebApp      *NodeWebAppPattern      `json:"-" yaml:"-"`
+	DotnetAPI       *DotnetAPIPattern       `json:"-" yaml:"-"`
+	ClusterGeneric  *ClusterGenericPattern  `json:"-" yaml:"-"`
+	DockerContainer *DockerContainerPattern `json:"-" yaml:"-"`
+}
+
+// --- Concrete pattern union members (one struct per pattern.type) ------------
+// Each carries ONLY the fields legal for its pattern.type per DESIGN §6.4, so a
+// populated member is a self-describing, type-safe projection of the union.
+//
+// SCHEMA-PARITY CONTRACT: the flat Pattern above and the selected concrete member
+// are BOTH strict-decoded (DisallowUnknownFields), so a field legal for a variant
+// MUST appear in the flat struct AND that variant's concrete struct — otherwise a
+// valid spec silently fails to parse with "json: unknown field ...". types_drift_test.go
+// enforces this: TestPatternFlatConcreteSchemaParity asserts the flat field set
+// equals the union of the concrete field sets, and TestPatternConcreteSchemaRoundTrip
+// parses a spec exercising EVERY §6.4 field of each pattern.type. When adding a
+// §6.4 field, update the flat struct, the concrete struct, AND that test's
+// per-variant spec together.
+
+type ConsoleAppPattern struct {
+	Type          PatternType `json:"type"`
+	InstallRoot   string      `json:"install_root,omitempty"`
+	PostInstall   string      `json:"post_install,omitempty"`
+	Exe           string      `json:"exe"`
+	Args          []string    `json:"args,omitempty"`
+	VerifyCommand string      `json:"verify_command,omitempty"`
+}
+
+type WindowsServicePattern struct {
+	Type               PatternType    `json:"type"`
+	InstallRoot        string         `json:"install_root,omitempty"`
+	PostInstall        string         `json:"post_install,omitempty"`
+	ServiceName        string         `json:"service_name"`
+	DisplayName        string         `json:"display_name,omitempty"`
+	Description        string         `json:"description,omitempty"`
+	Exe                string         `json:"exe"`
+	Args               []string       `json:"args,omitempty"`
+	Wrapper            string         `json:"wrapper,omitempty"`
+	WinswExe           string         `json:"winsw_exe,omitempty"`
+	StartType          string         `json:"start_type,omitempty"`
+	Account            ServiceAccount `json:"account,omitempty"`
+	Recovery           Recovery       `json:"recovery,omitempty"`
+	StopTimeoutSeconds int            `json:"stop_timeout_seconds,omitempty"`
+}
+
+// node_web_app (DESIGN §6.4): installed as a WinSW-wrapped Windows service. Its
+// legal fields are service_name, entry, node_exe, port, install_deps, winsw_exe,
+// stop_timeout_seconds — it does NOT accept start_type/account/recovery.
+type NodeWebAppPattern struct {
+	Type               PatternType `json:"type"`
+	InstallRoot        string      `json:"install_root,omitempty"`
+	PostInstall        string      `json:"post_install,omitempty"`
+	ServiceName        string      `json:"service_name"`
+	Entry              string      `json:"entry"`
+	NodeExe            string      `json:"node_exe,omitempty"`
+	Port               int         `json:"port"`
+	InstallDeps        bool        `json:"install_deps,omitempty"`
+	WinswExe           string      `json:"winsw_exe,omitempty"`
+	StopTimeoutSeconds int         `json:"stop_timeout_seconds,omitempty"`
+}
+
+// dotnet_api (DESIGN §6.4): args/account/recovery/stop_timeout_seconds mirror
+// windows_service, but start_type is NOT a documented field for this variant.
+type DotnetAPIPattern struct {
+	Type               PatternType    `json:"type"`
+	InstallRoot        string         `json:"install_root,omitempty"`
+	PostInstall        string         `json:"post_install,omitempty"`
+	ServiceName        string         `json:"service_name"`
+	Launcher           string         `json:"launcher,omitempty"`
+	Exe                string         `json:"exe,omitempty"`
+	DLL                string         `json:"dll,omitempty"`
+	DotnetExe          string         `json:"dotnet_exe,omitempty"`
+	URLs               string         `json:"urls,omitempty"`
+	Hosting            string         `json:"hosting,omitempty"`
+	Args               []string       `json:"args,omitempty"`
+	WinswExe           string         `json:"winsw_exe,omitempty"`
+	Account            ServiceAccount `json:"account,omitempty"`
+	Recovery           Recovery       `json:"recovery,omitempty"`
+	StopTimeoutSeconds int            `json:"stop_timeout_seconds,omitempty"`
+}
+
+// cluster_generic_service (DESIGN §6.4): account/recovery/stop_timeout_seconds
+// mirror windows_service; start_type is not a documented field (start type is
+// forced to manual/demand by the cluster verbs — DESIGN §9.5 C1).
+type ClusterGenericPattern struct {
+	Type               PatternType    `json:"type"`
+	InstallRoot        string         `json:"install_root,omitempty"`
+	PostInstall        string         `json:"post_install,omitempty"`
+	ServiceName        string         `json:"service_name"`
+	RoleName           string         `json:"role_name"`
+	Exe                string         `json:"exe"`
+	Args               []string       `json:"args,omitempty"`
+	StaticAddress      string         `json:"static_address,omitempty"`
+	PreferredOwner     string         `json:"preferred_owner,omitempty"`
+	Account            ServiceAccount `json:"account,omitempty"`
+	Recovery           Recovery       `json:"recovery,omitempty"`
+	StopTimeoutSeconds int            `json:"stop_timeout_seconds,omitempty"`
+}
+
+type DockerContainerPattern struct {
+	Type          PatternType `json:"type"`
+	InstallRoot   string      `json:"install_root,omitempty"`
+	PostInstall   string      `json:"post_install,omitempty"`
+	ContainerName string      `json:"container_name"`
+	Ports         []string    `json:"ports,omitempty"`
+	Volumes       []string    `json:"volumes,omitempty"`
+	RestartPolicy string      `json:"restart_policy,omitempty"`
+	RunArgs       []string    `json:"run_args,omitempty"`
+}
+
+// UnmarshalJSON implements type-directed decoding of the pattern.type
+// discriminated union (DESIGN §6.4). It (1) decodes the shared/flat fields —
+// rejecting unknown keys so parse-time strictness is preserved — and (2) STRICTLY
+// decodes the SAME raw object into the concrete member struct selected by `type`,
+// leaving every other member nil. Because the concrete decode also rejects
+// unknown fields, a field that belongs to another variant (e.g. container_name
+// on a windows_service) is rejected rather than silently retained. Both YAML and
+// JSON specs reach here because parse.go converts YAML to JSON before decoding.
+func (p *Pattern) UnmarshalJSON(data []byte) error {
+	type rawPattern Pattern // alias sheds the custom method to avoid recursion
+	var rp rawPattern
+	if err := strictDecode(data, &rp); err != nil {
+		return err
+	}
+	*p = Pattern(rp)
+	return p.decodeUnion(data)
+}
+
+// strictDecode unmarshals data into v, rejecting any field not present in v's
+// schema (json.Decoder.DisallowUnknownFields).
+func strictDecode(data []byte, v interface{}) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
+// decodeUnion resets all concrete members then STRICTLY populates exactly the one
+// named by p.Type from the raw pattern object, so each concrete schema rejects
+// fields that belong to a different variant.
+func (p *Pattern) decodeUnion(data []byte) error {
+	p.ConsoleApp = nil
+	p.WindowsService = nil
+	p.NodeWebApp = nil
+	p.DotnetAPI = nil
+	p.ClusterGeneric = nil
+	p.DockerContainer = nil
+
+	wrap := func(err error) error {
+		if err != nil {
+			return fmt.Errorf("pattern.type %s: %w", p.Type, err)
+		}
+		return nil
+	}
+
+	switch p.Type {
+	case PatternConsoleApp:
+		var m ConsoleAppPattern
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
+		}
+		p.ConsoleApp = &m
+	case PatternWindowsService:
+		var m WindowsServicePattern
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
+		}
+		p.WindowsService = &m
+	case PatternNodeWebApp:
+		var m NodeWebAppPattern
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
+		}
+		p.NodeWebApp = &m
+	case PatternDotnetAPI:
+		var m DotnetAPIPattern
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
+		}
+		p.DotnetAPI = &m
+	case PatternClusterGeneric:
+		var m ClusterGenericPattern
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
+		}
+		p.ClusterGeneric = &m
+	case PatternDockerCont:
+		var m DockerContainerPattern
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
+		}
+		p.DockerContainer = &m
+	case "":
+		// Lenient path: no discriminant yet, so no variant is selected and every
+		// concrete member stays nil. This deliberately breaks the "exactly one
+		// non-nil" invariant (see the Pattern union-member doc); pattern.type is
+		// required (DESIGN §6.4), so ValidateDeployment rejects this state before
+		// any caller relies on a member being populated.
+	default:
+		return fmt.Errorf("pattern.type: %q unknown", p.Type)
+	}
+	return nil
 }
 
 type RenderedFile struct {

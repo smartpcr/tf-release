@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -177,6 +178,237 @@ pass_criteria: { exit_codes: [0], min_pass_rate: 1.0 }
 	}
 	if tr.EffectiveWorkRoot(OSWindows) == "" {
 		t.Fatal("work root default missing")
+	}
+}
+
+// Scenario: YAML equals JSON — the same Deployment authored in YAML and in JSON
+// must parse to byte-identical in-memory structs (and identical canonical hash).
+func TestYAMLEqualsJSON(t *testing.T) {
+	const jsonSpec = `{
+  "apiVersion": "labdeploy/v1",
+  "kind": "Deployment",
+  "metadata": { "name": "sample-svc" },
+  "target": {
+    "transport": "winrm",
+    "hosts": ["${var:HOST}"],
+    "os": "windows",
+    "credentials": { "username": "LAB\\deploy", "password_env": "LABDEPLOY_PASSWORD" }
+  },
+  "artifact": {
+    "type": "zip",
+    "version": "1.0.0",
+    "checksum": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source": { "type": "http", "url": "https://x/y.zip" }
+  },
+  "pattern": {
+    "type": "windows_service",
+    "service_name": "SampleSvc",
+    "exe": "bin\\SampleSvc.exe"
+  },
+  "health_check": { "type": "http", "http": { "url": "http://localhost:8080/health" } }
+}`
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	vars := map[string]string{"HOST": "lab-01"}
+	fromYAML, hy, err := ParseDeployment(winSvcYAML, vars, "")
+	if err != nil {
+		t.Fatalf("yaml parse: %v", err)
+	}
+	fromJSON, hj, err := ParseDeployment(jsonSpec, vars, "")
+	if err != nil {
+		t.Fatalf("json parse: %v", err)
+	}
+	if !reflect.DeepEqual(fromYAML, fromJSON) {
+		t.Fatalf("YAML and JSON produced different structs:\n yaml=%+v\n json=%+v", fromYAML, fromJSON)
+	}
+	if hy != hj {
+		t.Fatalf("canonical hash differs across formats: %s vs %s", hy, hj)
+	}
+}
+
+// Scenario: Pattern union decode — pattern.type: windows_service selects the
+// concrete windows_service member (non-nil) via type-directed decoding, and
+// every OTHER concrete union member is nil (DESIGN §6.4).
+func TestPatternUnionDecode(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	d, _, err := ParseDeployment(winSvcYAML, map[string]string{"HOST": "lab-01"}, "")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	p := d.Pattern
+	if p.Type != PatternWindowsService {
+		t.Fatalf("wrong pattern type: %q", p.Type)
+	}
+	// The selected concrete member must be non-nil and populated.
+	if p.WindowsService == nil {
+		t.Fatal("windows_service concrete member is nil; type-directed decode failed")
+	}
+	if p.WindowsService.ServiceName != "SampleSvc" {
+		t.Fatalf("windows_service member not populated: %+v", p.WindowsService)
+	}
+	if p.WindowsService.Exe != `bin\SampleSvc.exe` {
+		t.Fatalf("windows_service.exe not populated: %q", p.WindowsService.Exe)
+	}
+	// Every OTHER concrete union member must be nil.
+	if p.ConsoleApp != nil {
+		t.Fatalf("console_app member should be nil, got %+v", p.ConsoleApp)
+	}
+	if p.NodeWebApp != nil {
+		t.Fatalf("node_web_app member should be nil, got %+v", p.NodeWebApp)
+	}
+	if p.DotnetAPI != nil {
+		t.Fatalf("dotnet_api member should be nil, got %+v", p.DotnetAPI)
+	}
+	if p.ClusterGeneric != nil {
+		t.Fatalf("cluster_generic_service member should be nil, got %+v", p.ClusterGeneric)
+	}
+	if p.DockerContainer != nil {
+		t.Fatalf("docker_container member should be nil, got %+v", p.DockerContainer)
+	}
+}
+
+// Each pattern.type selects exactly one concrete union member; assert the whole
+// matrix so no two members are ever simultaneously non-nil.
+func TestPatternUnionMatrix(t *testing.T) {
+	base := `
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: p }
+target:
+  transport: winrm
+  hosts: ["h1"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  source: { type: http, url: "https://x/y.zip" }
+health_check: { type: none }
+`
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	cases := []struct {
+		name    string
+		pattern string
+		typ     PatternType
+		pick    func(*Pattern) bool
+	}{
+		{"console_app", "type: console_app\n  exe: app.exe", PatternConsoleApp,
+			func(p *Pattern) bool { return p.ConsoleApp != nil }},
+		{"windows_service", "type: windows_service\n  service_name: S\n  exe: s.exe", PatternWindowsService,
+			func(p *Pattern) bool { return p.WindowsService != nil }},
+		{"node_web_app", "type: node_web_app\n  service_name: S\n  entry: server.js\n  port: 8080\n  winsw_exe: winsw.exe", PatternNodeWebApp,
+			func(p *Pattern) bool { return p.NodeWebApp != nil }},
+		{"dotnet_api", "type: dotnet_api\n  service_name: S\n  exe: api.exe", PatternDotnetAPI,
+			func(p *Pattern) bool { return p.DotnetAPI != nil }},
+		{"cluster_generic_service", "type: cluster_generic_service\n  service_name: S\n  role_name: R\n  exe: s.exe", PatternClusterGeneric,
+			func(p *Pattern) bool { return p.ClusterGeneric != nil }},
+		{"docker_container", "type: docker_container\n  container_name: c", PatternDockerCont,
+			func(p *Pattern) bool { return p.DockerContainer != nil }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			y := strings.Replace(base, "health_check:", "pattern:\n  "+c.pattern+"\nhealth_check:", 1)
+			// docker_container requires docker_image artifact; swap for that case.
+			if c.typ == PatternDockerCont {
+				y = strings.Replace(y, "type: zip", "type: docker_image", 1)
+				y = strings.Replace(y, `  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+`, "", 1)
+				y = strings.Replace(y, `source: { type: http, url: "https://x/y.zip" }`,
+					`source: { type: docker_registry, image: "repo/img", tag: "1" }`, 1)
+			}
+			d, _, err := ParseDeploymentLenient(y, nil, "")
+			if err != nil {
+				t.Fatalf("parse %s: %v", c.name, err)
+			}
+			if d.Pattern.Type != c.typ {
+				t.Fatalf("type mismatch: got %q", d.Pattern.Type)
+			}
+			if !c.pick(&d.Pattern) {
+				t.Fatalf("%s concrete member not selected: %+v", c.name, d.Pattern)
+			}
+			members := []interface{}{
+				d.Pattern.ConsoleApp, d.Pattern.WindowsService, d.Pattern.NodeWebApp,
+				d.Pattern.DotnetAPI, d.Pattern.ClusterGeneric, d.Pattern.DockerContainer,
+			}
+			nonNil := 0
+			for _, m := range members {
+				switch v := m.(type) {
+				case *ConsoleAppPattern:
+					if v != nil {
+						nonNil++
+					}
+				case *WindowsServicePattern:
+					if v != nil {
+						nonNil++
+					}
+				case *NodeWebAppPattern:
+					if v != nil {
+						nonNil++
+					}
+				case *DotnetAPIPattern:
+					if v != nil {
+						nonNil++
+					}
+				case *ClusterGenericPattern:
+					if v != nil {
+						nonNil++
+					}
+				case *DockerContainerPattern:
+					if v != nil {
+						nonNil++
+					}
+				}
+			}
+			if nonNil != 1 {
+				t.Fatalf("expected exactly 1 concrete member non-nil, got %d", nonNil)
+			}
+		})
+	}
+}
+
+// A field that belongs to a DIFFERENT union variant must be rejected by the
+// selected concrete schema, not silently accepted (strict discriminated union).
+func TestPatternUnionRejectsCrossVariantField(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	// windows_service spec carrying docker_container's container_name.
+	bad := strings.Replace(winSvcYAML,
+		"  service_name: SampleSvc",
+		"  service_name: SampleSvc\n  container_name: sneaky",
+		1)
+	_, _, err := ParseDeploymentLenient(bad, map[string]string{"HOST": "h"}, "")
+	if err == nil {
+		t.Fatal("cross-variant field container_name on windows_service must be rejected")
+	}
+	if !strings.Contains(err.Error(), "container_name") {
+		t.Fatalf("error should name the offending field, got %v", err)
+	}
+	// node_web_app must reject start_type (not a documented node_web_app field).
+	nodeBad := `
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: n }
+target:
+  transport: winrm
+  hosts: ["h1"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  source: { type: http, url: "https://x/y.zip" }
+pattern:
+  type: node_web_app
+  service_name: S
+  entry: server.js
+  port: 8080
+  winsw_exe: winsw.exe
+  start_type: auto
+health_check: { type: none }
+`
+	if _, _, err := ParseDeploymentLenient(nodeBad, nil, ""); err == nil ||
+		!strings.Contains(err.Error(), "start_type") {
+		t.Fatalf("node_web_app must reject start_type, got %v", err)
 	}
 }
 
