@@ -1,6 +1,15 @@
 $ErrorActionPreference='Continue'
+$stage = Join-Path $env:TEMP ('labdeploy-stage-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
 $paths = @('C:\app\logs\*.log','C:\app\_results\*.trx') | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty FullName -Unique
-if(-not $paths){ Write-Output 'NOFILES'; exit 0 }
-Compress-Archive -Path $paths -DestinationPath 'C:\Windows\Temp\labdeploy-logs.zip' -Force
+if(-not $paths){ Remove-Item -Recurse -Force $stage; Write-Output 'NOFILES'; exit 0 }
+foreach($p in $paths){
+  $rel = $p -replace '^[A-Za-z]:[\\/]+','' -replace '^[\\/]+',''
+  $target = Join-Path $stage $rel
+  New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+  Copy-Item -LiteralPath $p -Destination $target -Force
+}
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath 'C:\Windows\Temp\labdeploy-logs.zip' -Force
+Remove-Item -Recurse -Force $stage
 Write-Output 'ZIPPED'
 exit 0

@@ -140,14 +140,11 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 			resultGlobs = append(resultGlobs, p.Release+"/"+strings.TrimLeft(rp, "/"))
 		}
 	}
-	// CollectFiles now extracts the archive itself and returns the (flattened)
-	// result files; parse them from the directory they were extracted into.
-	files, warns := logs.CollectFiles(ctx, t, resultGlobs, filepath.Join(dest, "results"))
+	// CollectFiles extracts the archive itself (preserving relative paths) and
+	// returns the result files; parse them by walking the whole results tree.
+	_, warns := logs.CollectFiles(ctx, t, resultGlobs, filepath.Join(dest, "results"))
 	collectWarns = append(collectWarns, warns...)
-	localResults := filepath.Join(dest, "results", sanitizeHost(host))
-	if len(files) > 0 {
-		localResults = filepath.Dir(files[0])
-	}
+	localResults := filepath.Join(dest, "results")
 	// 2. Extra log globs — CollectFiles extracts them into results_dir/logs/<host>/.
 	if len(tr.Collect.Logs) > 0 {
 		_, w := logs.CollectFiles(ctx, t, tr.Collect.Logs, filepath.Join(dest, "logs"))
@@ -155,7 +152,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 	}
 	// 3. Windows event logs since test start.
 	if len(tr.Collect.WindowsEventLogs) > 0 {
-		_, w := logs.CollectEventLogs(ctx, t, tr.Collect.WindowsEventLogs, startedAt.Add(-time.Minute), filepath.Join(dest, "events"))
+		_, w := logs.CollectEventLogs(ctx, t, tr.Collect.WindowsEventLogs, startedAt, filepath.Join(dest, "events"))
 		collectWarns = append(collectWarns, w...)
 	}
 	for _, w := range collectWarns {
@@ -169,7 +166,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 
 	// PARSE results if a format is configured.
 	if f := tr.Results.Format; f == "trx" || f == "junit" {
-		c, matched, perr := logs.SumResults(f, localResults, flatten(tr.Results.Paths))
+		c, matched, perr := logs.SumResults(f, localResults, tr.Results.Paths)
 		if perr != nil {
 			// Missing/corrupt results with format set ⇒ ERR_TEST_FAILED (E2E-06).
 			return out, coded("ERR_TEST_FAILED", host, "TEST",
@@ -224,28 +221,9 @@ func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started tim
 	_ = os.WriteFile(filepath.Join(dest, "summary.json"), b, 0o644)
 }
 
-// flatten strips directory components so globs match against the unpacked
-// flat archive layout (Compress-Archive flattens; tar preserves — match base).
-func flatten(patterns []string) []string {
-	out := make([]string, 0, len(patterns)*2)
-	for _, p := range patterns {
-		out = append(out, p, filepath.Base(p))
-	}
-	return out
-}
-
 func tail(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return s[len(s)-n:]
-}
-
-func sanitizeHost(h string) string {
-	return strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, strings.ToLower(h))
 }

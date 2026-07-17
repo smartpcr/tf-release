@@ -54,13 +54,25 @@ func TestZipScriptGolden(t *testing.T) {
 	}
 }
 
-// TestZipScriptQuoting proves the archive path is shell/PS quoted (injection
-// guard) and that Linux glob patterns are LEFT UNQUOTED so the shell can expand
-// their wildcards (a quoted glob would be treated literally and match nothing).
+// TestZipScriptQuoting proves the collection script cannot be hijacked by a
+// malicious manifest glob: on Linux the pattern is passed as DATA to `find
+// -path` (single-quoted), never expanded by the shell, so command substitutions
+// are inert; the archive path is shell/PS quoted; on Windows the glob is
+// PowerShell single-quoted.
 func TestZipScriptQuoting(t *testing.T) {
-	lin := buildZipScript(spec.OSLinux, []string{"/var/log/*.log"}, "/tmp/x'y.tar.gz").Script
-	if !strings.Contains(lin, "for f in /var/log/*.log;") {
-		t.Fatalf("linux glob should be unquoted for expansion: %s", lin)
+	evil := "/var/log/$(touch /tmp/pwned)/*.log"
+	lin := buildZipScript(spec.OSLinux, []string{evil}, "/tmp/x'y.tar.gz").Script
+	// find (not the shell) interprets the wildcards; both args are single-quoted.
+	if !strings.Contains(lin, `find "$1" -type f -path "$2"`) {
+		t.Fatalf("linux should match via find -path, not shell glob: %s", lin)
+	}
+	// The dangerous pattern must appear ONLY inside single quotes (as data).
+	if !strings.Contains(lin, `'/var/log/$(touch /tmp/pwned)/*.log'`) {
+		t.Fatalf("evil glob not passed as single-quoted data: %s", lin)
+	}
+	// It must NOT appear as an unquoted command substitution the shell would run.
+	if strings.Contains(lin, "for f in "+evil) || strings.Contains(lin, "for f in /var/log/$(touch") {
+		t.Fatalf("evil glob left unquoted for shell expansion: %s", lin)
 	}
 	if !strings.Contains(lin, `tar czf '/tmp/x'\''y.tar.gz' -C "$tmp" .`) {
 		t.Fatalf("linux archive path not safely quoted: %s", lin)

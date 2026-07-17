@@ -1,10 +1,16 @@
 set +e
 tmp=$(mktemp -d) || exit 1
 n=0
-for f in /var/log/app/*.log /opt/app/_results/*.xml; do
-  [ -f "$f" ] || continue
-  cp "$f" "$tmp"/ 2>/dev/null && n=$((n+1))
-done
+stage(){
+  find "$1" -type f -path "$2" 2>/dev/null | while IFS= read -r f; do
+    rel=${f#/}
+    d=$tmp/$(dirname "$rel")
+    mkdir -p "$d"
+    cp "$f" "$d"/ 2>/dev/null && echo x
+  done | wc -l
+}
+c=$(stage '/var/log/app' '/var/log/app/*.log'); n=$((n+c))
+c=$(stage '/opt/app/_results' '/opt/app/_results/*.xml'); n=$((n+c))
 if [ "$n" = "0" ]; then rm -rf "$tmp"; echo NOFILES; exit 0; fi
 tar czf '/tmp/labdeploy-logs.tar.gz' -C "$tmp" .
 rm -rf "$tmp"

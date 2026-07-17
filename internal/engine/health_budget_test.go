@@ -94,7 +94,7 @@ func TestHealthHardDeadlineCancelsProbe(t *testing.T) {
 	hc := &spec.HealthCheck{
 		Type:                "tcp",
 		TCP:                 spec.TCPCheck{Port: 5432},
-		InitialDelaySeconds: 0,
+		InitialDelaySeconds: 1,
 		IntervalSeconds:     1,
 		TimeoutSeconds:      2,
 	}
@@ -106,6 +106,11 @@ func TestHealthHardDeadlineCancelsProbe(t *testing.T) {
 	}
 	if elapsed > 2500*time.Millisecond {
 		t.Fatalf("deadline not enforced: probe allowed to run %s past the 2s budget", elapsed)
+	}
+	// The probe MUST have actually started (and then been cancelled by the hard
+	// deadline) — otherwise we're not exercising mid-probe cancellation.
+	if len(rec.timeouts) == 0 {
+		t.Fatal("probe never started; hard-deadline cancellation not exercised")
 	}
 }
 
