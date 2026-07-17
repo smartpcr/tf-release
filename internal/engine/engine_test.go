@@ -571,9 +571,9 @@ pattern:
 health_check:
   type: http
   http: { url: "http://localhost:8080/health" }
-  initial_delay_seconds: 0
+  initial_delay_seconds: 1
   interval_seconds: 1
-  timeout_seconds: 2
+  timeout_seconds: 3
 strategy: { keep_releases: 2, rollback_on_failure: true }
 `, checksum, url)
 	d, _, err := spec.ParseDeployment(y, nil, "")
