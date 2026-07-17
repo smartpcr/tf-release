@@ -42,8 +42,9 @@ unzip -o -q %s -d %s
 // switchScript renders the `current` junction/symlink repoint for p.OS
 // (DESIGN §9.1, S3). Windows removes the existing junction with `rmdir` (which
 // deletes only the link, never the target) then recreates it with `mklink /J`;
-// any failure of either cmd.exe step exits 42. Linux uses an atomic
-// `ln -sfn` replace; failure exits 42. Exit 42 ⇒ ERR_SWITCH. Deterministic for
+// any failure of either cmd.exe step exits 42. Linux repoints with `ln -sfn`
+// per DESIGN §9.1's literal command; `-f` unlinks then re-symlinks, so the swap
+// is not gap-free. Failure exits 42. Exit 42 ⇒ ERR_SWITCH. Deterministic for
 // golden testing.
 func switchScript(p layout.Paths) string {
 	if p.OS == spec.OSWindows {
