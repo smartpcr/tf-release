@@ -1230,6 +1230,93 @@ func TestCreateOperationalFailureIsNotContention(t *testing.T) {
 	}
 }
 
+// TestAcquireLockCreateContentionRetriesThenAcquires is the regression for
+// evaluator iter-22 item 2 (transient path): a create that returns exit 49 —
+// the create-gate (named mutex / directory flock) was briefly held by a peer and
+// our bounded wait elapsed — must be treated as TRANSIENT and retried, not
+// surfaced as ERR_CONNECT. Once the gate clears, the acquire succeeds into the
+// free slot with no stale warning. We script three contended creates, then let
+// the real create run.
+func TestAcquireLockCreateContentionRetriesThenAcquires(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			p := lockFakePaths(osk)
+			f := newLockFake(osk) // slot FREE
+			var mu sync.Mutex
+			creates := 0
+			f.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "create" {
+					mu.Lock()
+					creates++
+					n := creates
+					mu.Unlock()
+					if n <= 3 {
+						return transport.Result{ExitCode: 49}, nil, true // transient gate contention
+					}
+				}
+				return transport.Result{}, nil, false // 4th create runs for real → success
+			}
+			start := time.Now()
+			lk, warn, err := AcquireLock(context.Background(), f, p, "me", "deploy", 900)
+			elapsed := time.Since(start)
+			if err != nil || lk == nil {
+				t.Fatalf("transient create contention must retry then acquire, got lk=%v warn=%q err=%v", lk, warn, err)
+			}
+			if warn != "" {
+				t.Fatalf("a fresh create into a free slot must carry no stale warning, got %q", warn)
+			}
+			mu.Lock()
+			got := creates
+			mu.Unlock()
+			if got < 4 {
+				t.Fatalf("acquire must retry past the 3 contended creates, saw %d create attempts", got)
+			}
+			if elapsed > 5*time.Second {
+				t.Fatalf("acquisition must stay within the 5s budget, took %v", elapsed)
+			}
+			if !f.has(p.Lock) {
+				t.Fatal("a successful acquire must leave the lock present")
+			}
+		})
+	}
+}
+
+// TestAcquireLockCreateContentionPersistsReturnsLocked is the regression for
+// evaluator iter-22 items 1 & 2 (persistent path + budget): create-gate contention
+// (exit 49) that NEVER clears must neither spin unbounded nor be misclassified as
+// ERR_CONNECT — it returns ERR_LOCKED, leaves NO lock behind, and the whole
+// acquisition stays strictly within the 5s budget (proving the bounded-wait /
+// deadline strategy, not a 20s block).
+func TestAcquireLockCreateContentionPersistsReturnsLocked(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			p := lockFakePaths(osk)
+			f := newLockFake(osk) // slot FREE, but the create gate is always contended
+			f.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "create" {
+					return transport.Result{ExitCode: 49}, nil, true
+				}
+				return transport.Result{}, nil, false
+			}
+			start := time.Now()
+			lk, _, err := AcquireLock(context.Background(), f, p, "me", "deploy", 900)
+			elapsed := time.Since(start)
+			var ce *CodedError
+			if err == nil || lk != nil || !asCoded(err, &ce) || ce.Code != "ERR_LOCKED" {
+				t.Fatalf("persistent create contention must return ERR_LOCKED, got lk=%v err=%v", lk, err)
+			}
+			if elapsed >= 5*time.Second {
+				t.Fatalf("persistent contention must resolve within the 5s budget, took %v", elapsed)
+			}
+			if f.has(p.Lock) {
+				t.Fatalf("a never-acquired lock must not be present: %q", f.get(p.Lock))
+			}
+		})
+	}
+}
+
 
 // genuinely LIVE (non-stale) held lock must be refused promptly — a handful of
 // commands, no spinning — to honor DESIGN §13 "fail fast, <5s, no wait". We assert

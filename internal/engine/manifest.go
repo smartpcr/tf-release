@@ -268,15 +268,40 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 	// (evaluator iter-21 item 1).
 	const acquireBudget = 5 * time.Second
 	start := time.Now()
-	for attempt := 0; ; attempt++ {
-		remaining := acquireBudget - time.Since(start)
-		if remaining <= 0 {
-			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-				fmt.Errorf("lock acquisition exceeded %s budget (gate repeatedly contended)", acquireBudget))
+	deadline := start.Add(acquireBudget)
+
+	// Bind ALL remote gate operations to the acquisition deadline so transport
+	// overhead (connect/exec latency), not just the in-guard gate wait, is counted
+	// against the 5s budget: a hung Exec is cancelled at the deadline instead of
+	// silently overrunning it (evaluator iter-22 item 1).
+	actx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	// gateWaitMS returns how long the NEXT single gate op may wait, recomputed from
+	// the live remaining budget every time it is called (0 ⇒ budget exhausted).
+	// Recomputing before each of createLockExclusive AND casReplace prevents the two
+	// gate ops in one attempt from each consuming the full remaining allowance
+	// (evaluator iter-22 item 1).
+	gateWaitMS := func() int {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			return 0
 		}
-		waitMS := int(remaining / time.Millisecond)
-		if waitMS > lockGateWaitMS {
-			waitMS = lockGateWaitMS
+		ms := int(rem / time.Millisecond)
+		if ms > lockGateWaitMS {
+			ms = lockGateWaitMS
+		}
+		return ms
+	}
+	budgetExceeded := func() (*Lock, string, error) {
+		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+			fmt.Errorf("lock acquisition exceeded %s budget (gate repeatedly contended)", acquireBudget))
+	}
+
+	for attempt := 0; ; attempt++ {
+		waitMS := gateWaitMS()
+		if waitMS <= 0 {
+			return budgetExceeded()
 		}
 
 		token := newToken()
@@ -285,7 +310,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		})
 		content := string(li)
 
-		created, exit, cerr := createLockExclusive(ctx, t, p, content, waitMS)
+		created, exit, cerr := createLockExclusive(actx, t, p, content, waitMS)
 		if cerr != nil {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr)
 		}
@@ -309,7 +334,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 			// within the budget rather than misclassifying it as ERR_CONNECT
 			// (evaluator iter-21 item 2).
 			if attempt < maxAttempts {
-				casBackoff(ctx, attempt)
+				casBackoff(actx, attempt)
 				continue
 			}
 			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
@@ -327,7 +352,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		// publish / compare-and-delete), a `.lock` is never observed empty or
 		// partial, so there is no "crash residue" to recover — treating an empty
 		// file as recoverable is exactly what previously allowed dual ownership.
-		raw, ok, rerr := readSmallFile(ctx, t, p.Lock)
+		raw, ok, rerr := readSmallFile(actx, t, p.Lock)
 		if rerr != nil {
 			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock held (unreadable): %v", rerr))
 		}
@@ -366,7 +391,11 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		// winner ALWAYS returns the stale-owner WARN; every loser observes our FRESH
 		// bytes (casMismatch) and retries into ERR_LOCKED against the live successor.
 		warn := staleWarnMsg(existing, t.Host())
-		outcome, serr := casReplace(ctx, t, p.Lock, raw, content, waitMS)
+		replaceWaitMS := gateWaitMS()
+		if replaceWaitMS <= 0 {
+			return budgetExceeded()
+		}
+		outcome, serr := casReplace(actx, t, p.Lock, raw, content, replaceWaitMS)
 		if serr != nil {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", serr)
 		}
@@ -378,7 +407,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 			// A peer holds the exclusive gate right now (transient). Back off and
 			// re-evaluate rather than misreporting it as a mismatch/absence.
 			if attempt < maxAttempts {
-				casBackoff(ctx, attempt)
+				casBackoff(actx, attempt)
 				continue
 			}
 			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
