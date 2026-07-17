@@ -12,9 +12,11 @@
 //   - SSH dial and SFTP round-trip (proof:lab for a live VM; proven here
 //     in-process because a local shell cannot exercise ssh/sftp): with the
 //     host-key pin satisfied and the password accepted, Connect brings up the
-//     ssh + sftp subsystem, Exec returns the application exit code in Result
-//     with no transport error, and Upload then Download round-trips a byte
-//     payload byte-for-byte. A SECOND stub configured to reject the password is
+//     ssh + sftp subsystem, Exec surfaces a distinctive NON-ZERO application
+//     exit code (7) in Result with no transport error — proving ssh.go's
+//     *ssh.ExitError/ExitStatus() surfacing path rather than a hard-coded 0 —
+//     and Upload then Download round-trips a byte payload byte-for-byte. A
+//     SECOND stub configured to reject the password is
 //     dialed with connect_retries=3 and MUST map to ERR_AUTH after EXACTLY ONE
 //     TCP connection — auth rejection is never retried (DESIGN §8.1).
 //   - Host key mismatch mapping (in-process; deps: none): a wrong base64
@@ -53,6 +55,16 @@ import (
 // sshxferPassEnv is the env-var NAME the ssh transport resolves the password
 // from (NewTransport reads secrets by name from the runner environment).
 const sshxferPassEnv = "FORGE_E2E_SSH_XFER_PASSWORD"
+
+// sshxferExecExitCode is the distinctive NON-ZERO application exit status the
+// stub's exec handler reports on the wire. The round-trip scenario asserts Exec
+// returns exactly this value in Result.ExitCode with a nil error, proving the
+// ssh transport forwards the wire exit code (via *ssh.ExitError/ExitStatus())
+// instead of hard-coding 0 or mapping an application exit to a transport error
+// (DESIGN §8.1: "err = transport failure ONLY; app exit codes go in Result").
+// Both the stub and the assertion reference this single constant so the two
+// ends of the proof cannot silently drift apart.
+const sshxferExecExitCode = 7
 
 // --- ephemeral in-process stub sshd -----------------------------------------
 
@@ -132,11 +144,13 @@ func (s *sshxferStub) close() {
 }
 
 // handle completes the SSH handshake and serves session channels: an "exec"
-// request replies success and returns exit-status 0 (so Exec surfaces
-// ExitCode 0 with no transport error), and an sftp "subsystem" request serves
-// the real filesystem via pkg/sftp (so Upload/Download round-trip). Handshake
-// or auth failures are expected in the mismatch/auth-rejection paths and are
-// discarded.
+// request replies success and returns a distinctive NON-ZERO exit-status
+// (sshxferExecExitCode), so Exec is proven to surface that application exit
+// code in Result.ExitCode with no transport error — exercising ssh.go's
+// *ssh.ExitError/ExitStatus() path rather than a hard-coded 0. An sftp
+// "subsystem" request serves the real filesystem via pkg/sftp (so
+// Upload/Download round-trip). Handshake or auth failures are expected in the
+// mismatch/auth-rejection paths and are discarded.
 func (s *sshxferStub) handle(conn net.Conn) {
 	defer conn.Close()
 	sconn, chans, reqs, err := ssh.NewServerConn(conn, s.cfg)
@@ -162,7 +176,7 @@ func (s *sshxferStub) handle(conn net.Conn) {
 					_ = req.Reply(true, nil)
 					_, _ = ch.Write([]byte("ok\n"))
 					_, _ = ch.SendRequest("exit-status", false,
-						ssh.Marshal(struct{ Status uint32 }{0}))
+						ssh.Marshal(struct{ Status uint32 }{sshxferExecExitCode}))
 					_ = ch.Close()
 					return
 				case req.Type == "subsystem" && len(req.Payload) >= 4 &&
@@ -271,12 +285,19 @@ func (w *sshxferWorld) connectExecUploadDownload() error {
 		return fmt.Errorf("OS()=%s want linux", got)
 	}
 
-	res, err := w.tr.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: "true"})
+	// The Feature requires Exec to "surface application exit codes". The stub
+	// reports a distinctive non-zero exit status on the wire, and Exec MUST
+	// return it in Result.ExitCode with a nil error — an application exit is
+	// NOT a transport failure (DESIGN §8.1). Asserting the exact non-zero value
+	// (not merely != 0) is what proves the wire code is forwarded via
+	// *ssh.ExitError/ExitStatus() rather than hard-coded; a constant-0 stub
+	// could not tell a surfaced code apart from a dropped one.
+	res, err := w.tr.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: fmt.Sprintf("exit %d", sshxferExecExitCode)})
 	if err != nil {
-		return fmt.Errorf("Exec returned a transport error: %w", err)
+		return fmt.Errorf("Exec surfaced an application exit as a transport error: %w", err)
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("Exec ExitCode=%d want 0", res.ExitCode)
+	if res.ExitCode != sshxferExecExitCode {
+		return fmt.Errorf("Exec ExitCode=%d want %d (application exit code must surface in Result with nil error)", res.ExitCode, sshxferExecExitCode)
 	}
 
 	dir, err := os.MkdirTemp("", "e2e-ssh-xfer-")
