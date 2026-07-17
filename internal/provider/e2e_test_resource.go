@@ -17,13 +17,20 @@ import (
 )
 
 var (
-	_ resource.Resource              = (*E2ETestResource)(nil)
-	_ resource.ResourceWithConfigure = (*E2ETestResource)(nil)
+	_ resource.Resource                     = (*E2ETestResource)(nil)
+	_ resource.ResourceWithConfigure        = (*E2ETestResource)(nil)
+	_ resource.ResourceWithConfigValidators = (*E2ETestResource)(nil)
 )
 
 func NewE2ETestResource() resource.Resource { return &E2ETestResource{} }
 
 type E2ETestResource struct{ pd *providerData }
+
+// ConfigValidators enforces the VAL-06 exactly-one-of(spec, spec_file) rule at
+// the Terraform config layer (DESIGN §14).
+func (r *E2ETestResource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
+	return []resource.ConfigValidator{exactlyOneOfSpecValidator{}}
+}
 
 type e2eModel struct {
 	ID                types.String `tfsdk:"id"`

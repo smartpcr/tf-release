@@ -7,8 +7,10 @@ import (
 
 	fwprovider "github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
-	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
 
 // TestProviderMetadataTypeName asserts the provider advertises the type name
@@ -74,22 +76,77 @@ func keys(m map[string]*tfprotov6.Schema) []string {
 	return out
 }
 
-// TestVAL06ExactlyOneOfSpec covers DESIGN §14 VAL-06: setting both `spec` and
-// `spec_file` is rejected with an ERR_SPEC_INVALID "exactly one of" error,
-// before any spec parse or dial.
-func TestVAL06ExactlyOneOfSpec(t *testing.T) {
+// deploymentConfig builds a tfsdk.Config from the DeploymentResource schema,
+// setting spec/spec_file to the given values (nil ⇒ null) and every other
+// attribute to null. This lets tests drive the framework config validators the
+// same way Terraform does during plan/validate.
+func deploymentConfig(t *testing.T, specVal, specFileVal *string) tfsdk.Config {
+	t.Helper()
+	ctx := context.Background()
 	r := &DeploymentResource{}
-	m := &deploymentModel{
-		Spec:     types.StringValue("apiVersion: labdeploy/v1"),
-		SpecFile: types.StringValue("/tmp/spec.yaml"),
+	sresp := &resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, sresp)
+	sc := sresp.Schema
+
+	objType := sc.Type().TerraformType(ctx).(tftypes.Object)
+	vals := make(map[string]tftypes.Value, len(objType.AttributeTypes))
+	for name, ty := range objType.AttributeTypes {
+		vals[name] = tftypes.NewValue(ty, nil) // null
 	}
-	_, _, err := r.resolveSpec(context.Background(), m)
-	if err == nil {
-		t.Fatal("VAL-06: expected error when both spec and spec_file are set")
+	if specVal != nil {
+		vals["spec"] = tftypes.NewValue(tftypes.String, *specVal)
 	}
-	for _, frag := range []string{"ERR_SPEC_INVALID", "exactly one of"} {
-		if !strings.Contains(err.Error(), frag) {
-			t.Fatalf("VAL-06 error missing %q: got %v", frag, err)
+	if specFileVal != nil {
+		vals["spec_file"] = tftypes.NewValue(tftypes.String, *specFileVal)
+	}
+	return tfsdk.Config{Schema: sc, Raw: tftypes.NewValue(objType, vals)}
+}
+
+// TestVAL06ExactlyOneOfSpec covers DESIGN §14 VAL-06 at the Terraform SCHEMA
+// layer: the resource's ConfigValidators reject configs where both `spec` and
+// `spec_file` are set (or neither), and accept exactly one — before any parse
+// or dial. Exercised through the framework's ValidateResource contract.
+func TestVAL06ExactlyOneOfSpec(t *testing.T) {
+	ctx := context.Background()
+	r := &DeploymentResource{}
+	validators := r.ConfigValidators(ctx)
+	if len(validators) == 0 {
+		t.Fatal("VAL-06: DeploymentResource declares no ConfigValidators")
+	}
+
+	run := func(cfg tfsdk.Config) *resource.ValidateConfigResponse {
+		resp := &resource.ValidateConfigResponse{}
+		for _, v := range validators {
+			v.ValidateResource(ctx, resource.ValidateConfigRequest{Config: cfg}, resp)
 		}
+		return resp
+	}
+
+	inline := "apiVersion: labdeploy/v1"
+	file := "/tmp/spec.yaml"
+
+	// Both set ⇒ error naming ERR_SPEC_INVALID + exactly-one-of.
+	resp := run(deploymentConfig(t, &inline, &file))
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("VAL-06: both spec and spec_file set must produce a config error")
+	}
+	msg := resp.Diagnostics.Errors()[0].Summary() + " " + resp.Diagnostics.Errors()[0].Detail()
+	for _, frag := range []string{"ERR_SPEC_INVALID", "exactly one of"} {
+		if !strings.Contains(msg, frag) {
+			t.Fatalf("VAL-06 diagnostic missing %q: got %q", frag, msg)
+		}
+	}
+
+	// Neither set ⇒ error.
+	if !run(deploymentConfig(t, nil, nil)).Diagnostics.HasError() {
+		t.Fatal("VAL-06: neither spec nor spec_file set must produce a config error")
+	}
+
+	// Exactly one set ⇒ no error (both orderings).
+	if run(deploymentConfig(t, &inline, nil)).Diagnostics.HasError() {
+		t.Fatalf("VAL-06: inline spec alone must be valid: %v", run(deploymentConfig(t, &inline, nil)).Diagnostics)
+	}
+	if run(deploymentConfig(t, nil, &file)).Diagnostics.HasError() {
+		t.Fatalf("VAL-06: spec_file alone must be valid: %v", run(deploymentConfig(t, nil, &file)).Diagnostics)
 	}
 }

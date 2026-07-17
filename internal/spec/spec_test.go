@@ -652,7 +652,7 @@ func TestValidationMatrix(t *testing.T) {
 			yaml:      strings.Replace(winSvcYAML, "os: windows", "os: linux", 1),
 			vars:      map[string]string{"HOST": "h"},
 			setEnv:    map[string]string{"LABDEPLOY_PASSWORD": "x"},
-			fragments: []string{"[ERR_SPEC_INVALID]", "windows_service", "linux"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "pattern.type", "windows_service", "linux"},
 		},
 		{
 			id:        "VAL-04 cluster one host",
@@ -684,7 +684,7 @@ func TestValidationMatrix(t *testing.T) {
 			id:        "VAL-09 docker_image with windows_service",
 			yaml:      dockerWinSvcYAML,
 			setEnv:    map[string]string{"LABDEPLOY_PASSWORD": "x"},
-			fragments: []string{"[ERR_SPEC_INVALID]", "docker"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "artifact.type", "docker_image", "docker_container"},
 		},
 	}
 	for _, c := range cases {

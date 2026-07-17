@@ -19,15 +19,22 @@ import (
 )
 
 var (
-	_ resource.Resource                = (*DeploymentResource)(nil)
-	_ resource.ResourceWithConfigure   = (*DeploymentResource)(nil)
-	_ resource.ResourceWithModifyPlan  = (*DeploymentResource)(nil)
-	_ resource.ResourceWithImportState = (*DeploymentResource)(nil)
+	_ resource.Resource                     = (*DeploymentResource)(nil)
+	_ resource.ResourceWithConfigure        = (*DeploymentResource)(nil)
+	_ resource.ResourceWithModifyPlan       = (*DeploymentResource)(nil)
+	_ resource.ResourceWithImportState      = (*DeploymentResource)(nil)
+	_ resource.ResourceWithConfigValidators = (*DeploymentResource)(nil)
 )
 
 func NewDeploymentResource() resource.Resource { return &DeploymentResource{} }
 
 type DeploymentResource struct{ pd *providerData }
+
+// ConfigValidators enforces the VAL-06 exactly-one-of(spec, spec_file) rule at
+// the Terraform config layer (DESIGN §14).
+func (r *DeploymentResource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
+	return []resource.ConfigValidator{exactlyOneOfSpecValidator{}}
+}
 
 type deploymentModel struct {
 	ID              types.String `tfsdk:"id"`
