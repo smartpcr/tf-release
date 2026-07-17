@@ -155,6 +155,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case reRead.MatchString(s): // readSmallFile
 		p := reRead.FindStringSubmatch(s)[1]
+		if f.fail["read"] {
+			return transport.Result{}, fmt.Errorf("simulated manifest read transport failure")
+		}
 		raw, exists := f.files[p]
 		if !exists {
 			return transport.Result{ExitCode: 3}, nil

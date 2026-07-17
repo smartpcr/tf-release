@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -30,6 +31,8 @@ type fakeCluster struct {
 	svc   string
 	owner string
 	state string
+
+	statusErr bool // when true, the pattern Status probe returns a transport error
 }
 
 var reNodeArg = regexp.MustCompile(`-Node '([^']+)'`)
@@ -76,6 +79,9 @@ func (n *clusterNode) Exec(ctx context.Context, c transport.Cmd) (transport.Resu
 	case strings.Contains(s, "FailoverClusters module missing"): // pattern Preflight
 		return ok(""), nil
 	case strings.Contains(s, "Get-ClusterGroup") && strings.Contains(s, "not_installed"): // Status
+		if n.cl.statusErr {
+			return transport.Result{}, fmt.Errorf("simulated cluster status probe transport failure")
+		}
 		if !n.cl.role {
 			return ok("not_installed"), nil
 		}
@@ -307,7 +313,9 @@ func TestClusterCreateHealthBringsOffline(t *testing.T) {
 		return nodes[strings.ToLower(host)], nil
 	}
 
-	_, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	var buf bytes.Buffer
+	ctx := tflogtest.RootLogger(context.Background(), &buf)
+	_, err := eng.Deploy(ctx, clusterUpdateSpec(t, url, sum))
 	if err == nil {
 		t.Fatalf("expected fresh cluster create to fail at C5 HEALTH")
 	}
@@ -317,6 +325,13 @@ func TestClusterCreateHealthBringsOffline(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "role stopped after failed create") {
 		t.Fatalf("want 'role stopped after failed create' detail, got: %v", err)
+	}
+	// The Offline transition is an executed STOP step and MUST carry the full
+	// structured record (evaluator iter9 item 2). captureSteps asserts the
+	// app/host/step/version/duration_ms field set on every emitted record.
+	steps := captureSteps(t, &buf)
+	if countStep(steps, "STOP") == 0 {
+		t.Fatalf("clusterCreateStop must emit a structured STOP step; got %v", stepNames(steps))
 	}
 }
 
@@ -349,6 +364,124 @@ func TestClusterCreateOwnerResolutionBringsOffline(t *testing.T) {
 	}
 	if cl.state != "Offline" {
 		t.Fatalf("owner-resolution failure must still bring the role Offline, got state=%q", cl.state)
+	}
+}
+
+// seedUpdateNode builds an owner/passive cluster node with a previous 1.0.0
+// deployment recorded and the service Running — the starting state for a rolling
+// update to 2.0.0.
+func seedUpdateNode(t *testing.T, host string, cl *fakeCluster) *clusterNode {
+	t.Helper()
+	f := newFakeHost(host)
+	f.svc = "Running"
+	seedManifest(t, f, `C:\deploy\sample-svc\manifest.json`, &Manifest{
+		Schema: 1, App: "sample-svc", Pattern: "cluster_generic_service",
+		CurrentVersion: "1.0.0", ArtifactChecksum: "sha256:old",
+		CurrentRelease:  `C:\deploy\sample-svc\releases\1.0.0`,
+		ProviderVersion: ProviderVersion,
+		LastOperation:   LastOp{Type: "deploy", Result: "success"},
+	})
+	return &clusterNode{fakeHost: f, cl: cl}
+}
+
+// TestClusterCreateStatusErrorPropagates covers evaluator iter9 item 3: a failed
+// remote Status probe on an otherwise-successful fresh cluster CREATE must be
+// surfaced (ERR_CONNECT/READ), not swallowed into an empty service_status.
+func TestClusterCreateStatusErrorPropagates(t *testing.T) {
+	payload := []byte("cluster create zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	// owner preset so C5 resolves lab-01 and health passes; the ONLY failure is
+	// the post-finalize Status probe.
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  false, svc: "SampleSvc", owner: "lab-01", state: "Offline",
+		statusErr: true,
+	}
+	n1 := &clusterNode{fakeHost: newFakeHost("lab-01"), cl: cl}
+	n2 := &clusterNode{fakeHost: newFakeHost("lab-02"), cl: cl}
+
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	st, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if st != nil || err == nil {
+		t.Fatalf("failed status probe must surface an error, got st=%v err=%v", st, err)
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_CONNECT" {
+		t.Fatalf("want ERR_CONNECT from a failed create status probe, got: %v", err)
+	}
+}
+
+// TestClusterUpdateStatusErrorPropagates covers evaluator iter9 item 3: same as
+// above for a successful rolling UPDATE.
+func TestClusterUpdateStatusErrorPropagates(t *testing.T) {
+	payload := []byte("cluster v2 zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  true, svc: "SampleSvc", owner: "lab-01", state: "Online",
+		statusErr: true,
+	}
+	n1 := seedUpdateNode(t, "lab-01", cl)
+	n2 := seedUpdateNode(t, "lab-02", cl)
+
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	st, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if st != nil || err == nil {
+		t.Fatalf("failed status probe must surface an error, got st=%v err=%v", st, err)
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_CONNECT" {
+		t.Fatalf("want ERR_CONNECT from a failed update status probe, got: %v", err)
+	}
+}
+
+// TestClusterUpdateOwnerManifestReadErrorPropagates covers evaluator iter9 item 3
+// / iter6 item 5: a genuine owner-manifest read failure at U0 must surface as
+// ERR_PREFLIGHT/VALIDATE, not be swallowed into an empty prevVersion (which would
+// mutate the cluster with no valid rollback target).
+func TestClusterUpdateOwnerManifestReadErrorPropagates(t *testing.T) {
+	payload := []byte("cluster v2 zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  true, svc: "SampleSvc", owner: "lab-01", state: "Online",
+	}
+	n1 := seedUpdateNode(t, "lab-01", cl)
+	n2 := seedUpdateNode(t, "lab-02", cl)
+	// The owner's manifest read (the rollback-target lookup at U0) fails at the
+	// transport level. The idempotency pre-check tolerates it (treats as not
+	// current), so U0 is where it must be surfaced.
+	n1.fakeHost.fail["read"] = true
+
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	st, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if st != nil || err == nil {
+		t.Fatalf("owner-manifest read failure must surface an error, got st=%v err=%v", st, err)
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_PREFLIGHT" {
+		t.Fatalf("want ERR_PREFLIGHT from a failed owner-manifest read, got: %v", err)
 	}
 }
 

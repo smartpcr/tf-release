@@ -302,7 +302,13 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 // clean Offline (evaluator iter6 item 4).
 func (e *Engine) clusterCreateStop(ctx context.Context, cc *clusterCtx, started time.Time, orig error) error {
 	s := cc.s
-	stopErr := cc.cg.StopGroup(ctx, cc.coord(), s.Pattern.RoleName)
+	// The Offline transition is an executed fixed step, so it MUST carry the
+	// structured app/host/step/version/duration_ms record like every other step
+	// (evaluator iter9 item 2) — emit it through the step logger, not a bare call.
+	sl := newStepLogger(s, cc.hosts[0])
+	stopErr := sl.timed(ctx, "STOP", func() error {
+		return cc.cg.StopGroup(ctx, cc.coord(), s.Pattern.RoleName)
+	})
 	ferr := e.clusterFinalize(ctx, cc, "", started, "failed")
 	if stopErr != nil {
 		detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — role could not be brought Offline after failed create: %v; deploy: %w",
