@@ -45,18 +45,16 @@ var _ transport.Transport = (*probeRecorder)(nil)
 
 // TestHealthBudgetExhaustion: an always-unhealthy probe must fail with
 // ERR_HEALTH_CHECK once timeout_seconds elapses — and MUST NOT run the full
-// 30/60s per-probe timeout past the budget (evaluator item 3).
+// 30/60s per-probe timeout past the budget (evaluator item 1).
 func TestHealthBudgetExhaustion(t *testing.T) {
 	rec := &probeRecorder{os: spec.OSWindows, exit: 1, stdout: "connection refused"}
 	hc := &spec.HealthCheck{
 		Type:                "http",
 		HTTP:                spec.HTTPCheck{URL: "http://localhost:8080/health"},
-		InitialDelaySeconds: 0, // Budget() floors to... no: 0<=0 => 5? see below
+		InitialDelaySeconds: 1,
 		IntervalSeconds:     1,
 		TimeoutSeconds:      2,
 	}
-	// Budget() forces initial=5 when <=0; we want a small initial, so set 1.
-	hc.InitialDelaySeconds = 1
 
 	start := time.Now()
 	err := RunHealthCheck(context.Background(), rec, hc, `C:\wd`, nil)
@@ -69,10 +67,11 @@ func TestHealthBudgetExhaustion(t *testing.T) {
 	if !asCoded(err, &ce) || ce.Code != "ERR_HEALTH_CHECK" {
 		t.Fatalf("want ERR_HEALTH_CHECK, got %v", err)
 	}
-	// Total budget is 2s; allow generous slack but it must be far below the
-	// 30s per-probe timeout the old code would have permitted.
-	if elapsed > 5*time.Second {
-		t.Fatalf("budget not enforced: ran %s (>5s)", elapsed)
+	// Total budget is 2s; the context deadline is the hard stop, so the loop
+	// must return within a tight margin of the budget — nowhere near the 30s
+	// per-probe timeout the old code permitted.
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("budget not enforced: ran %s (>2.5s for a 2s budget)", elapsed)
 	}
 	if len(rec.timeouts) == 0 {
 		t.Fatal("no probes executed")
@@ -83,6 +82,30 @@ func TestHealthBudgetExhaustion(t *testing.T) {
 		if to > 2 {
 			t.Fatalf("probe %d timeout %d exceeds 2s budget cap", i, to)
 		}
+	}
+}
+
+// TestHealthHardDeadlineCancelsProbe: a probe that would SUCCEED but only after
+// running longer than the total budget must be cancelled by the context
+// deadline and MUST NOT be allowed to complete past the budget (evaluator
+// item 1 — "still runs a probe after deadline exhaustion").
+func TestHealthHardDeadlineCancelsProbe(t *testing.T) {
+	rec := &probeRecorder{os: spec.OSLinux, exit: 0, execDelay: 10 * time.Second}
+	hc := &spec.HealthCheck{
+		Type:                "tcp",
+		TCP:                 spec.TCPCheck{Port: 5432},
+		InitialDelaySeconds: 0,
+		IntervalSeconds:     1,
+		TimeoutSeconds:      2,
+	}
+	start := time.Now()
+	err := RunHealthCheck(context.Background(), rec, hc, "/wd", nil)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected ERR_HEALTH_CHECK: the slow probe must not complete past budget")
+	}
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("deadline not enforced: probe allowed to run %s past the 2s budget", elapsed)
 	}
 }
 

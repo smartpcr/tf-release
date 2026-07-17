@@ -25,36 +25,40 @@ func RunHealthCheck(ctx context.Context, t transport.Transport, hc *spec.HealthC
 	initial, interval, budget := hc.Budget()
 	deadline := time.Now().Add(time.Duration(budget) * time.Second)
 
-	// Initial delay, bounded by the total deadline. A cut-short sleep due to the
-	// deadline (not cancellation) still proceeds to at least one probe below.
-	if !sleepBounded(ctx, time.Duration(initial)*time.Second, deadline) && ctx.Err() != nil {
-		return coded("ERR_HEALTH_CHECK", t.Host(), "HEALTH", ctx.Err())
+	// Enforce timeout_seconds as a HARD context deadline: every probe Exec is
+	// cancelled the instant the total budget is exhausted, so no probe can
+	// succeed (or even keep running) past the deadline (DESIGN §6.5).
+	hctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	// Initial delay, bounded by the total deadline.
+	if initial > 0 && !sleepBounded(hctx, time.Duration(initial)*time.Second, deadline) && hctx.Err() != nil {
+		return coded("ERR_HEALTH_CHECK", t.Host(), "HEALTH", hctx.Err())
 	}
 
 	var lastDetail string
 	attempt := 0
-	for {
+	// Probe only while budget remains: the loop guard guarantees we never START
+	// a probe at/after the deadline.
+	for time.Now().Before(deadline) {
 		attempt++
-		// Always run at least one probe (even if the initial delay already
-		// consumed the budget); the probe's own timeout is capped to whatever
-		// budget remains so a single call can't blow past timeout_seconds.
-		ok, detail := probeOnce(ctx, t, hc, workDir, env, time.Until(deadline))
+		ok, detail := probeOnce(hctx, t, hc, workDir, env, time.Until(deadline))
 		if ok {
 			tflog.Debug(ctx, "health check passed", map[string]interface{}{
 				"host": t.Host(), "step": "HEALTH", "attempts": attempt})
 			return nil
 		}
 		lastDetail = detail
-		if ctx.Err() != nil {
-			return coded("ERR_HEALTH_CHECK", t.Host(), "HEALTH", ctx.Err())
-		}
-		if !time.Now().Before(deadline) {
+		if hctx.Err() != nil {
 			break
 		}
 		// Poll interval, bounded so we never sleep past the deadline.
-		if !sleepBounded(ctx, time.Duration(interval)*time.Second, deadline) && ctx.Err() != nil {
-			return coded("ERR_HEALTH_CHECK", t.Host(), "HEALTH", ctx.Err())
+		if !sleepBounded(hctx, time.Duration(interval)*time.Second, deadline) && hctx.Err() != nil {
+			break
 		}
+	}
+	if attempt == 0 {
+		lastDetail = "budget exhausted before first probe"
 	}
 	return coded("ERR_HEALTH_CHECK", t.Host(), "HEALTH",
 		fmt.Errorf("budget %ds exhausted after %d attempts; last: %s", budget, attempt, lastDetail))
@@ -86,10 +90,10 @@ func sleepBounded(ctx context.Context, d time.Duration, deadline time.Time) bool
 // past timeout_seconds.
 func probeOnce(ctx context.Context, t transport.Transport, hc *spec.HealthCheck, workDir string, env map[string]string, budget time.Duration) (bool, string) {
 	cmd := buildProbeCmd(t.OS(), hc, workDir, env)
-	// Cap the probe command's timeout to the remaining budget (rounded UP to
-	// whole seconds, floored at 1s so a probe always gets a chance), never
-	// exceeding the built-in default. Prevents a slow call from exceeding
-	// timeout_seconds.
+	// Cap the probe command's transport timeout to whole seconds of remaining
+	// budget. The hard bound is the caller's context deadline (hctx): even if
+	// this cap rounds up, the Exec is cancelled exactly at the deadline so a
+	// slow call can never complete past timeout_seconds.
 	capSec := int((budget + time.Second - 1) / time.Second)
 	if capSec < 1 {
 		capSec = 1

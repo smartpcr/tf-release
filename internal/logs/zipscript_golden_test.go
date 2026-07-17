@@ -54,13 +54,16 @@ func TestZipScriptGolden(t *testing.T) {
 	}
 }
 
-// TestZipScriptQuoting proves spec-controlled glob values are shell/PS quoted so
-// they cannot break out of the generated script (injection guard).
+// TestZipScriptQuoting proves the archive path is shell/PS quoted (injection
+// guard) and that Linux glob patterns are LEFT UNQUOTED so the shell can expand
+// their wildcards (a quoted glob would be treated literally and match nothing).
 func TestZipScriptQuoting(t *testing.T) {
-	evil := "/tmp/a'; rm -rf /; echo '"
-	lin := buildZipScript(spec.OSLinux, []string{evil}, "/tmp/x.tar.gz").Script
-	if !strings.Contains(lin, `'/tmp/a'\''; rm -rf /; echo '\'''`) {
-		t.Fatalf("linux glob not safely quoted: %s", lin)
+	lin := buildZipScript(spec.OSLinux, []string{"/var/log/*.log"}, "/tmp/x'y.tar.gz").Script
+	if !strings.Contains(lin, "for f in /var/log/*.log;") {
+		t.Fatalf("linux glob should be unquoted for expansion: %s", lin)
+	}
+	if !strings.Contains(lin, `tar czf '/tmp/x'\''y.tar.gz' -C "$tmp" .`) {
+		t.Fatalf("linux archive path not safely quoted: %s", lin)
 	}
 	win := buildZipScript(spec.OSWindows, []string{"C:\\a'b"}, "C:\\x.zip").Script
 	if !strings.Contains(win, `'C:\a''b'`) {

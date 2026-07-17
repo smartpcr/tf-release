@@ -572,8 +572,11 @@ func (h *HealthCheck) EffectiveType() string {
 
 func (h *HealthCheck) Budget() (initial, interval, timeout int) {
 	initial, interval, timeout = h.InitialDelaySeconds, h.IntervalSeconds, h.TimeoutSeconds
-	if initial <= 0 {
-		initial = 5
+	// initial_delay defaults to 0 (probe immediately, Kubernetes-style): a
+	// non-zero default could exceed a small timeout_seconds budget and starve
+	// the first probe. timeout_seconds is the real total-budget guardrail.
+	if initial < 0 {
+		initial = 0
 	}
 	if interval <= 0 {
 		interval = 5

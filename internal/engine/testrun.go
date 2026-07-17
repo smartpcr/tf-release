@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -141,15 +140,15 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 			resultGlobs = append(resultGlobs, p.Release+"/"+strings.TrimLeft(rp, "/"))
 		}
 	}
+	// CollectFiles now extracts the archive itself and returns the (flattened)
+	// result files; parse them from the directory they were extracted into.
 	files, warns := logs.CollectFiles(ctx, t, resultGlobs, filepath.Join(dest, "results"))
 	collectWarns = append(collectWarns, warns...)
 	localResults := filepath.Join(dest, "results", sanitizeHost(host))
 	if len(files) > 0 {
-		if err := unpackLocal(files[0], localResults); err != nil {
-			collectWarns = append(collectWarns, fmt.Sprintf("unpack results: %v", err))
-		}
+		localResults = filepath.Dir(files[0])
 	}
-	// 2. Extra log globs.
+	// 2. Extra log globs — CollectFiles extracts them into results_dir/logs/<host>/.
 	if len(tr.Collect.Logs) > 0 {
 		_, w := logs.CollectFiles(ctx, t, tr.Collect.Logs, filepath.Join(dest, "logs"))
 		collectWarns = append(collectWarns, w...)
@@ -223,26 +222,6 @@ func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started tim
 	}
 	b, _ := json.MarshalIndent(doc, "", "  ")
 	_ = os.WriteFile(filepath.Join(dest, "summary.json"), b, 0o644)
-}
-
-// unpackLocal expands the downloaded logs.zip/tar.gz into dir for parsing.
-func unpackLocal(archive, dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	if strings.HasSuffix(archive, ".zip") {
-		return runLocal("unzip", "-o", "-q", archive, "-d", dir)
-	}
-	return runLocal("tar", "xzf", archive, "-C", dir)
-}
-
-func runLocal(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %v: %v: %s", name, args, err, tail(string(out), 500))
-	}
-	return nil
 }
 
 // flatten strips directory components so globs match against the unpacked

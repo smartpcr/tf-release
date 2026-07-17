@@ -3,9 +3,13 @@
 package logs
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
 	"context"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,59 +20,141 @@ import (
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
-// CollectFiles zips remote glob matches and downloads to destDir/<host>/.
-// Best-effort: returns collected paths + warnings, never a hard failure.
+// CollectFiles zips remote glob matches, downloads the archive to destDir/<host>/,
+// and EXTRACTS it there so callers get ready-to-parse files (flattened to
+// basenames) — no external unzip/tar dependency. Best-effort: returns the
+// extracted file paths + warnings, never a hard failure.
 func CollectFiles(ctx context.Context, t transport.Transport, globs []string, destDir string) ([]string, []string) {
-	var out, warns []string
+	var warns []string
 	if len(globs) == 0 {
-		return out, warns
+		return nil, warns
 	}
 	hostDir := filepath.Join(destDir, sanitize(t.Host()))
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
-		return out, []string{fmt.Sprintf("mkdir %s: %v", hostDir, err)}
+		return nil, []string{fmt.Sprintf("mkdir %s: %v", hostDir, err)}
 	}
 	stamp := time.Now().UTC().Format("20060102T150405Z")
+
+	var remoteArchive, localArchive string
+	var rmCmd transport.Cmd
 	if t.OS() == spec.OSWindows {
-		remoteZip := fmt.Sprintf(`%s\labdeploy-logs-%s.zip`, `C:\Windows\Temp`, stamp)
-		cmd := buildZipScript(t.OS(), globs, remoteZip)
-		r, err := t.Exec(ctx, cmd)
-		if err != nil || r.ExitCode != 0 {
-			return out, []string{fmt.Sprintf("log zip on %s: err=%v %s", t.Host(), err, r.Stderr)}
-		}
-		if strings.Contains(r.Stdout, "NOFILES") {
-			return out, []string{fmt.Sprintf("no log files matched on %s: %v", t.Host(), globs)}
-		}
-		local := filepath.Join(hostDir, "logs.zip")
-		if err := t.Download(ctx, remoteZip, local); err != nil {
-			return out, []string{fmt.Sprintf("log download from %s: %v", t.Host(), err)}
-		}
-		_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell,
-			Script: fmt.Sprintf(`Remove-Item -Force -ErrorAction SilentlyContinue %s`, psq(remoteZip)), TimeoutSec: 30})
-		out = append(out, local)
-		return out, warns
+		remoteArchive = fmt.Sprintf(`%s\labdeploy-logs-%s.zip`, `C:\Windows\Temp`, stamp)
+		localArchive = filepath.Join(hostDir, "logs.zip")
+		rmCmd = transport.Cmd{Shell: transport.ShellPowerShell,
+			Script: fmt.Sprintf(`Remove-Item -Force -ErrorAction SilentlyContinue %s`, psq(remoteArchive)), TimeoutSec: 30}
+	} else {
+		remoteArchive = fmt.Sprintf("/tmp/labdeploy-logs-%s.tar.gz", stamp)
+		localArchive = filepath.Join(hostDir, "logs.tar.gz")
+		rmCmd = transport.Cmd{Shell: transport.ShellSh, Script: "rm -f " + shq(remoteArchive), TimeoutSec: 30}
 	}
-	remoteTar := fmt.Sprintf("/tmp/labdeploy-logs-%s.tar.gz", stamp)
-	cmd := buildZipScript(t.OS(), globs, remoteTar)
+
+	cmd := buildZipScript(t.OS(), globs, remoteArchive)
 	r, err := t.Exec(ctx, cmd)
 	if err != nil || r.ExitCode != 0 {
-		return out, []string{fmt.Sprintf("log tar on %s: err=%v %s", t.Host(), err, r.Stderr)}
+		return nil, []string{fmt.Sprintf("log archive on %s: err=%v %s", t.Host(), err, r.Stderr)}
 	}
 	if strings.Contains(r.Stdout, "NOFILES") {
-		return out, []string{fmt.Sprintf("no log files matched on %s: %v", t.Host(), globs)}
+		return nil, []string{fmt.Sprintf("no log files matched on %s: %v", t.Host(), globs)}
 	}
-	local := filepath.Join(hostDir, "logs.tar.gz")
-	if err := t.Download(ctx, remoteTar, local); err != nil {
-		return out, []string{fmt.Sprintf("log download from %s: %v", t.Host(), err)}
+	if err := t.Download(ctx, remoteArchive, localArchive); err != nil {
+		return nil, []string{fmt.Sprintf("log download from %s: %v", t.Host(), err)}
 	}
-	_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: "rm -f " + shq(remoteTar), TimeoutSec: 30})
-	return append(out, local), warns
+	_, _ = t.Exec(ctx, rmCmd)
+
+	extracted, err := extractArchive(localArchive, hostDir)
+	if err != nil {
+		return nil, []string{fmt.Sprintf("extract %s: %v", localArchive, err)}
+	}
+	_ = os.Remove(localArchive) // keep only the extracted files
+	return extracted, warns
+}
+
+// extractArchive unpacks a .zip or .tar.gz into destDir, FLATTENING every entry
+// to its basename (guards against Zip-Slip and guarantees the extracted layout
+// is discoverable by relative/basename result globs). Returns extracted paths.
+func extractArchive(archivePath, destDir string) ([]string, error) {
+	if strings.HasSuffix(strings.ToLower(archivePath), ".zip") {
+		return extractZip(archivePath, destDir)
+	}
+	return extractTarGz(archivePath, destDir)
+}
+
+func extractZip(archivePath, destDir string) ([]string, error) {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	var out []string
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return out, err
+		}
+		dst := filepath.Join(destDir, filepath.Base(f.Name))
+		if err := writeExtracted(dst, rc); err != nil {
+			rc.Close()
+			return out, err
+		}
+		rc.Close()
+		out = append(out, dst)
+	}
+	return out, nil
+}
+
+func extractTarGz(archivePath, destDir string) ([]string, error) {
+	fh, err := os.Open(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer fh.Close()
+	gz, err := gzip.NewReader(fh)
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	var out []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return out, err
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		dst := filepath.Join(destDir, filepath.Base(hdr.Name))
+		if err := writeExtracted(dst, tr); err != nil {
+			return out, err
+		}
+		out = append(out, dst)
+	}
+	return out, nil
+}
+
+func writeExtracted(dst string, src io.Reader) error {
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, src)
+	return err
 }
 
 // buildZipScript renders the glob-to-archive command executed ON THE TARGET
-// (DESIGN §8.5, T8 "glob→zip script golden"). Windows uses Compress-Archive
-// over Get-ChildItem matches; Linux uses tar over ls matches. Emits the sentinel
-// "NOFILES" (exit 0) when nothing matched. Pure function so it can be
-// golden-tested. globs and archive are quoted to prevent script breakage.
+// (DESIGN §8.5, T8 "glob→zip script golden"). Windows uses Compress-Archive over
+// Get-ChildItem matches (which flattens to basenames and expands wildcards even
+// from quoted -Path values). Linux copies each glob match into a temp dir and
+// tars THAT (flat, basename-only entries) so the extracted layout is
+// discoverable by relative/basename result globs. Emits the sentinel "NOFILES"
+// (exit 0) when nothing matched. Pure function so it can be golden-tested.
 func buildZipScript(os spec.OSKind, globs []string, archive string) transport.Cmd {
 	if os == spec.OSWindows {
 		items := make([]string, len(globs))
@@ -83,16 +169,22 @@ Compress-Archive -Path $paths -DestinationPath %s -Force
 Write-Output 'ZIPPED'
 exit 0`, strings.Join(items, ","), psq(archive))}
 	}
-	quoted := make([]string, len(globs))
-	for i, g := range globs {
-		quoted[i] = shq(g)
-	}
+	// Glob patterns are intentionally LEFT UNQUOTED so the shell expands the
+	// wildcards; matches are copied (flattened) into a temp dir which is then
+	// tarred, so the archive holds basename-only entries. The archive path and
+	// temp dir ARE quoted.
 	return transport.Cmd{Shell: transport.ShellSh, TimeoutSec: 300, Script: fmt.Sprintf(
 		`set +e
-files=$(ls -1 %s 2>/dev/null)
-[ -z "$files" ] && { echo NOFILES; exit 0; }
-tar czf %s $files
-echo ZIPPED`, strings.Join(quoted, " "), shq(archive))}
+tmp=$(mktemp -d) || exit 1
+n=0
+for f in %s; do
+  [ -f "$f" ] || continue
+  cp "$f" "$tmp"/ 2>/dev/null && n=$((n+1))
+done
+if [ "$n" = "0" ]; then rm -rf "$tmp"; echo NOFILES; exit 0; fi
+tar czf %s -C "$tmp" .
+rm -rf "$tmp"
+echo ZIPPED`, strings.Join(globs, " "), shq(archive))}
 }
 
 // CollectEventLogs exports matching Windows events since `since` as JSON lines

@@ -1,5 +1,11 @@
 set +e
-files=$(ls -1 '/var/log/app/*.log' '/opt/app/_results/*.xml' 2>/dev/null)
-[ -z "$files" ] && { echo NOFILES; exit 0; }
-tar czf '/tmp/labdeploy-logs.tar.gz' $files
+tmp=$(mktemp -d) || exit 1
+n=0
+for f in /var/log/app/*.log /opt/app/_results/*.xml; do
+  [ -f "$f" ] || continue
+  cp "$f" "$tmp"/ 2>/dev/null && n=$((n+1))
+done
+if [ "$n" = "0" ]; then rm -rf "$tmp"; echo NOFILES; exit 0; fi
+tar czf '/tmp/labdeploy-logs.tar.gz' -C "$tmp" .
+rm -rf "$tmp"
 echo ZIPPED
