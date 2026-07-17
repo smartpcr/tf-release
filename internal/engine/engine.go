@@ -258,9 +258,18 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 		}
 		sl.emit(ctx, "ROLLBACK", rbStart)
 		if len(cleanupErrs) > 0 {
-			return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-				fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; fresh-install cleanup error: %v",
-					host, orig, errors.Join(cleanupErrs...)))
+			// §10.6: persist a failed manifest recording the unknown state before
+			// surfacing ERR_ROLLBACK_FAILED. The fresh cleanup may have removed the
+			// manifest, so write one at the attempted (current) version recording
+			// last_operation.result=failed; a write failure is folded into the
+			// diagnostic so we never claim persistence that did not happen.
+			ferr := e.finalizeFailed(ctx, t, s, p, s.Artifact.Version, started, "failed")
+			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; fresh-install cleanup error: %v",
+				host, orig, errors.Join(cleanupErrs...))
+			if ferr != nil {
+				detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, ferr)
+			}
+			return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
 		}
 		return fmt.Errorf("%w; fresh install failed — target cleaned (no service, no junction, no manifest)", orig)
 	}
@@ -289,9 +298,12 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 	rerr := rb()
 	sl.emit(ctx, "ROLLBACK", rbStart)
 	if rerr != nil {
-		e.finalizeFailed(ctx, t, s, pp, prev, started, "failed")
-		return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; rollback error: %v", host, orig, rerr))
+		fmErr := e.finalizeFailed(ctx, t, s, pp, prev, started, "failed")
+		detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; rollback error: %v", host, orig, rerr)
+		if fmErr != nil {
+			detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
+		}
+		return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
 	}
 	// Restore succeeded: persist a manifest reflecting the previous version as the
 	// current state, INCLUDING its artifact checksum so the recorded manifest is
@@ -314,9 +326,9 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 }
 
 func (e *Engine) finalizeFailed(ctx context.Context, t transport.Transport, s *spec.Deployment,
-	p layout.Paths, current string, started time.Time, result string) {
+	p layout.Paths, current string, started time.Time, result string) error {
 	if current == "" {
-		return
+		return nil
 	}
 	m, _ := ReadManifest(ctx, t, p)
 	if m == nil {
@@ -325,7 +337,11 @@ func (e *Engine) finalizeFailed(ctx context.Context, t transport.Transport, s *s
 	}
 	m.LastOperation = LastOp{Type: "deploy", Result: result,
 		Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)}
-	_ = WriteManifest(ctx, t, p, m)
+	if err := WriteManifest(ctx, t, p, m); err != nil {
+		e.warnf("failed-manifest write on %s: %v", t.Host(), err)
+		return err
+	}
+	return nil
 }
 
 // deployDocker = D-steps (DESIGN §9.6) with image-id rollback. Emits the same
@@ -376,8 +392,13 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		}
 		sl.emit(ctx, "ROLLBACK", rbStart)
 		if rerr != nil {
-			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-				fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy: %v; rollback: %v", host, runErr, rerr))
+			// §10.6: persist a failed manifest before surfacing ERR_ROLLBACK_FAILED.
+			fmErr := e.dockerFinalizeFailed(ctx, t, s, p, prev, oldImage, started)
+			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy: %v; rollback: %v", host, runErr, rerr)
+			if fmErr != nil {
+				detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
+			}
+			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
 		}
 		return nil, fmt.Errorf("%w; rolled back to previous image %s", runErr, short(oldImage))
 	}
@@ -390,14 +411,44 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		LastOperation: LastOp{Type: "deploy", Result: "success",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
-	_ = sl.timed(ctx, "FINALIZE", func() error {
+	// A FINALIZE failure means the new container is running but its manifest was
+	// not persisted — the deploy is NOT durably recorded, so fail closed instead
+	// of reporting success (evaluator item 9).
+	if ferr := sl.timed(ctx, "FINALIZE", func() error {
 		if err := ensureDir(ctx, t, p.Root); err != nil {
 			return err
 		}
 		return WriteManifest(ctx, t, p, nm)
-	})
+	}); ferr != nil {
+		return nil, coded("ERR_CONNECT", host, "FINALIZE", ferr)
+	}
 	st, _ := dc.Status(ctx, t, rc)
 	return statusFrom(nm, host, st), nil
+}
+
+// dockerFinalizeFailed persists a failed manifest for the docker path (DESIGN
+// §10.6) recording last_operation.result=failed at the previous version/image.
+func (e *Engine) dockerFinalizeFailed(ctx context.Context, t transport.Transport, s *spec.Deployment,
+	p layout.Paths, prev, prevImage string, started time.Time) error {
+	if prev == "" {
+		return nil
+	}
+	m := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
+		CurrentVersion: prev, CurrentRelease: "docker://" + s.Pattern.ContainerName,
+		ProviderVersion: ProviderVersion,
+		Extra:           map[string]string{"image_id": prevImage},
+		LastOperation: LastOp{Type: "deploy", Result: "failed",
+			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
+	}
+	if err := ensureDir(ctx, t, p.Root); err != nil {
+		e.warnf("docker failed-manifest dir on %s: %v", t.Host(), err)
+		return err
+	}
+	if err := WriteManifest(ctx, t, p, m); err != nil {
+		e.warnf("docker failed-manifest write on %s: %v", t.Host(), err)
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +766,14 @@ func (e *Engine) fetchToStaging(ctx context.Context, t transport.Transport, s *s
 	f, err := artifact.Fetch(ctx, &s.Artifact)
 	if err != nil {
 		if ce, ok := err.(*artifact.CodedError); ok {
-			return coded(ce.Code, host, "FETCH", ce.Err)
+			// A checksum mismatch is a CHECKSUM-step failure even though it is
+			// detected during the runner-side fetch+verify (DESIGN §8.5: the
+			// diagnostic step must match the actual failing operation).
+			step := "FETCH"
+			if ce.Code == "ERR_CHECKSUM_MISMATCH" {
+				step = "CHECKSUM"
+			}
+			return coded(ce.Code, host, step, ce.Err)
 		}
 		return coded("ERR_ARTIFACT_FETCH", host, "FETCH", err)
 	}

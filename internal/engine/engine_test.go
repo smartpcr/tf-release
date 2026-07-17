@@ -44,7 +44,12 @@ func newFakeHost(name string) *fakeHost {
 
 func (f *fakeHost) mark(s string) { f.log = append(f.log, s) }
 
-func (f *fakeHost) Connect(ctx context.Context) error { return nil }
+func (f *fakeHost) Connect(ctx context.Context) error {
+	if f.fail["connect"] {
+		return fmt.Errorf("simulated connect failure")
+	}
+	return nil
+}
 func (f *fakeHost) Close() error                      { return nil }
 func (f *fakeHost) OS() spec.OSKind                   { return spec.OSWindows }
 func (f *fakeHost) Host() string                      { return f.host }
@@ -78,6 +83,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 	s := c.Script
 	switch {
 	case strings.Contains(s, "$PSVersionTable"): // preflight
+		if f.fail["preflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "preflight gate failed"}, nil
+		}
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
@@ -114,6 +122,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case reLock.MatchString(s): // AcquireLock atomic create (temp then Move publish)
+		if f.fail["lock"] {
+			return transport.Result{}, fmt.Errorf("simulated lock acquire transport failure")
+		}
 		p := reLock.FindStringSubmatch(s)[1]
 		if _, held := f.files[p]; held {
 			return transport.Result{ExitCode: 48}, nil // create-with-content: fail if exists
@@ -130,6 +141,11 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case reWrite.MatchString(s): // writeSmallFile
 		m := reWrite.FindStringSubmatch(s)
+		// RENDER failure is scoped to the rendered config file so it does not also
+		// break manifest writes (which also flow through writeSmallFile).
+		if f.fail["render"] && strings.Contains(m[1], "render.conf") {
+			return transport.Result{ExitCode: 1, Stderr: "render write failed"}, nil
+		}
 		raw, err := base64.StdEncoding.DecodeString(m[2])
 		if err != nil {
 			return transport.Result{ExitCode: 1, Stderr: "b64"}, nil
@@ -153,6 +169,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "New-Item -ItemType Directory"): // ensureLayout/ensureDir
+		if f.fail["stage"] {
+			return transport.Result{ExitCode: 1, Stderr: "mkdir failed"}, nil
+		}
 		return ok(""), nil
 
 	case reMklink.MatchString(s): // switchJunction
@@ -371,6 +390,15 @@ func winSvcSpecPostInstall(t *testing.T, url, checksum string) *spec.Deployment 
 	t.Helper()
 	d := winSvcSpec(t, url, checksum)
 	d.Pattern.PostInstall = "LDPOSTINSTALL"
+	return d
+}
+
+// winSvcSpecRender is winSvcSpec plus a rendered config file (render.conf) so the
+// RENDER step actually writes a file the fake transport can fail on demand.
+func winSvcSpecRender(t *testing.T, url, checksum string) *spec.Deployment {
+	t.Helper()
+	d := winSvcSpec(t, url, checksum)
+	d.Files = []spec.RenderedFile{{Path: "render.conf", Content: "x"}}
 	return d
 }
 
