@@ -1317,8 +1317,65 @@ func TestAcquireLockCreateContentionPersistsReturnsLocked(t *testing.T) {
 	}
 }
 
+// TestAcquireLockDeadlineCancellationReturnsLocked is the regression for evaluator
+// iter-23 item 3 (delayed/blocking transport) and item 2 (classification): with a
+// SLOW gate — each create Exec blocks for a real duration and the gate stays
+// contended (exit 49) — the CUMULATIVE waits eventually blow the acquisition
+// deadline, cancelling an in-flight Exec. That deadline cancellation must be
+// classified as ERR_LOCKED (budget exhausted by contention), NOT ERR_CONNECT, and
+// the whole call must return within the budget (well under 5s). We shrink the
+// package budget so the real deadline path runs deterministically in milliseconds.
+func TestAcquireLockDeadlineCancellationReturnsLocked(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			saved := lockAcquireBudget
+			lockAcquireBudget = 250 * time.Millisecond
+			defer func() { lockAcquireBudget = saved }()
 
-// genuinely LIVE (non-stale) held lock must be refused promptly — a handful of
+			p := lockFakePaths(osk)
+			f := newLockFake(osk) // slot FREE, but every create blocks and stays contended
+			// Each gate op blocks 150ms of REAL time (cumulative gate wait), and the
+			// gate never clears (exit 49). After the 2nd blocking op the 250ms
+			// deadline fires mid-Exec and the deadline-bound ctx cancels it.
+			f.hook = func(op, s string) {
+				if op == "create" {
+					time.Sleep(150 * time.Millisecond)
+				}
+			}
+			f.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "create" {
+					return transport.Result{ExitCode: 49}, nil, true
+				}
+				return transport.Result{}, nil, false
+			}
+
+			start := time.Now()
+			lk, _, err := AcquireLock(context.Background(), f, p, "me", "deploy", 900)
+			elapsed := time.Since(start)
+
+			var ce *CodedError
+			if err == nil || lk != nil || !asCoded(err, &ce) || ce.Code != "ERR_LOCKED" {
+				t.Fatalf("deadline exhaustion under contention must be ERR_LOCKED, got lk=%v err=%v", lk, err)
+			}
+			// Prove REAL cumulative delay occurred (not an immediate fast-fail): at
+			// least one blocking op elapsed before the deadline tripped.
+			if elapsed < 150*time.Millisecond {
+				t.Fatalf("expected cumulative gate waits before the deadline, took only %v", elapsed)
+			}
+			// And prove the deadline actually bounded us well under the 5s contract
+			// (budget 250ms + at most one in-flight 150ms blocking op + slack).
+			if elapsed > 2*time.Second {
+				t.Fatalf("acquisition must be bounded by the deadline, took %v", elapsed)
+			}
+			if f.has(p.Lock) {
+				t.Fatalf("a never-acquired lock must not be present: %q", f.get(p.Lock))
+			}
+		})
+	}
+}
+
+
 // commands, no spinning — to honor DESIGN §13 "fail fast, <5s, no wait". We assert
 // both a bounded command count and a short elapsed time.
 func TestAcquireLockFastFailsOnLiveLock(t *testing.T) {

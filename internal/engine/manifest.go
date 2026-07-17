@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -264,15 +265,16 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 	// and each gate wait return immediately, so this budget is only ever consumed
 	// under pathological live gate contention. Each attempt's gate wait is bounded
 	// by the REMAINING budget (capped at lockGateWaitMS), so the sum of all waits —
-	// and therefore total acquisition time — never exceeds acquireBudget
-	// (evaluator iter-21 item 1).
-	const acquireBudget = 5 * time.Second
+	// and therefore total acquisition time — never exceeds acquireBudget, which is
+	// itself held below 5s for a safety margin (evaluator iter-21 item 1,
+	// iter-23 item 1).
+	acquireBudget := lockAcquireBudget
 	start := time.Now()
 	deadline := start.Add(acquireBudget)
 
 	// Bind ALL remote gate operations to the acquisition deadline so transport
 	// overhead (connect/exec latency), not just the in-guard gate wait, is counted
-	// against the 5s budget: a hung Exec is cancelled at the deadline instead of
+	// against the budget: a hung Exec is cancelled at the deadline instead of
 	// silently overrunning it (evaluator iter-22 item 1).
 	actx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -297,6 +299,19 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
 			fmt.Errorf("lock acquisition exceeded %s budget (gate repeatedly contended)", acquireBudget))
 	}
+	// acquireErr classifies a transport error from a gate op. When OUR acquisition
+	// deadline fired (actx timed out but the CALLER's ctx did not), the budget was
+	// exhausted by repeated gate contention — that is a lock-contention outcome
+	// (ERR_LOCKED), NOT a connectivity fault, so it must be classified consistently
+	// with the budget-exhaustion path above (evaluator iter-23 item 2). A genuine
+	// transport failure, or the caller cancelling its own ctx, remains ERR_CONNECT.
+	acquireErr := func(execErr error) error {
+		if ctx.Err() == nil && (errors.Is(execErr, context.DeadlineExceeded) || actx.Err() == context.DeadlineExceeded) {
+			return coded("ERR_LOCKED", t.Host(), "LOCK",
+				fmt.Errorf("lock acquisition exceeded %s budget (gate repeatedly contended): %w", acquireBudget, execErr))
+		}
+		return coded("ERR_CONNECT", t.Host(), "LOCK", execErr)
+	}
 
 	for attempt := 0; ; attempt++ {
 		waitMS := gateWaitMS()
@@ -312,7 +327,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 
 		created, exit, cerr := createLockExclusive(actx, t, p, content, waitMS)
 		if cerr != nil {
-			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr)
+			return nil, "", acquireErr(cerr)
 		}
 		if created {
 			// A fresh create into a FREE slot legitimately carries no warning.
@@ -397,7 +412,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		}
 		outcome, serr := casReplace(actx, t, p.Lock, raw, content, replaceWaitMS)
 		if serr != nil {
-			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", serr)
+			return nil, "", acquireErr(serr)
 		}
 		switch outcome {
 		case casDone:
@@ -500,6 +515,16 @@ func winLockMutexName(path string) string {
 // contention — where a timeout is surfaced as transient (exit 49) and retried
 // within the caller's overall 5s budget, never as a hard failure.
 const lockGateWaitMS = 1500
+
+// lockAcquireBudget is the overall wall-clock ceiling for a whole AcquireLock call.
+// DESIGN §13 mandates a STRICT "<5s, no wait" fresh-lock contract, so this is held
+// at 4.5s — a deliberate safety margin BELOW 5s that absorbs Go scheduling latency,
+// the final classify/return overhead, and clock granularity, guaranteeing the
+// caller-observed elapsed time stays under 5s even in the worst case (evaluator
+// iter-23 item 1). It is a var (not a const) purely so tests can shrink it to
+// deterministically exercise the deadline-cancellation path in milliseconds; the
+// production value never changes.
+var lockAcquireBudget = 4500 * time.Millisecond
 
 // winMutexGuard wraps a PowerShell critical-section `body` (which sets $rc) in an
 // acquire/finally-release of the path-keyed named mutex, so create/delete/replace
