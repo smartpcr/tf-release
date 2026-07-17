@@ -72,7 +72,7 @@ func readSmallFile(ctx context.Context, t transport.Transport, path string) (str
 		}
 		return string(raw), true, nil
 	}
-	script := fmt.Sprintf(`[ -f '%s' ] || exit 3; base64 < '%s'`, path, path)
+	script := fmt.Sprintf(`[ -f %s ] || exit 3; base64 < %s`, shq(path), shq(path))
 	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	if err != nil {
 		return "", false, err
@@ -110,7 +110,7 @@ func writeSmallFile(ctx context.Context, t transport.Transport, path, content st
 		}
 		return nil
 	}
-	script := fmt.Sprintf(`printf '%%s' '%s' | base64 -d > '%s'`, b64, path)
+	script := fmt.Sprintf(`printf '%%s' '%s' | base64 -d > %s`, b64, shq(path))
 	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	if err != nil {
 		return err
@@ -161,7 +161,7 @@ try { $fs=[IO.File]::Open(%s,'CreateNew'); $b=[Convert]::FromBase64String(%s); $
 catch [System.IO.IOException] { exit 48 }`, psq(p.Root), psq(p.Lock), psq(b64))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
 	} else {
-		script := fmt.Sprintf(`mkdir -p '%s'; (set -C; printf '%%s' '%s' | base64 -d > '%s') 2>/dev/null || exit 48`, p.Root, b64, p.Lock)
+		script := fmt.Sprintf(`mkdir -p %s; (set -C; printf '%%s' '%s' | base64 -d > %s) 2>/dev/null || exit 48`, shq(p.Root), b64, shq(p.Lock))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {
@@ -200,7 +200,7 @@ func ReleaseLock(ctx context.Context, t transport.Transport, p layout.Paths) {
 		return
 	}
 	_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh,
-		Script: fmt.Sprintf(`rm -f '%s'`, p.Lock), TimeoutSec: 30})
+		Script: fmt.Sprintf(`rm -f %s`, shq(p.Lock)), TimeoutSec: 30})
 }
 
 func psq(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
