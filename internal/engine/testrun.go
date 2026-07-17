@@ -125,6 +125,12 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 			return nil, coded("ERR_CONNECT", host, "STAGE", merr)
 		}
 	}
+	// Staging is complete: the release is now fully extracted and marked. Clear
+	// the cleanup guard so a LATER failure (test execution, result collection, or
+	// result parsing) does NOT delete a good release or its collected `_results`
+	// — the incomplete-release cleanup is strictly a pre-execution/staging-only
+	// failure remedy (DESIGN §10.2).
+	createdRelease = false
 
 	env := layout.MergeEnv(layout.BuiltinEnv(tr.Metadata.Name, tr.Artifact.Version, p, 0), tr.Runner.Env)
 	cmdline := runnerCommand(tr)

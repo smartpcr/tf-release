@@ -147,6 +147,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("HEALTH")
 		return ok(""), nil
 
+	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
+		return transport.Result{}, fmt.Errorf("runner transport blew up")
+
 	case strings.Contains(s, "LDPOSTINSTALL"): // post_install hook
 		if f.fail["postinstall"] {
 			return transport.Result{ExitCode: 9, Stderr: "hook failed"}, nil
@@ -871,6 +874,88 @@ func TestMalformedMarkerReFetches(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(f2.log, ">"), "EXTRACT") {
 		t.Fatalf("incomplete marker (no extracted_at) must force re-extract; log=%v", f2.log)
+	}
+}
+
+// e2eTestRunSpec is a minimal TestRun whose exec runner command is the sentinel
+// LDRUNNERFAIL the fake transport fails post-staging.
+func e2eTestRunSpec(t *testing.T, url, checksum string) *spec.TestRun {
+	t.Helper()
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	y := fmt.Sprintf(`
+apiVersion: labdeploy/v1
+kind: TestRun
+metadata: { name: sample-svc-e2e }
+target:
+  transport: winrm
+  hosts: ["lab-01"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "%s"
+  source: { type: http, url: "%s" }
+runner:
+  type: exec
+  command: LDRUNNERFAIL
+  timeout_seconds: 60
+results: { format: none }
+pass_criteria: { exit_codes: [0] }
+`, checksum, url)
+	tr, _, err := spec.ParseTestRun(y, nil)
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	return tr
+}
+
+// TestRunPostStagingFailureKeepsRelease covers evaluator (iter 5) item 1: once
+// staging completes the release is fully extracted, so a LATER failure (here the
+// test-execution transport error) must NOT delete the good release — the
+// incomplete-release cleanup is strictly a pre-execution/staging remedy.
+func TestRunPostStagingFailureKeepsRelease(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("test zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	_, err := eng.RunTest(context.Background(), e2eTestRunSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("expected runner execution failure")
+	}
+	// Staging happened (fresh extract) ...
+	joined := strings.Join(f.log, ">")
+	if !strings.Contains(joined, "EXTRACT") {
+		t.Fatalf("test release should have been extracted; log=%v", f.log)
+	}
+	// ... but the fully-extracted release must survive the post-staging failure.
+	release := `C:\deploy\sample-svc-e2e-tests\releases\1.0.0`
+	if strings.Contains(joined, "RM "+release) {
+		t.Fatalf("post-staging failure must NOT delete the extracted release; log=%v", f.log)
+	}
+	// The cleanup-failure marker must also be absent from the error.
+	if strings.Contains(err.Error(), "incomplete-release cleanup") {
+		t.Fatalf("no incomplete-release cleanup should run post-staging; got: %v", err)
+	}
+}
+
+// TestRunStagingFailureRemovesRelease is the counterpart: a PRE-execution failure
+// (extract) on a freshly-created test release DOES remove the partial release.
+func TestRunStagingFailureRemovesRelease(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("test zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["extract"] = true
+	eng := engineWith(f)
+
+	_, err := eng.RunTest(context.Background(), e2eTestRunSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("expected extract failure")
+	}
+	release := `C:\deploy\sample-svc-e2e-tests\releases\1.0.0`
+	if !strings.Contains(strings.Join(f.log, ">"), "RM "+release) {
+		t.Fatalf("pre-execution staging failure must remove the partial release; log=%v", f.log)
 	}
 }
 
