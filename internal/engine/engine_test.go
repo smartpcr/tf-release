@@ -54,11 +54,12 @@ var reRmOne = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContin
 var reMklink = regexp.MustCompile(`mklink /J "([^"]+)" "([^"]+)"`)
 var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 
-// reCasOpen captures the exclusive-handle open used by casDelete (FileShare::Delete).
-// The single command holds the OS handle for its whole lifetime and atomically
-// compares-then-deletes, so no persistent gate is needed and nothing can be
-// stranded on crash.
-var reCasOpen = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open,\[IO\.FileAccess\]::ReadWrite,\[IO\.FileShare\]::Delete\)`)
+// reCasDel captures the compare-and-delete used by casDelete. Under the shared
+// path-keyed mutex it reads the current bytes and removes the file only when they
+// match this owner's content, so no persistent gate is needed and nothing can be
+// stranded on crash. Keyed on the [IO.File]::Delete call (checked before reRead,
+// which the same script also contains via ReadAllBytes).
+var reCasDel = regexp.MustCompile(`\[IO\.File\]::Delete\('([^']+)'\)`)
 var reCurEq = regexp.MustCompile(`\$cur -eq '([^']*)'`)
 
 // reCasReplace captures the atomic crash-safe compare-and-replace used by
@@ -95,8 +96,8 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("LOCK")
 		return ok(""), nil
 
-	case reCasOpen.MatchString(s): // casDelete exclusive-handle compare-and-delete
-		m := reCasOpen.FindStringSubmatch(s)
+	case reCasDel.MatchString(s): // casDelete compare-and-delete (shared mutex)
+		m := reCasDel.FindStringSubmatch(s)
 		path := m[1]
 		cur, exists := f.files[path]
 		if !exists {

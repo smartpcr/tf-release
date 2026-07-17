@@ -929,7 +929,116 @@ func TestWindowsTakeoverScriptIsCrashSafe(t *testing.T) {
 }
 
 
-// TestLateNewcomerDuringTakeoverStillWarns is the DISTINCT interleaving demanded
+// TestTakeoverReplaceCannotDualOwn is the DIRECT regression for evaluator iter-20
+// item 1: the exact interleaving where, while a stale-takeover replace is between
+// reading the stale bytes and committing its atomic swap, the OLD owner deletes the
+// stale lock AND a NEWCOMER creates a fresh lock into the slot. If create/delete did
+// not share the takeover's mutex, the replace would clobber the newcomer's fresh
+// lock and BOTH the newcomer and the taker would believe they own it. Here the fake
+// models the SHARED per-path mutex (as the production code now does: create,
+// casdelete, and casreplace all take the Windows Global\ mutex / POSIX
+// parent-directory flock), so the old owner's release and the newcomer's create are
+// injected DURING the taker's in-flight replace (via replaceMid) and are serialized
+// behind it. The result is exactly one owner: the taker wins WITH the stale WARN,
+// the newcomer is refused ERR_LOCKED against the taker's fresh lock, and the old
+// owner's release is a safe no-op. Deterministic (owner-pinned channel
+// rendezvous), no timing sleeps.
+func TestTakeoverReplaceCannotDualOwn(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			pp := lockFakePaths(osk)
+			aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+			stale := `{"owner":"dead","op":"deploy","started_utc":"` + aged + `","token":"stale"}`
+			f := newLockFake(osk)
+			f.set(pp.Lock, stale)
+
+			paused := make(chan struct{})
+			resume := make(chan struct{})
+			f.replaceMid = func(path string) {
+				close(paused) // taker has read+matched the stale bytes, holds the mutex
+				<-resume      // stay mid-replace until the racers are in flight
+			}
+
+			// Count the racers' first Exec (create for the newcomer, casdelete for
+			// the old owner) so we release the taker ONLY once both are contending
+			// the shared mutex — a deterministic rendezvous, not a sleep.
+			armed := make(chan struct{})
+			delSeen := make(chan struct{})
+			createSeen := make(chan struct{})
+			var delOnce, createOnce sync.Once
+			f.hook = func(op, s string) {
+				select {
+				case <-armed:
+				default:
+					return
+				}
+				switch op {
+				case "casdelete":
+					delOnce.Do(func() { close(delSeen) })
+				case "create":
+					createOnce.Do(func() { close(createSeen) })
+				}
+			}
+
+			type ares struct {
+				lk   *Lock
+				warn string
+				err  error
+			}
+			takerCh := make(chan ares, 1)
+			go func() {
+				lk, warn, err := AcquireLock(context.Background(), f, pp, "taker", "deploy", 900)
+				takerCh <- ares{lk, warn, err}
+			}()
+
+			<-paused // taker is between its read and its atomic swap, holding the mutex
+			close(armed)
+
+			oldOwnerErr := make(chan error, 1)
+			go func() {
+				oldOwnerErr <- ReleaseLock(context.Background(),
+					&Lock{t: f, paths: pp, content: stale, token: "stale"})
+			}()
+			newcomerCh := make(chan ares, 1)
+			go func() {
+				lk, warn, err := AcquireLock(context.Background(), f, pp, "newcomer", "deploy", 900)
+				newcomerCh <- ares{lk, warn, err}
+			}()
+
+			<-delSeen    // old owner's compare-and-delete is contending the mutex
+			<-createSeen // newcomer's create is contending the mutex
+			close(resume) // let the taker commit its swap and release the mutex
+
+			taker := <-takerCh
+			newcomer := <-newcomerCh
+			oldErr := <-oldOwnerErr
+
+			// The taker wins WITH the stale WARN and installs its bytes.
+			if taker.err != nil || taker.lk == nil {
+				t.Fatalf("taker must win the stale takeover: lk=%v err=%v", taker.lk, taker.err)
+			}
+			if !strings.Contains(taker.warn, "stale") || !strings.Contains(taker.warn, "dead") {
+				t.Fatalf("taker dropped the stale WARN: %q", taker.warn)
+			}
+			// The newcomer is refused — NOT granted a second, dual ownership.
+			var ce *CodedError
+			if newcomer.err == nil || newcomer.lk != nil || !asCoded(newcomer.err, &ce) || ce.Code != "ERR_LOCKED" {
+				t.Fatalf("newcomer must be refused ERR_LOCKED (no dual ownership): lk=%v err=%v",
+					newcomer.lk, newcomer.err)
+			}
+			// The old owner's release never removed the taker's fresh lock.
+			if oldErr != nil {
+				t.Fatalf("stale old-owner release should be a safe no-op: %v", oldErr)
+			}
+			if !strings.Contains(f.get(pp.Lock), `"owner":"taker"`) {
+				t.Fatalf("canonical lock is not solely the taker's: %q", f.get(pp.Lock))
+			}
+		})
+	}
+}
+
+
 // by evaluator item 1: a late newcomer B that races a takeover must NOT be able to
 // acquire warning-less through a gap. We deterministically pin contender A at the
 // moment it is about to run its compare-and-replace (identified by the owner in
@@ -1364,6 +1473,19 @@ type lockFake struct {
 	// replace: the private temp is fully written but the swap never commits, so
 	// the canonical lock keeps its intact prior bytes (crash-safety, iter-19 item 1).
 	crashReplace bool
+	// pathMu models the SHARED per-path OS mutex (Windows Global\ named mutex /
+	// POSIX parent-directory flock) that create, casdelete, AND casreplace all take
+	// in the real transport. Modeling it here — rather than serializing every Exec
+	// under f.mu — is what lets a test inject a delete + newcomer-create BETWEEN a
+	// casReplace's read and its swap and observe that they BLOCK on the shared mutex
+	// until the replace commits, so no dual ownership can occur (evaluator iter-20
+	// items 1 & 2).
+	pathMu map[string]*sync.Mutex
+	// replaceMid, if set, is invoked by casreplace AFTER it reads+matches the stale
+	// bytes but BEFORE it commits the swap, while the shared path mutex is HELD (and
+	// f.mu is NOT), so the callback can launch concurrent create/delete goroutines
+	// and prove they are serialized behind the in-flight replace.
+	replaceMid func(path string)
 }
 
 func newLockFake(osk spec.OSKind) *lockFake {
@@ -1410,11 +1532,13 @@ var (
 	lfNewB64Sh  = regexp.MustCompile(`printf '%s' '([^']*)'`)
 	lfDelWin    = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
 	lfDelSh     = regexp.MustCompile(`rm -f '([^']+)'`)
-	// CAS primitive (single exclusive-handle compare-and-delete).
-	lfCasOpenWin = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open`)
-	lfCurEqWin   = regexp.MustCompile(`\$cur -eq '([^']*)'`)
-	lfCasPathSh  = regexp.MustCompile(`exec 9<'([^']+)'`)
-	lfCurNeSh    = regexp.MustCompile(`\[ "\$cur" != '([^']*)' \]`)
+	// CAS compare-and-delete: keyed on [IO.File]::Delete (Windows) / the
+	// dir-flock body (POSIX). The Windows read is now ReadAllBytes under the shared
+	// mutex; the lock path is recovered from the Delete call, the POSIX path from
+	// the `base64 < 'path'` read (lfReadSh).
+	lfCasDelWin = regexp.MustCompile(`\[IO\.File\]::Delete\('([^']+)'\)`)
+	lfCurEqWin  = regexp.MustCompile(`\$cur -eq '([^']*)'`)
+	lfCurNeSh   = regexp.MustCompile(`\[ "\$cur" != '([^']*)' \]`)
 	// CAS compare-and-REPLACE (atomic crash-safe stale takeover).
 	lfCasReplaceWin = regexp.MustCompile(`\[IO\.File\]::Replace\(\$tmp,'([^']+)',`)
 	lfCurNeWin      = regexp.MustCompile(`\$cur -ne '([^']*)'`)
@@ -1438,10 +1562,10 @@ func firstGroup(re *regexp.Regexp, s string) (string, bool) {
 func (f *lockFake) classify(s string) string {
 	switch {
 	case strings.Contains(s, "[IO.File]::Replace(") ||
-		(strings.Contains(s, "flock -n 9") && strings.Contains(s, `mv -f "$tmp"`)):
+		strings.Contains(s, `mv -f "$tmp"`):
 		return "casreplace"
 	case strings.Contains(s, "[IO.File]::Delete(") ||
-		(strings.Contains(s, "flock -n 9") && strings.Contains(s, "rm -f '")):
+		(strings.Contains(s, "flock") && strings.Contains(s, "rm -f '")):
 		return "casdelete"
 	case strings.Contains(s, "ReadAllBytes(") || strings.Contains(s, "base64 < '"):
 		return "read"
@@ -1466,6 +1590,20 @@ func (f *lockFake) classify(s string) string {
 // so two contenders can never both win and no late newcomer can slip into a gap
 // and acquire warning-less. It HONORS context cancellation (a canceled ctx fails
 // the op) so tests can prove cleanup uses a cancellation-detached context.
+func (f *lockFake) pathMutex(path string) *sync.Mutex {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pathMu == nil {
+		f.pathMu = map[string]*sync.Mutex{}
+	}
+	m, ok := f.pathMu[path]
+	if !ok {
+		m = &sync.Mutex{}
+		f.pathMu[path] = m
+	}
+	return m
+}
+
 func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
 	win := f.osk == spec.OSWindows
@@ -1477,11 +1615,12 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return transport.Result{}, err // canceled/timed-out ctx fails the op
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.execN++
+	ff := f.failOn
+	f.mu.Unlock()
 
-	if f.failOn != nil {
-		if r, err, hit := f.failOn(op, s); hit {
+	if ff != nil {
+		if r, err, hit := ff(op, s); hit {
 			return r, err
 		}
 	}
@@ -1494,7 +1633,9 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		} else {
 			path, _ = firstGroup(lfReadSh, s)
 		}
+		f.mu.Lock()
 		content, ok := f.files[path]
+		f.mu.Unlock()
 		if !ok {
 			return transport.Result{ExitCode: 3}, nil
 		}
@@ -1509,6 +1650,13 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 			path, _ = firstGroup(lfCreateSh, s)
 			newB64, _ = firstGroup(lfNewB64Sh, s)
 		}
+		// create shares the per-path mutex, so it cannot slip a fresh lock into a
+		// slot a stale-takeover replace is mid-swapping (evaluator iter-20 item 1).
+		pm := f.pathMutex(path)
+		pm.Lock()
+		defer pm.Unlock()
+		f.mu.Lock()
+		defer f.mu.Unlock()
 		if _, held := f.files[path]; held {
 			return transport.Result{ExitCode: 48}, nil
 		}
@@ -1526,7 +1674,9 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 			newB64, _ = firstGroup(lfNewB64Sh, s)
 		}
 		raw, _ := base64.StdEncoding.DecodeString(newB64)
+		f.mu.Lock()
 		f.files[path] = string(raw)
+		f.mu.Unlock()
 		return transport.Result{ExitCode: 0}, nil
 
 	case "casreplace": // atomic crash-safe compare-and-replace (stale takeover)
@@ -1536,16 +1686,31 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 			expB64, _ = firstGroup(lfCurNeWin, s)
 			newB64, _ = firstGroup(lfNewB64Win, s)
 		} else {
-			path, _ = firstGroup(lfCasPathSh, s)
+			path, _ = firstGroup(lfReadSh, s)
 			expB64, _ = firstGroup(lfCurNeSh, s)
 			newB64, _ = firstGroup(lfNewB64Sh, s)
 		}
+		// The whole read-compare-then-swap runs under the SHARED path mutex, so a
+		// concurrent casdelete or create BLOCKS until we finish — it can neither
+		// remove the bytes we matched nor publish a fresh lock we would clobber
+		// (evaluator iter-20 items 1 & 2).
+		pm := f.pathMutex(path)
+		pm.Lock()
+		defer pm.Unlock()
+		f.mu.Lock()
 		cur, ok := f.files[path]
+		f.mu.Unlock()
 		if !ok {
 			return transport.Result{ExitCode: 48}, nil // slot vanished (released)
 		}
 		if b64(cur) != expB64 {
 			return transport.Result{ExitCode: 10}, nil // a fresh successor already installed
+		}
+		// Interleave window: the mutex is HELD (f.mu is not). A test's replaceMid
+		// can launch concurrent delete/create here and prove they serialize behind
+		// this in-flight swap rather than racing it.
+		if f.replaceMid != nil {
+			f.replaceMid(path)
 		}
 		raw, _ := base64.StdEncoding.DecodeString(newB64)
 		if f.crashReplace {
@@ -1554,21 +1719,30 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 			// [IO.File]::Replace/mv swap commits. The canonical lock is therefore
 			// left UNTOUCHED (the intact stale bytes) — never truncated/partial —
 			// which is exactly the crash-safety contract (evaluator iter-19 item 1).
+			f.mu.Lock()
 			f.files[path+".mx.crash"] = string(raw) // orphan temp, never the .lock
+			f.mu.Unlock()
 			return transport.Result{}, fmt.Errorf("crash before atomic replace commit")
 		}
+		f.mu.Lock()
 		f.files[path] = string(raw) // atomic swap: stale bytes -> successor, never partial
+		f.mu.Unlock()
 		return transport.Result{ExitCode: 0}, nil
 
-	case "casdelete": // single exclusive-handle compare-and-delete of a HELD lock
+	case "casdelete": // compare-and-delete of a HELD lock (shared path mutex)
 		var path, expB64 string
 		if win {
-			path, _ = firstGroup(lfCasOpenWin, s)
+			path, _ = firstGroup(lfCasDelWin, s)
 			expB64, _ = firstGroup(lfCurEqWin, s)
 		} else {
-			path, _ = firstGroup(lfCasPathSh, s)
+			path, _ = firstGroup(lfReadSh, s)
 			expB64, _ = firstGroup(lfCurNeSh, s)
 		}
+		pm := f.pathMutex(path)
+		pm.Lock()
+		defer pm.Unlock()
+		f.mu.Lock()
+		defer f.mu.Unlock()
 		cur, ok := f.files[path]
 		if !ok {
 			return transport.Result{ExitCode: 48}, nil // already gone / peer-locked
@@ -1586,7 +1760,9 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		} else {
 			path, _ = firstGroup(lfDelSh, s)
 		}
+		f.mu.Lock()
 		delete(f.files, path)
+		f.mu.Unlock()
 		return transport.Result{ExitCode: 0}, nil
 	}
 	return transport.Result{ExitCode: 0}, nil

@@ -222,20 +222,19 @@ func newToken() string {
 // on a pathname" is fundamentally unfixable.
 //
 // This design removes the gate. Ownership-safe release runs as a SINGLE remote
-// command that holds an EXCLUSIVE OS file handle for the command's entire
-// lifetime and performs a compare-and-delete atomically before releasing the
-// handle. Stale takeover never mutates `.lock` in place: it is an atomic
-// compare-and-delete of the exact stale bytes followed by a fresh atomic create
-// (temp + publish), so an interruption leaves the slot intact-stale or absent,
-// never mixed/partial. The handle is a true process-lifetime primitive: the OS
-// drops it when the command process exits — normally OR on crash/kill — so
-// nothing can be stranded and no separate recovery path (with its unavoidable
-// TOCTOU) is ever needed. Windows uses `[IO.File]::Open(..., FileShare.Delete)`
-// for delete and an atomic `Move` for create; POSIX uses `flock -n` on the lock
-// fd for delete and an atomic hard-link `ln` for create. Concurrent mutators
-// serialize on the handle / atomic publish, so exactly one can win — the
-// canonical `.lock` is never emptied mid-takeover and two operations can never
-// both believe they own it.
+// command that, under the SHARED per-path mutex, performs a compare-and-delete
+// atomically. Stale takeover never mutates `.lock` in place: it is an atomic
+// compare-and-REPLACE of the exact stale bytes (temp + atomic swap), so an
+// interruption leaves the slot intact-stale or intact-successor, never
+// mixed/partial. Create, compare-and-delete, and compare-and-replace ALL take one
+// path-keyed OS mutex — a Windows `Global\` named mutex (auto-released when the
+// process exits, normally OR on crash/kill, so nothing is stranded and no separate
+// recovery path with its unavoidable TOCTOU is needed) and, on POSIX, a blocking
+// `flock` on the lock's parent DIRECTORY (a stable inode, unlike the lock file
+// itself which a delete unlinks). Because every mutator serializes on that one
+// mutex, a release/create can never interleave inside a takeover's compare-then-
+// swap: exactly one operation wins, the canonical `.lock` is never emptied
+// mid-takeover, and two operations can never both believe they own it.
 
 // AcquireLock takes the target lock with atomic create-new semantics
 // (DESIGN §13). exit 48 ⇒ held. A held lock is inspected: unparseable/empty
@@ -413,46 +412,88 @@ func classifyCas(op, path string, r transport.Result) (casOutcome, error) {
 	}
 }
 
-// casDelete performs an atomic compare-and-delete on a HELD `.lock`: in a SINGLE
-// remote command it opens the file with an EXCLUSIVE OS handle and removes it
-// ONLY if the current bytes equal `expect` (this handle's owned content). A
-// successor that legitimately took over after our timeout has DIFFERENT bytes, so
-// its lock is never removed. The outcomes: casDone (deleted),
-// casMismatch (not ours — safe no-op), casAbsent (already gone), casContended (a
-// peer holds the handle right now — the caller RETRIES so it never returns
-// success while OUR lock is still present, evaluator item 2); any other exit
-// (removal failed, permission, missing flock) is a Go error. The removal is
-// classified AT THE DELETE CALL (a failed Delete/`rm -f` ⇒ exit 17), with NO
-// post-delete existence probe: probing after a successful delete could observe a
-// concurrent acquirer's fresh recreate and spuriously report exit 17 instead of a
-// clean success (evaluator item 2).
+// winLockMutexName returns the process-global, path-keyed named mutex that
+// serializes EVERY mutation of a given lock path — create-new, compare-and-delete,
+// AND compare-and-replace — so each operation's "inspect current bytes then
+// mutate" critical section is mutually exclusive against ALL the others across
+// processes. Without one shared mutex, a stale-takeover replace could read the
+// stale bytes, then a concurrent release could delete them and a newcomer create a
+// fresh lock into the freed slot, after which the replace's atomic swap would
+// clobber the newcomer's lock — leaving BOTH the newcomer and the taker believing
+// they own it (evaluator iter-20 item 1). Mutex names cannot contain a path
+// separator (except the leading Global\), so the path is hashed. One mutex ⇔ one
+// lock file.
+func winLockMutexName(path string) string {
+	sum := sha1.Sum([]byte(path))
+	return `Global\labdeploy-lock-` + hex.EncodeToString(sum[:])
+}
+
+// winMutexGuard wraps a PowerShell critical-section `body` (which sets $rc) in an
+// acquire/finally-release of the path-keyed named mutex, so create/delete/replace
+// all share ONE cross-process gate. A crashed holder abandons the mutex (WaitOne
+// throws AbandonedMutexException); the next acquirer treats that as acquired
+// because the crash-safe atomic file ops guarantee the bytes it observes are never
+// partial. A WaitOne timeout maps to exit 49 (contended) so the caller backs off
+// and retries rather than failing hard.
+func winMutexGuard(path, body string) string {
+	return fmt.Sprintf(`$mtx=New-Object System.Threading.Mutex($false,%s)
+$rc=99
+$got=$false
+try{$got=$mtx.WaitOne(20000)}catch [System.Threading.AbandonedMutexException]{$got=$true}
+if(-not $got){$mtx.Dispose();exit 49}
+try{
+%s
+}finally{$mtx.ReleaseMutex();$mtx.Dispose()}
+exit $rc`, psq(winLockMutexName(path)), body)
+}
+
+// shDirLockPrologue opens the lock's PARENT DIRECTORY (a stable inode that, unlike
+// the lock file, is never unlinked) on fd 9 and takes a blocking flock on it,
+// giving a path-keyed cross-process mutex that serializes create/delete/replace
+// exactly like the Windows named mutex. flock on the lock FILE itself would be
+// useless: a delete unlinks that inode, so a newcomer's freshly-created lock is a
+// DIFFERENT inode whose flock the taker never held, which is precisely how the
+// dual-ownership race arose (evaluator iter-20 item 1). `dirExpr` is a shell
+// expression evaluating to the directory (a literal for create, `$(dirname …)`
+// for delete/replace). On failure to open/flock, callers exit 71/49.
+func shDirLockPrologue(dirExpr, path string) string {
+	return fmt.Sprintf(`exec 9<%s 2>/dev/null || { [ -e '%s' ] && exit 71 || exit 48; }
+flock -w 20 9 || exit 49`, dirExpr, path)
+}
+
+// casDelete performs an atomic compare-and-delete on a HELD `.lock`: under the
+// shared path-keyed mutex (winMutexGuard / the parent-directory flock) it removes
+// the file ONLY if the current bytes equal `expect` (this handle's owned content).
+// A successor that legitimately took over after our timeout has DIFFERENT bytes,
+// so its lock is never removed. Because delete now shares the SAME mutex as create
+// and replace, its inspect-then-remove is mutually exclusive against a concurrent
+// takeover replace, so a release can never delete bytes a replace is mid-swapping
+// (evaluator iter-20 item 1). The outcomes: casDone (deleted), casMismatch (not
+// ours — safe no-op), casAbsent (already gone), casContended (the mutex was held
+// past the wait — the caller RETRIES so it never returns success while OUR lock is
+// still present, evaluator item 2); any other exit (removal failed, permission,
+// missing flock) is a Go error. The removal is classified AT THE DELETE CALL (a
+// failed Delete/`rm -f` ⇒ exit 17), with NO post-delete existence probe (evaluator
+// item 2).
 func casDelete(ctx context.Context, t transport.Transport, path, expect string) (casOutcome, error) {
 	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
 	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`try{$fs=[IO.File]::Open(%s,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Delete)}
-catch [System.IO.FileNotFoundException]{exit 48}
-catch [System.IO.DirectoryNotFoundException]{exit 48}
-catch [System.IO.IOException]{exit 49}
-catch{exit 71}
-$rc=99
-try{
-$len=[int]$fs.Length; $b=New-Object byte[] $len; [void]$fs.Read($b,0,$len)
-$cur=[Convert]::ToBase64String($b)
+		body := fmt.Sprintf(`if(-not [IO.File]::Exists(%s)){$rc=48}
+else{
+$cur=[Convert]::ToBase64String([IO.File]::ReadAllBytes(%s))
 if($cur -eq %s){ try{ [IO.File]::Delete(%s); $rc=0 }catch{ $rc=17 } } else { $rc=10 }
-} finally { $fs.Close() }
-exit $rc`, psq(path), psq(expectB64), psq(path))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
+}`, psq(path), psq(path), psq(expectB64), psq(path))
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, body), TimeoutSec: 30})
 	} else {
-		script := fmt.Sprintf(`[ -e '%s' ] || exit 48
-command -v flock >/dev/null 2>&1 || exit 70
-exec 9<'%s' 2>/dev/null || { [ -e '%s' ] && exit 71 || exit 48; }
-flock -n 9 || exit 49
+		script := fmt.Sprintf(`command -v flock >/dev/null 2>&1 || exit 70
+%s
+[ -e '%s' ] || exit 48
 cur=$(base64 < '%s' | tr -d '\n')
 if [ "$cur" != '%s' ]; then exit 10; fi
 rm -f '%s' || exit 17
-exit 0`, path, path, path, path, expectB64, path)
+exit 0`, shDirLockPrologue(`"$(dirname '`+path+`')"`, path), path, path, expectB64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
 	}
 	if err != nil {
@@ -479,28 +520,22 @@ exit 0`, path, path, path, path, expectB64, path)
 // stale bytes to the successor bytes with NO in-place mutation: an interruption at
 // any instant leaves EITHER the intact stale lock (temp orphaned) OR the intact
 // successor lock — never a truncated/partial/mixed JSON that would wedge
-// acquisition. Compare-and-swap atomicity (so two contenders can't both "win") is
-// provided by a per-path OS mutex: POSIX `flock` on the open fd, Windows a
-// `Global\` named mutex. The mutex serializes the read-compare-then-swap critical
-// section across processes; if a holder crashes mid-section the mutex is abandoned
-// (WaitOne throws AbandonedMutexException) and the next acquirer proceeds — the
-// crash-safe atomic swap guarantees the file it observes is never partial.
+// acquisition. Compare-and-swap atomicity (so two contenders can't both "win", and
+// so a concurrent create/delete can't slip a fresh lock into the slot mid-swap) is
+// provided by the SHARED per-path OS mutex used by create and delete as well:
+// POSIX a blocking `flock` on the lock's parent DIRECTORY, Windows a `Global\`
+// named mutex. The mutex serializes the read-compare-then-swap critical section
+// against ALL other lock mutations across processes (evaluator iter-20 item 1); if
+// a holder crashes mid-section the mutex is abandoned (WaitOne throws
+// AbandonedMutexException) and the next acquirer proceeds — the crash-safe atomic
+// swap guarantees the file it observes is never partial.
 func casReplace(ctx context.Context, t transport.Transport, path, expect, newContent string) (casOutcome, error) {
 	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
 	newB64 := base64.StdEncoding.EncodeToString([]byte(newContent))
 	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
-		// Per-path Global mutex serializes the compare-and-swap across processes.
-		sum := sha1.Sum([]byte(path))
-		mutexName := `Global\labdeploy-lock-` + hex.EncodeToString(sum[:])
-		script := fmt.Sprintf(`$mtx=New-Object System.Threading.Mutex($false,%s)
-$rc=99
-$got=$false
-try{$got=$mtx.WaitOne(20000)}catch [System.Threading.AbandonedMutexException]{$got=$true}
-if(-not $got){$mtx.Dispose();exit 49}
-try{
-if(-not [IO.File]::Exists(%s)){$rc=48}
+		body := fmt.Sprintf(`if(-not [IO.File]::Exists(%s)){$rc=48}
 else{
 $cur=[Convert]::ToBase64String([IO.File]::ReadAllBytes(%s))
 if($cur -ne %s){$rc=10}
@@ -509,21 +544,18 @@ $tmp=%s + '.mx.' + [Guid]::NewGuid().ToString('N')
 try{$nb=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$nb); [IO.File]::Replace($tmp,%s,$null); $rc=0}
 catch{Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $rc=17}
 }
-}
-}finally{$mtx.ReleaseMutex();$mtx.Dispose()}
-exit $rc`, psq(mutexName), psq(path), psq(path), psq(expectB64), psq(path), psq(newB64), psq(path))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
+}`, psq(path), psq(path), psq(expectB64), psq(path), psq(newB64), psq(path))
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, body), TimeoutSec: 30})
 	} else {
-		script := fmt.Sprintf(`[ -e '%s' ] || exit 48
-command -v flock >/dev/null 2>&1 || exit 70
-exec 9<'%s' 2>/dev/null || { [ -e '%s' ] && exit 71 || exit 48; }
-flock -n 9 || exit 49
+		script := fmt.Sprintf(`command -v flock >/dev/null 2>&1 || exit 70
+%s
+[ -e '%s' ] || exit 48
 cur=$(base64 < '%s' | tr -d '\n')
 if [ "$cur" != '%s' ]; then exit 10; fi
 tmp='%s.mx.'$$
 printf '%%s' '%s' | base64 -d > "$tmp" || { rm -f "$tmp"; exit 17; }
 mv -f "$tmp" '%s' || { rm -f "$tmp"; exit 17; }
-exit 0`, path, path, path, path, expectB64, path, newB64, path)
+exit 0`, shDirLockPrologue(`"$(dirname '`+path+`')"`, path), path, path, expectB64, path, newB64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
 	}
 	if err != nil {
@@ -568,21 +600,30 @@ func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Pa
 //     IOException if the target exists; the target appears fully-formed or not.
 //
 // A crashed creator leaves at most an orphan temp (never an empty `.lock`), so
-// there is no dual-ownership window and nothing to "recover".
+// there is no dual-ownership window and nothing to "recover". The whole
+// inspect-then-publish runs under the SHARED path-keyed mutex (winMutexGuard / the
+// parent-directory flock) that create, delete, AND replace all take, so a create
+// can never publish a fresh lock into a slot a concurrent stale-takeover replace is
+// mid-swapping — closing the dual-ownership race (evaluator iter-20 item 1).
 func createExclusiveAt(ctx context.Context, t transport.Transport, root, path, content string) (bool, int, error) {
 	b64 := base64.StdEncoding.EncodeToString([]byte(content))
 	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
+		body := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
+if([IO.File]::Exists(%s)){$rc=48}
+else{
 $tmp=%s + '.tmp.' + [Guid]::NewGuid().ToString('N')
-try { $b=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$b); [IO.File]::Move($tmp,%s); exit 0 }
-catch [System.IO.IOException] { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $h=$_.Exception.HResult -band 0xFFFF; if ($h -eq 80 -or $h -eq 183) { exit 48 } else { exit 71 } }
-catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; exit 71 }`,
-			psq(root), psq(path), psq(b64), psq(path))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
+try { $b=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$b); [IO.File]::Move($tmp,%s); $rc=0 }
+catch [System.IO.IOException] { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $h=$_.Exception.HResult -band 0xFFFF; if ($h -eq 80 -or $h -eq 183) { $rc=48 } else { $rc=71 } }
+catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $rc=71 }
+}`, psq(root), psq(path), psq(path), psq(b64), psq(path))
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, body), TimeoutSec: 60})
 	} else {
 		script := fmt.Sprintf(`mkdir -p '%s'
+command -v flock >/dev/null 2>&1 || exit 70
+%s
+if [ -e '%s' ]; then exit 48; fi
 tmp='%s.tmp.'$$
 printf '%%s' '%s' | base64 -d > "$tmp" || { rm -f "$tmp"; exit 71; }
 lnerr=$(ln "$tmp" '%s' 2>&1); lnrc=$?
@@ -592,7 +633,7 @@ case "$lnerr" in
   *[Ee]xists*) exit 48 ;;
   *) exit 71 ;;
 esac`,
-			root, path, b64, path)
+			root, shDirLockPrologue(fmt.Sprintf("'%s'", root), path), path, path, b64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {
@@ -602,12 +643,13 @@ esac`,
 }
 
 // ReleaseLock releases the lock with a SINGLE atomic compare-and-delete
-// (casDelete): in one exclusive-handle command it removes `.lock` ONLY when the
+// (casDelete): under the SHARED path-keyed mutex it removes `.lock` ONLY when the
 // persisted bytes still equal this handle's exact content. A caller that overran
 // the timeout can therefore never delete a successor's lock — the successor's
 // bytes differ (casMismatch), so casDelete is a safe no-op. Because the check and
-// the removal happen inside one command that holds the file's exclusive OS
-// handle, no takeover can interleave between "verify" and "delete".
+// the removal happen inside the same mutex-guarded command that create and replace
+// also serialize on, no takeover or create can interleave between "verify" and
+// "delete".
 //
 // Contention is NOT success (evaluator item 2): if a mismatching peer CAS briefly
 // holds the exclusive handle while we try to release (casContended), OUR lock is
