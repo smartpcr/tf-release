@@ -4,11 +4,13 @@ package transport
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
@@ -61,9 +63,53 @@ func (e *CodedError) Unwrap() error { return e.Err }
 func ErrConnect(err error) error { return &CodedError{Code: "ERR_CONNECT", Err: err} }
 func ErrAuth(err error) error    { return &CodedError{Code: "ERR_AUTH", Err: err} }
 
-// New builds a transport for one host from a merged spec.Target.
+// nonRetryable wraps an error that the connect retry loop must surface
+// immediately without further attempts (e.g. ERR_AUTH, host-key mismatch).
+type nonRetryable struct{ err error }
+
+func (n *nonRetryable) Error() string { return n.err.Error() }
+func (n *nonRetryable) Unwrap() error { return n.err }
+
+// noRetry marks err so retryConnect returns it as-is without retrying.
+func noRetry(err error) error { return &nonRetryable{err: err} }
+
+// retryConnect runs attempt up to retries+1 times with a FIXED backoff between
+// attempts (DESIGN §8.1). The backoff is applied ONLY between attempts — never
+// after the final attempt — so an exhausted loop does not waste a trailing
+// sleep. An attempt may short-circuit the loop by returning a noRetry-wrapped
+// error (e.g. ERR_AUTH), which is returned verbatim. Any other non-nil error is
+// retryable; once attempts are exhausted the last one is wrapped in ERR_CONNECT.
+func retryConnect(ctx context.Context, retries int, backoff time.Duration, attempt func() error) error {
+	attempts := retries + 1
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		err := attempt()
+		if err == nil {
+			return nil
+		}
+		var nr *nonRetryable
+		if errors.As(err, &nr) {
+			return nr.err // ERR_AUTH / fatal: not retried
+		}
+		lastErr = err
+		if i == attempts-1 {
+			break // no backoff after the final attempt
+		}
+		select {
+		case <-ctx.Done():
+			return ErrConnect(ctx.Err())
+		case <-time.After(backoff):
+		}
+	}
+	return ErrConnect(fmt.Errorf("after %d attempts: %w", attempts, lastErr))
+}
+
+// NewTransport builds a transport for one host from a merged spec.Target
+// (DESIGN §8.1, implementation-plan Stage 2.1 step 4). It dispatches on the
+// transport kind (local/ssh/winrm) and is the seam the engine swaps for a
+// fake transport in unit tests (see engine.Engine.NewTransport).
 // Secrets are resolved here from the runner's environment by NAME.
-func New(t *spec.Target, host string) (Transport, error) {
+func NewTransport(t *spec.Target, host string) (Transport, error) {
 	password := ""
 	if t.Credentials.PasswordEnv != "" {
 		password = os.Getenv(t.Credentials.PasswordEnv)

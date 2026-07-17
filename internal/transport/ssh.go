@@ -77,35 +77,28 @@ func (s *sshTransport) Connect(ctx context.Context) error {
 		Timeout:         time.Duration(s.dialTimeout) * time.Second,
 	}
 	addr := net.JoinHostPort(s.host, fmt.Sprintf("%d", s.port))
-	var lastErr error
-	for i := 0; i <= s.retries; i++ {
+	return retryConnect(ctx, s.retries, 5*time.Second, func() error {
 		cli, err := ssh.Dial("tcp", addr, cfg)
-		if err == nil {
-			s.client = cli
-			sc, err := sftp.NewClient(cli)
-			if err != nil {
-				cli.Close()
-				return ErrConnect(fmt.Errorf("sftp subsystem: %w", err))
+		if err != nil {
+			es := err.Error()
+			if strings.Contains(es, "unable to authenticate") ||
+				strings.Contains(es, "no supported methods remain") {
+				return noRetry(ErrAuth(err)) // not retried (DESIGN §8.1)
 			}
-			s.sftpc = sc
-			return nil
+			if strings.Contains(es, "host key mismatch") || strings.Contains(es, "key mismatch") {
+				return noRetry(ErrConnect(fmt.Errorf("host key mismatch: %w", err)))
+			}
+			return err // retryable transport failure
 		}
-		es := err.Error()
-		if strings.Contains(es, "unable to authenticate") ||
-			strings.Contains(es, "no supported methods remain") {
-			return ErrAuth(err) // not retried
+		sc, err := sftp.NewClient(cli)
+		if err != nil {
+			cli.Close()
+			return noRetry(ErrConnect(fmt.Errorf("sftp subsystem: %w", err)))
 		}
-		if strings.Contains(es, "host key mismatch") || strings.Contains(es, "key mismatch") {
-			return ErrConnect(fmt.Errorf("host key mismatch: %w", err))
-		}
-		lastErr = err
-		select {
-		case <-ctx.Done():
-			return ErrConnect(ctx.Err())
-		case <-time.After(5 * time.Second):
-		}
-	}
-	return ErrConnect(fmt.Errorf("after %d attempts: %w", s.retries+1, lastErr))
+		s.client = cli
+		s.sftpc = sc
+		return nil
+	})
 }
 
 func (s *sshTransport) Close() error {

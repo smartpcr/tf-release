@@ -40,12 +40,10 @@ func (w *winrmTransport) Host() string    { return w.host }
 func (w *winrmTransport) Connect(ctx context.Context) error {
 	ep := winrm.NewEndpoint(w.host, w.port, w.https, w.insecure, nil, nil, nil,
 		time.Duration(w.opTimeoutSec)*time.Second)
-	var lastErr error
-	attempts := w.retries + 1
-	for i := 0; i < attempts; i++ {
+	return retryConnect(ctx, w.retries, 5*time.Second, func() error {
 		cli, err := winrm.NewClient(ep, w.user, w.pass)
 		if err != nil {
-			return ErrConnect(err)
+			return noRetry(ErrConnect(err))
 		}
 		// probe: cheap command validates both reachability and credentials
 		_, _, code, err := cli.RunWithContextWithString(ctx, "cmd.exe /c echo ok", "")
@@ -54,19 +52,13 @@ func (w *winrmTransport) Connect(ctx context.Context) error {
 			return nil
 		}
 		if err != nil && isAuthErr(err) {
-			return ErrAuth(err) // never retried (DESIGN §8.1)
+			return noRetry(ErrAuth(err)) // never retried (DESIGN §8.1)
 		}
-		lastErr = err
-		if err == nil {
-			lastErr = fmt.Errorf("probe exit code %d", code)
+		if err != nil {
+			return err // retryable transport failure
 		}
-		select {
-		case <-ctx.Done():
-			return ErrConnect(ctx.Err())
-		case <-time.After(5 * time.Second):
-		}
-	}
-	return ErrConnect(fmt.Errorf("after %d attempts: %w", attempts, lastErr))
+		return fmt.Errorf("probe exit code %d", code)
+	})
 }
 
 func isAuthErr(err error) bool {

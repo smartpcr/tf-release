@@ -35,7 +35,7 @@ type Engine struct {
 	Warnings     []string
 }
 
-func New() *Engine { return &Engine{NewTransport: transport.New} }
+func New() *Engine { return &Engine{NewTransport: transport.NewTransport} }
 
 func (e *Engine) warnf(format string, a ...interface{}) {
 	e.Warnings = append(e.Warnings, fmt.Sprintf(format, a...))

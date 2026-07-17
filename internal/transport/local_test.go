@@ -40,7 +40,7 @@ func localTarget(os spec.OSKind) *spec.Target {
 // survives the round-trip and Exec surfaces the app exit code in Result while
 // returning a nil transport error.
 func TestLocalRoundTrip(t *testing.T) {
-	tr, err := New(localTarget(gateOS()), "localhost")
+	tr, err := NewTransport(localTarget(gateOS()), "localhost")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestLocalRoundTrip(t *testing.T) {
 // Scenario: OS mismatch rejected — Connect must error before executing any
 // command when target.os does not match runtime.GOOS.
 func TestLocalConnectOSMismatch(t *testing.T) {
-	tr, err := New(localTarget(otherOS()), "localhost")
+	tr, err := NewTransport(localTarget(otherOS()), "localhost")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestLocalConnectOSMismatch(t *testing.T) {
 // kinds — this is the seam reused by the engine's fake-transport tests.
 func TestNewTransportFactoryDispatch(t *testing.T) {
 	t.Run("local", func(t *testing.T) {
-		tr, err := New(localTarget(gateOS()), "localhost")
+		tr, err := NewTransport(localTarget(gateOS()), "localhost")
 		if err != nil {
 			t.Fatalf("New local: %v", err)
 		}
@@ -143,7 +143,7 @@ func TestNewTransportFactoryDispatch(t *testing.T) {
 			OS:          spec.OSLinux,
 			Credentials: spec.Credentials{Username: "deploy"},
 		}
-		tr, err := New(tgt, "host-a")
+		tr, err := NewTransport(tgt, "host-a")
 		if err != nil {
 			t.Fatalf("New ssh: %v", err)
 		}
@@ -162,7 +162,7 @@ func TestNewTransportFactoryDispatch(t *testing.T) {
 			OS:          spec.OSWindows,
 			Credentials: spec.Credentials{Username: "admin", PasswordEnv: "PW"},
 		}
-		tr, err := New(tgt, "host-b")
+		tr, err := NewTransport(tgt, "host-b")
 		if err != nil {
 			t.Fatalf("New winrm: %v", err)
 		}
@@ -177,15 +177,16 @@ func TestNewTransportFactoryDispatch(t *testing.T) {
 			Hosts:     []string{"host-c"},
 			OS:        spec.OSLinux,
 		}
-		if _, err := New(tgt, "host-c"); err == nil {
+		if _, err := NewTransport(tgt, "host-c"); err == nil {
 			t.Fatal("winrm with os=linux must be rejected")
 		}
 	})
 
 	t.Run("unknown", func(t *testing.T) {
 		tgt := &spec.Target{Transport: spec.TransportKind("carrier-pigeon"), Hosts: []string{"x"}}
-		if _, err := New(tgt, "x"); err == nil {
+		if _, err := NewTransport(tgt, "x"); err == nil {
 			t.Fatal("unknown transport kind must be rejected")
 		}
 	})
 }
+
