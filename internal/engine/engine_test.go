@@ -95,14 +95,14 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		return ok(base64.StdEncoding.EncodeToString(raw)), nil
 
-	case strings.Contains(s, "New-Item -ItemType Directory"): // ensureLayout/ensureDir
-		return ok(""), nil
-
-	case strings.Contains(s, "Expand-Archive"): // extract
+	case strings.Contains(s, "Expand-Archive"): // extract (check before New-Item: script has both)
 		if f.fail["extract"] {
 			return transport.Result{ExitCode: 1, Stderr: "corrupt zip"}, nil
 		}
 		f.mark("EXTRACT")
+		return ok(""), nil
+
+	case strings.Contains(s, "New-Item -ItemType Directory"): // ensureLayout/ensureDir
 		return ok(""), nil
 
 	case reMklink.MatchString(s): // switchJunction
@@ -168,6 +168,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case reRmRecurse.MatchString(s):
 		p := reRmRecurse.FindStringSubmatch(s)[1]
+		if f.fail["rm"] {
+			return transport.Result{ExitCode: 1, Stderr: "remove failed"}, nil
+		}
 		for k := range f.files {
 			if strings.HasPrefix(k, p) {
 				delete(f.files, k)
@@ -490,6 +493,155 @@ func TestPruneKeepsPrevious(t *testing.T) {
 		if strings.Contains(joined, `RM C:\deploy\sample-svc\releases\`+keep) {
 			t.Fatalf("release %s must be retained (current/previous/kept), log=%v", keep, f.log)
 		}
+	}
+}
+
+// TestPruneReportsDeletionFailure proves prune no longer silently swallows a
+// failed removal: when removePath returns nonzero, pruneReleases surfaces the
+// error so the caller can emit its prune warning (evaluator feedback item 2).
+func TestPruneReportsDeletionFailure(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("prune-fail"))
+	defer done()
+	d := winSvcSpec(t, url, sum) // keep_releases: 2
+	f := newFakeHost("lab-01")
+	f.fail["rm"] = true
+	eng := engineWith(f)
+
+	p := layout.NewPaths(spec.OSWindows, `C:\deploy`, "sample-svc", "1.2.0")
+	f.dirs = map[string]bool{"1.2.0": true, "1.1.0": true, "1.0.0": true, "0.9.0": true}
+	f.dirTS = map[string]int64{"1.2.0": 400, "1.1.0": 300, "1.0.0": 200, "0.9.0": 100}
+
+	m := &Manifest{CurrentVersion: "1.2.0", PreviousVersion: "1.0.0"}
+	err := eng.pruneReleases(context.Background(), f, d, p, m)
+	if err == nil {
+		t.Fatal("prune must return an error when a deletion fails")
+	}
+	if !strings.Contains(err.Error(), "0.9.0") {
+		t.Fatalf("prune error should name the failed release: %v", err)
+	}
+}
+
+// runnerPushSpec is winSvcSpec with fetch_mode: runner_push so fetchToStaging
+// takes the runner-download + transport.Upload path (DESIGN §6.3).
+func runnerPushSpec(t *testing.T, url, checksum string) *spec.Deployment {
+	t.Helper()
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	y := fmt.Sprintf(`
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: winrm
+  hosts: ["lab-01"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  fetch_mode: runner_push
+  checksum: "%s"
+  source: { type: http, url: "%s" }
+pattern:
+  type: windows_service
+  service_name: SampleSvc
+  exe: bin\SampleSvc.exe
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+  initial_delay_seconds: 0
+  interval_seconds: 1
+  timeout_seconds: 2
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, checksum, url)
+	d, _, err := spec.ParseDeployment(y, nil, "")
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	return d
+}
+
+// TestRunnerPushStagingAndMarker exercises the runner_push staging path: the
+// artifact is downloaded on the runner and uploaded to <staging>/pkg.zip, the
+// release marker records {version, sha256, extracted_at}, and staging is wiped
+// on success (evaluator feedback items 1 & 4).
+func TestRunnerPushStagingAndMarker(t *testing.T) {
+	payload := []byte("runner push zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	if _, err := eng.Deploy(context.Background(), runnerPushSpec(t, url, sum)); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+
+	joined := strings.Join(f.log, ">")
+	if !strings.Contains(joined, `UPLOAD C:\deploy\sample-svc\staging\pkg.zip`) {
+		t.Fatalf("runner_push must Upload the package to staging; log=%v", f.log)
+	}
+	// Marker contents.
+	marker := `C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`
+	raw, ok := f.files[marker]
+	if !ok {
+		t.Fatalf("release marker %s not written; files=%v", marker, keysOf(f.files))
+	}
+	for _, frag := range []string{`"version": "1.0.0"`, `"sha256": "` + sum + `"`, `"extracted_at"`} {
+		if !strings.Contains(string(raw), frag) {
+			t.Fatalf("marker missing %q; got:\n%s", frag, raw)
+		}
+	}
+	// Staging wiped on success: no pkg.zip survives.
+	if _, present := f.files[`C:\deploy\sample-svc\staging\pkg.zip`]; present {
+		t.Fatal("staging pkg.zip must be wiped after a successful stage")
+	}
+}
+
+// TestStagingWipedOnExtractFailure proves the deferred staging wipe runs even
+// when extraction fails, so no partial download leaks (evaluator feedback
+// items 1 & 4).
+func TestStagingWipedOnExtractFailure(t *testing.T) {
+	payload := []byte("corrupt")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["extract"] = true
+	eng := engineWith(f)
+	_, err := eng.Deploy(context.Background(), runnerPushSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("expected extract failure")
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_EXTRACT" {
+		t.Fatalf("want ERR_EXTRACT, got %v", err)
+	}
+	if _, present := f.files[`C:\deploy\sample-svc\staging\pkg.zip`]; present {
+		t.Fatal("staging pkg.zip must be wiped after a failed extract")
+	}
+	if _, present := f.files[`C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`]; present {
+		t.Fatal("release marker must NOT be written when extract fails")
+	}
+}
+
+// TestStagingWipedOnChecksumFailure proves a runner-side checksum mismatch fails
+// closed and still triggers the staging wipe (evaluator feedback items 1 & 4).
+func TestStagingWipedOnChecksumFailure(t *testing.T) {
+	payload := []byte("real bytes")
+	url, _, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Wrong checksum ⇒ artifact.Fetch verify fails before upload.
+	badSum := "sha256:" + strings.Repeat("0", 64)
+	_, err := eng.Deploy(context.Background(), runnerPushSpec(t, url, badSum))
+	if err == nil {
+		t.Fatal("expected checksum mismatch failure")
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_CHECKSUM_MISMATCH" {
+		t.Fatalf("want ERR_CHECKSUM_MISMATCH, got %v", err)
+	}
+	// The start-of-op staging wipe must have executed.
+	if !strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\staging`) {
+		t.Fatalf("staging must be wiped on checksum failure; log=%v", f.log)
 	}
 }
 

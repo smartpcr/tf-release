@@ -85,6 +85,10 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 		return nil, coded("ERR_CONNECT", host, "STAGE", err)
 	}
 	if !cached {
+		if err := e.wipeStaging(ctx, t, p); err != nil {
+			return nil, coded("ERR_CONNECT", host, "STAGE", err)
+		}
+		defer func() { _ = e.wipeStaging(ctx, t, p) }()
 		if err := e.fetchToStaging(ctx, t, dep, p); err != nil {
 			return nil, err
 		}

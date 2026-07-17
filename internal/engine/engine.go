@@ -335,6 +335,13 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 		return coded("ERR_CONNECT", host, "STAGE", err)
 	}
 	if !cached {
+		// STAGING WIPE (start): staging/ is scratch; it is wiped whole before
+		// fetch and again on every exit (defer) so partial downloads/extracts
+		// never leak across ops (DESIGN §9.1 "wiped at start & end of every op").
+		if err := e.wipeStaging(ctx, t, p); err != nil {
+			return coded("ERR_CONNECT", host, "STAGE", err)
+		}
+		defer func() { _ = e.wipeStaging(ctx, t, p) }()
 		if err := e.fetchToStaging(ctx, t, s, p); err != nil {
 			return err
 		}
@@ -570,13 +577,43 @@ func (e *Engine) removeJunction(ctx context.Context, t transport.Transport, p la
 
 func (e *Engine) removePath(ctx context.Context, t transport.Transport, path string) error {
 	if t.OS() == spec.OSWindows {
-		_, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell,
-			Script: fmt.Sprintf(`Remove-Item -Recurse -Force -ErrorAction SilentlyContinue %s`, psq(path)), TimeoutSec: 300})
+		// SilentlyContinue makes a missing path a no-op (idempotent), but a
+		// real removal failure (locked/permission) leaves the path present, so
+		// we re-check and exit nonzero to surface it to the caller.
+		script := fmt.Sprintf(`Remove-Item -Recurse -Force -ErrorAction SilentlyContinue %s
+if(Test-Path %s){ Write-Error 'remove failed'; exit 1 }
+exit 0`, psq(path), psq(path))
+		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 300})
+		if err != nil {
+			return err
+		}
+		if r.ExitCode != 0 {
+			return fmt.Errorf("remove %s: %s", path, strings.TrimSpace(r.Stderr+r.Stdout))
+		}
+		return nil
+	}
+	// `rm -rf` is a no-op on a missing path; the `[ ! -e ]` guard turns a real
+	// removal failure into a nonzero exit the caller can propagate.
+	script := fmt.Sprintf("rm -rf %s\n[ ! -e %s ]", shq(path), shq(path))
+	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 300})
+	if err != nil {
 		return err
 	}
-	_, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh,
-		Script: fmt.Sprintf(`rm -rf '%s'`, path), TimeoutSec: 300})
-	return err
+	if r.ExitCode != 0 {
+		return fmt.Errorf("remove %s: %s", path, strings.TrimSpace(r.Stderr+r.Stdout))
+	}
+	return nil
+}
+
+// wipeStaging removes the entire staging directory tree and recreates it empty
+// (DESIGN §9.1: staging/ is "wiped at start & end of every op"). Called before
+// fetch and, via defer, on every stage exit regardless of success or failure so
+// that fetch/checksum/extract failures never leave partial artifacts behind.
+func (e *Engine) wipeStaging(ctx context.Context, t transport.Transport, p layout.Paths) error {
+	if err := e.removePath(ctx, t, p.Staging); err != nil {
+		return err
+	}
+	return ensureDir(ctx, t, p.Staging)
 }
 
 // pruneReleases keeps newest keep_releases dirs; current+previous always
@@ -624,6 +661,7 @@ func (e *Engine) pruneReleases(ctx context.Context, t transport.Transport, s *sp
 		protected[m.PreviousVersion] = true
 	}
 	kept := 0
+	var firstErr error
 	for _, r := range rels {
 		if protected[r.name] {
 			kept++
@@ -633,9 +671,11 @@ func (e *Engine) pruneReleases(ctx context.Context, t transport.Transport, s *sp
 			kept++
 			continue
 		}
-		_ = e.removePath(ctx, t, p.Releases+sepFor(t.OS())+r.name)
+		if err := e.removePath(ctx, t, p.Releases+sepFor(t.OS())+r.name); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("prune %s: %w", r.name, err)
+		}
 	}
-	return nil
+	return firstErr
 }
 
 // quoteCmd double-quotes a path for cmd.exe embedded in PS `& cmd /c ...`.

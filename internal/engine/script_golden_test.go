@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
@@ -50,6 +51,33 @@ func TestScriptGolden(t *testing.T) {
 			}
 			if got != string(want) {
 				t.Errorf("%s script mismatch.\n got: %q\nwant: %q", c.name, got, string(want))
+			}
+		})
+	}
+}
+
+// TestScriptHostilePathQuoting proves an install_root containing a single quote
+// (which spec validation does NOT forbid) is escaped by shq so it cannot break
+// out of the quoted shell argument in the generated linux scripts (evaluator
+// feedback item 3). The escaped POSIX form of `'` is `'\''`.
+func TestScriptHostilePathQuoting(t *testing.T) {
+	hostile := `/opt/de'ploy;rm -rf ~` // embedded quote + shell metachars
+	p := layout.NewPaths(spec.OSLinux, hostile, "svc", "1.0.0")
+	for _, tc := range []struct {
+		name  string
+		build func(layout.Paths) string
+	}{
+		{"extract", extractScript},
+		{"switch", switchScript},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.build(p)
+			// The literal quote must appear only as the escaped sequence.
+			if strings.Contains(got, `de'ploy`) {
+				t.Fatalf("%s: unescaped single quote leaked into script:\n%s", tc.name, got)
+			}
+			if !strings.Contains(got, `de'\''ploy`) {
+				t.Fatalf("%s: expected shq-escaped quote `'\\''`, got:\n%s", tc.name, got)
 			}
 		})
 	}
