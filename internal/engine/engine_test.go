@@ -61,11 +61,35 @@ var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 var reCasOpen = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open,\[IO\.FileAccess\]::ReadWrite,\[IO\.FileShare\]::Delete\)`)
 var reCurEq = regexp.MustCompile(`\$cur -eq '([^']*)'`)
 
+// reCasReplace captures the exclusive-handle open used by casReplace
+// (FileShare::None). The single command holds the OS handle, compares the current
+// bytes to `expect`, and rewrites the successor bytes in place (SetLength+Write)
+// with NO intervening absent slot — the atomic stale takeover.
+var reCasReplace = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open,\[IO\.FileAccess\]::ReadWrite,\[IO\.FileShare\]::None\)`)
+
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
 	switch {
 	case strings.Contains(s, "$PSVersionTable"): // preflight
 		f.mark("PREFLIGHT")
+		return ok(""), nil
+
+	case reCasReplace.MatchString(s): // casReplace exclusive-handle compare-and-replace
+		m := reCasReplace.FindStringSubmatch(s)
+		path := m[1]
+		cur, exists := f.files[path]
+		if !exists {
+			return transport.Result{ExitCode: 48}, nil // slot released
+		}
+		em := reCurEq.FindStringSubmatch(s)
+		if em == nil || base64.StdEncoding.EncodeToString(cur) != em[1] {
+			return transport.Result{ExitCode: 10}, nil // a fresh successor already installed
+		}
+		if nm := regexp.MustCompile(`FromBase64String\('([^']*)'\)`).FindStringSubmatch(s); nm != nil {
+			raw, _ := base64.StdEncoding.DecodeString(nm[1])
+			f.files[path] = raw // atomic replace: never absent/empty/partial
+		}
+		f.mark("LOCK")
 		return ok(""), nil
 
 	case reCasOpen.MatchString(s): // casDelete exclusive-handle compare-and-delete

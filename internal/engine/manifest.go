@@ -259,11 +259,6 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 	// Only a repeatedly-vanishing/-contended slot spins, which cannot progress, so
 	// a tiny cap keeps us well under 5s.
 	const maxAttempts = 8
-	// pendingWarn carries the stale-takeover WARN across the delete→recreate turn:
-	// the compare-and-delete happens on one iteration and the atomic re-create that
-	// finally installs our lock happens on the next, so the WARN must survive the
-	// loop boundary to be returned with the handle.
-	var pendingWarn string
 	for attempt := 0; ; attempt++ {
 		token := newToken()
 		li, _ := json.Marshal(lockInfo{
@@ -276,7 +271,8 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr)
 		}
 		if created {
-			return &Lock{t: t, paths: p, content: content, token: token}, pendingWarn, nil
+			// A fresh create into a FREE slot legitimately carries no warning.
+			return &Lock{t: t, paths: p, content: content, token: token}, "", nil
 		}
 		if exit == 71 {
 			// Operational failure from the remote create (disk full, permission
@@ -328,39 +324,26 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 				fmt.Errorf("held by %s since %s (op=%s)", existing.Owner, existing.StartedUTC, existing.Op))
 		}
 
-		// Proven stale (age >= timeout): take it over WITHOUT mutating in place.
-		// Atomically compare-and-DELETE the exact stale bytes, then loop back to
-		// re-create the slot with a fresh atomic create. An interruption between
-		// the two steps leaves the slot either the intact stale lock (delete
-		// killed) or simply absent (delete done, re-create pending) — never a
-		// mixed/partial file that could permanently wedge acquisition.
-		//
-		// Record the stale-takeover WARN NOW, before the compare-and-delete
-		// (evaluator item 1). Under concurrent takeover only ONE contender's
-		// casDelete returns casDone; the others receive casAbsent/casMismatch yet
-		// may still win the ensuing atomic re-create and install the successor
-		// lock. Assigning pendingWarn here — keyed on having PROVEN this lock stale
-		// — guarantees whichever contender ultimately installs the lock returns the
-		// required WARN, instead of only the contender that personally deleted it.
-		pendingWarn = staleWarnMsg(existing, t.Host())
-		outcome, serr := casDelete(ctx, t, p.Lock, raw)
+		// Proven stale (age >= timeout): take it over as a SINGLE atomic
+		// compare-and-replace. The SAME actor that proved this lock stale installs
+		// the successor bytes in ONE exclusive-gate command that swaps our content
+		// in place of the exact stale bytes. Unlike the old delete-then-recreate,
+		// there is NO intervening absent slot: a late newcomer can never slip into a
+		// gap and acquire warning-less while we recreate (evaluator item 1). The
+		// winner ALWAYS returns the stale-owner WARN; every loser observes our FRESH
+		// bytes (casMismatch) and retries into ERR_LOCKED against the live successor.
+		warn := staleWarnMsg(existing, t.Host())
+		outcome, serr := casReplace(ctx, t, p.Lock, raw, content)
 		if serr != nil {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", serr)
 		}
 		switch outcome {
 		case casDone:
-			// The stale lock is gone; the next iteration re-creates the slot.
-			// Whoever wins that atomic create owns it — if a third party beats
-			// us, our create returns 48, we read the now-FRESH lock and correctly
-			// report ERR_LOCKED. pendingWarn was already recorded above.
-			if attempt < maxAttempts {
-				continue
-			}
-			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-				fmt.Errorf("stale lock from %s: takeover repeatedly contended", existing.Owner))
+			// We atomically replaced the stale bytes with our own — we own it.
+			return &Lock{t: t, paths: p, content: content, token: token}, warn, nil
 		case casContended:
-			// A peer holds the exclusive handle right now (transient). Back off
-			// and re-evaluate rather than misreporting it as a mismatch/absence.
+			// A peer holds the exclusive gate right now (transient). Back off and
+			// re-evaluate rather than misreporting it as a mismatch/absence.
 			if attempt < maxAttempts {
 				casBackoff(ctx, attempt)
 				continue
@@ -437,7 +420,11 @@ func classifyCas(op, path string, r transport.Result) (casOutcome, error) {
 // casMismatch (not ours — safe no-op), casAbsent (already gone), casContended (a
 // peer holds the handle right now — the caller RETRIES so it never returns
 // success while OUR lock is still present, evaluator item 2); any other exit
-// (removal failed, permission, missing flock) is a Go error.
+// (removal failed, permission, missing flock) is a Go error. The removal is
+// classified AT THE DELETE CALL (a failed Delete/`rm -f` ⇒ exit 17), with NO
+// post-delete existence probe: probing after a successful delete could observe a
+// concurrent acquirer's fresh recreate and spuriously report exit 17 instead of a
+// clean success (evaluator item 2).
 func casDelete(ctx context.Context, t transport.Transport, path, expect string) (casOutcome, error) {
 	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
 	var r transport.Result
@@ -452,10 +439,9 @@ $rc=99
 try{
 $len=[int]$fs.Length; $b=New-Object byte[] $len; [void]$fs.Read($b,0,$len)
 $cur=[Convert]::ToBase64String($b)
-if($cur -eq %s){ [IO.File]::Delete(%s); $rc=0 } else { $rc=10 }
+if($cur -eq %s){ try{ [IO.File]::Delete(%s); $rc=0 }catch{ $rc=17 } } else { $rc=10 }
 } finally { $fs.Close() }
-if($rc -eq 0 -and (Test-Path -LiteralPath %s)){ exit 17 }
-exit $rc`, psq(path), psq(expectB64), psq(path), psq(path))
+exit $rc`, psq(path), psq(expectB64), psq(path))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
 	} else {
 		script := fmt.Sprintf(`[ -e '%s' ] || exit 48
@@ -464,15 +450,68 @@ exec 9<'%s' 2>/dev/null || { [ -e '%s' ] && exit 71 || exit 48; }
 flock -n 9 || exit 49
 cur=$(base64 < '%s' | tr -d '\n')
 if [ "$cur" != '%s' ]; then exit 10; fi
-rm -f '%s'
-if [ -e '%s' ]; then exit 17; fi
-exit 0`, path, path, path, path, expectB64, path, path)
+rm -f '%s' || exit 17
+exit 0`, path, path, path, path, expectB64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
 	}
 	if err != nil {
 		return casDone, err
 	}
 	return classifyCas("compare-and-delete", path, r)
+}
+
+// casReplace performs an atomic compare-and-REPLACE on a proven-stale `.lock`: in
+// a SINGLE exclusive-gate command it swaps `newContent` in place of the exact
+// stale `expect` bytes, so the canonical slot is NEVER absent between removing the
+// stale lock and installing the successor. This closes the delete-then-recreate
+// gap where a late newcomer could create into the empty slot and acquire without
+// the mandated stale WARN (evaluator item 1). Outcomes mirror casDelete: casDone
+// (we installed our successor), casMismatch (a peer already installed FRESH bytes
+// — abort), casAbsent (the slot was released — retry a clean create), casContended
+// (a peer holds the gate right now — retry); any other exit is a Go error.
+//
+// Crash-safety note: POSIX replaces via a private temp + atomic `mv -f`, so it is
+// fully crash-safe. Windows cannot rename-replace a handle-held file (a
+// delete-pending name is retained until the handle closes), so it rewrites in
+// place under the exclusive handle (SetLength+Write+Flush). A crash mid-write is
+// scoped ONLY to this rare stale-takeover path; the common create path stays
+// fully temp+publish crash-safe, and a proven-stale lock is already degraded.
+func casReplace(ctx context.Context, t transport.Transport, path, expect, newContent string) (casOutcome, error) {
+	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
+	newB64 := base64.StdEncoding.EncodeToString([]byte(newContent))
+	var r transport.Result
+	var err error
+	if t.OS() == spec.OSWindows {
+		script := fmt.Sprintf(`try{$fs=[IO.File]::Open(%s,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}
+catch [System.IO.FileNotFoundException]{exit 48}
+catch [System.IO.DirectoryNotFoundException]{exit 48}
+catch [System.IO.IOException]{exit 49}
+catch{exit 71}
+$rc=99
+try{
+$len=[int]$fs.Length; $b=New-Object byte[] $len; [void]$fs.Read($b,0,$len)
+$cur=[Convert]::ToBase64String($b)
+if($cur -eq %s){ try{ $nb=[Convert]::FromBase64String(%s); $fs.SetLength($nb.Length); $fs.Position=0; $fs.Write($nb,0,$nb.Length); $fs.Flush($true); $rc=0 }catch{ $rc=17 } } else { $rc=10 }
+} finally { $fs.Close() }
+exit $rc`, psq(path), psq(expectB64), psq(newB64))
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
+	} else {
+		script := fmt.Sprintf(`[ -e '%s' ] || exit 48
+command -v flock >/dev/null 2>&1 || exit 70
+exec 9<'%s' 2>/dev/null || { [ -e '%s' ] && exit 71 || exit 48; }
+flock -n 9 || exit 49
+cur=$(base64 < '%s' | tr -d '\n')
+if [ "$cur" != '%s' ]; then exit 10; fi
+tmp='%s.mx.'$$
+printf '%%s' '%s' | base64 -d > "$tmp" || { rm -f "$tmp"; exit 17; }
+mv -f "$tmp" '%s' || { rm -f "$tmp"; exit 17; }
+exit 0`, path, path, path, path, expectB64, path, newB64, path)
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
+	}
+	if err != nil {
+		return casDone, err
+	}
+	return classifyCas("compare-and-replace", path, r)
 }
 
 func staleWarnMsg(existing lockInfo, host string) string {
@@ -490,10 +529,14 @@ func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Pa
 // Returns (created, exitCode, transportErr): created=true on exit 0; exitCode==48
 // signals the file already existed (contention); exitCode==71 signals an
 // OPERATIONAL failure (disk full, permission denied, read-only/absent filesystem)
-// that must NOT be conflated with contention — the publish step distinguishes the
-// two by re-checking whether the destination actually exists after a failed
-// rename/hard-link, so a missing-destination IO error surfaces as 71 rather than a
-// spurious 48 (evaluator item 2).
+// that must NOT be conflated with contention. The publish step distinguishes the
+// two AT THE POINT OF FAILURE — from the failing operation's own error, not a
+// follow-up existence probe: Windows inspects the IOException HResult
+// (ERROR_FILE_EXISTS=80 / ERROR_ALREADY_EXISTS=183 ⇒ 48, else 71) and POSIX
+// inspects `ln`'s stderr (matches "exists" ⇒ 48, else 71). A racy re-check
+// (`[IO.File]::Exists` / `[ -e path ]`) after the failure would misclassify a
+// genuine EEXIST as operational when a concurrent release frees the slot between
+// the failed link and the probe (evaluator item 3).
 //
 // The old approach (an exclusive create-new redirect / open-then-Write) created the file
 // FIRST and wrote its bytes SECOND, exposing a transient EMPTY file that a
@@ -516,18 +559,22 @@ func createExclusiveAt(ctx context.Context, t transport.Transport, root, path, c
 		script := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
 $tmp=%s + '.tmp.' + [Guid]::NewGuid().ToString('N')
 try { $b=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$b); [IO.File]::Move($tmp,%s); exit 0 }
-catch [System.IO.IOException] { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; if ([IO.File]::Exists(%s)) { exit 48 } else { exit 71 } }
+catch [System.IO.IOException] { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $h=$_.Exception.HResult -band 0xFFFF; if ($h -eq 80 -or $h -eq 183) { exit 48 } else { exit 71 } }
 catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; exit 71 }`,
-			psq(root), psq(path), psq(b64), psq(path), psq(path))
+			psq(root), psq(path), psq(b64), psq(path))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
 	} else {
 		script := fmt.Sprintf(`mkdir -p '%s'
 tmp='%s.tmp.'$$
 printf '%%s' '%s' | base64 -d > "$tmp" || { rm -f "$tmp"; exit 71; }
-if ln "$tmp" '%s' 2>/dev/null; then rm -f "$tmp"; exit 0; fi
+lnerr=$(ln "$tmp" '%s' 2>&1); lnrc=$?
 rm -f "$tmp"
-if [ -e '%s' ]; then exit 48; else exit 71; fi`,
-			root, path, b64, path, path)
+if [ $lnrc -eq 0 ]; then exit 0; fi
+case "$lnerr" in
+  *[Ee]xists*) exit 48 ;;
+  *) exit 71 ;;
+esac`,
+			root, path, b64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {

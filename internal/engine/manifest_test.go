@@ -279,11 +279,11 @@ func TestAcquireLockConcurrentTakeover(t *testing.T) {
 				aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
 				f.set(p.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+aged+`","token":"stale"}`)
 
-				// Rendezvous both contenders on the atomic compare-and-delete so the
-				// exclusive-handle CAS arbitrates the takeover under a real race.
+				// Rendezvous both contenders on the atomic compare-and-replace so the
+				// exclusive-gate CAS arbitrates the takeover under a real race.
 				bar := newBarrier(2)
 				f.hook = func(op, s string) {
-					if op == "casdelete" {
+					if op == "casreplace" {
 						bar.wait()
 					}
 				}
@@ -313,10 +313,11 @@ func TestAcquireLockConcurrentTakeover(t *testing.T) {
 					case r.err == nil && r.lk != nil:
 						winners++
 						// The winner performed a stale TAKEOVER, so it MUST surface
-						// the WARN naming the dead owner — even if a peer contender
-						// is the one whose compare-and-delete removed the stale bytes
-						// (evaluator item 1). An empty warn here means the required
-						// diagnostic was dropped on the concurrent path.
+						// the WARN naming the dead owner. Because takeover is a single
+						// atomic compare-and-replace (no absent gap), the winner is
+						// always the actor that overrode the stale bytes, so the
+						// diagnostic can never be dropped on the concurrent path
+						// (evaluator item 1).
 						if !strings.Contains(r.warn, "stale") || !strings.Contains(r.warn, "dead") {
 							t.Fatalf("trial %d: takeover winner dropped the stale WARN: %q", trial, r.warn)
 						}
@@ -407,11 +408,11 @@ func TestReleaseVsTakeoverInterleaved(t *testing.T) {
 }
 
 // TestThreePartyTakeoverExactlyOneOwner is the acquisition half of evaluator
-// item 3: an already-installed successor plus TWO fresh contenders racing to
-// take over a stale lock must yield EXACTLY ONE owner, with the canonical `.lock`
-// never momentarily emptied (so no third party can slip into an empty slot) and
-// no gate/temp residue left behind. All three rendezvous on the exclusive gate
-// create so the interleaving is deterministic per trial.
+// item 3: multiple fresh contenders racing to take over the SAME stale lock must
+// yield EXACTLY ONE owner, with the canonical `.lock` never momentarily emptied
+// (so no late newcomer can slip into an empty slot and acquire warning-less) and
+// no gate/temp residue left behind. All contenders rendezvous on the exclusive-
+// gate compare-and-replace so the interleaving is deterministic per trial.
 func TestThreePartyTakeoverExactlyOneOwner(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
@@ -426,7 +427,7 @@ func TestThreePartyTakeoverExactlyOneOwner(t *testing.T) {
 				const contenders = 3
 				bar := newBarrier(contenders)
 				f.hook = func(op, s string) {
-					if op == "casdelete" {
+					if op == "casreplace" {
 						bar.wait()
 					}
 				}
@@ -542,11 +543,12 @@ func TestReleaseVsInstalledSuccessorPlusThird(t *testing.T) {
 }
 
 // TestTakeoverErrorPathsCleanUp is the injected-transport-failure regression for
-// the stale-takeover path: a failure of the compare-and-delete that removes the
-// stale owner must (a) surface a coded error and (b) leave the canonical `.lock`
-// exactly as it was — still holding the stale bytes, never emptied — with no
-// residue. Because takeover is delete-then-create (each step atomic, no gate, no
-// in-place mutation), a failed delete removes nothing: there is nothing to strand.
+// the stale-takeover path: a failure of the compare-and-replace that installs the
+// successor over the stale owner must (a) surface a coded error and (b) leave the
+// canonical `.lock` exactly as it was — still holding the stale bytes, never
+// emptied — with no residue. Because takeover is a single atomic compare-and-
+// replace (no delete step, no absent gap), a failed replace changes nothing:
+// there is nothing to strand.
 func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
@@ -557,12 +559,12 @@ func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 			staleContent := `{"owner":"dead","op":"deploy","started_utc":"` + aged + `","token":"stale"}`
 			f.set(p.Lock, staleContent)
 
-			// Fail the compare-and-delete exactly once with a transport error.
+			// Fail the compare-and-replace exactly once with a transport error.
 			var tripped bool
 			f.failOn = func(op, s string) (transport.Result, error, bool) {
-				if op == "casdelete" && !tripped {
+				if op == "casreplace" && !tripped {
 					tripped = true
-					return transport.Result{}, fmt.Errorf("injected casdelete failure"), true
+					return transport.Result{}, fmt.Errorf("injected casreplace failure"), true
 				}
 				return transport.Result{}, nil, false
 			}
@@ -576,7 +578,7 @@ func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 				t.Fatalf("expected coded ERR_CONNECT/ERR_LOCKED, got %v", err)
 			}
 			// No residue, and the canonical lock is untouched (never absent, still
-			// the stale bytes — the failed compare-and-delete removed nothing).
+			// the stale bytes — the failed compare-and-replace changed nothing).
 			f.mu.Lock()
 			for k := range f.files {
 				if strings.Contains(k, ".mx") || strings.Contains(k, ".tmp.") {
@@ -595,10 +597,10 @@ func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 
 // TestTakeoverCleanupSurvivesCancellation is the canceled-mid-takeover
 // regression: if the operation context is canceled exactly when the
-// compare-and-delete runs, the takeover must fail AND the canonical `.lock` must be
+// compare-and-replace runs, the takeover must fail AND the canonical `.lock` must be
 // left untouched (still the stale bytes, never emptied) with no residue. There is
-// no serialization gate to strand — the compare-and-delete either removes the
-// stale bytes atomically or does nothing.
+// no absent gap to strand — the compare-and-replace either swaps the bytes
+// atomically or does nothing.
 func TestTakeoverCleanupSurvivesCancellation(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
@@ -610,10 +612,10 @@ func TestTakeoverCleanupSurvivesCancellation(t *testing.T) {
 			f.set(p.Lock, staleContent)
 
 			ctx, cancel := context.WithCancel(context.Background())
-			// Cancel exactly when the compare-and-delete is about to run; the
+			// Cancel exactly when the compare-and-replace is about to run; the
 			// decision read that precedes it must complete normally.
 			f.hook = func(op, s string) {
-				if op == "casdelete" {
+				if op == "casreplace" {
 					cancel()
 				}
 			}
@@ -807,14 +809,15 @@ func TestAcquireLockRefusesEmptyLock(t *testing.T) {
 	}
 }
 
-// TestStaleTakeoverIsDeleteThenCreate proves the new takeover shape (evaluator
-// items 2 & 4): a proven-stale lock is removed by an atomic compare-and-delete and
-// then re-created atomically, with the stale-owner WARN preserved. Crucially, an
-// interruption between the two steps NEVER leaves a mixed/partial file: if the
-// compare-and-delete itself is killed, the canonical lock stays the INTACT stale
-// bytes (no in-place mutation exists to corrupt), and a subsequent acquire still
+// TestStaleTakeoverIsAtomicReplace proves the takeover shape (evaluator items 1,
+// 2 & 4): a proven-stale lock is overridden by a SINGLE atomic compare-and-replace
+// that swaps our bytes in place of the stale bytes, with the stale-owner WARN
+// preserved. Crucially, there is NO delete-then-recreate gap: the canonical slot
+// is never momentarily absent, so a late newcomer can never slip in and acquire
+// warning-less. If the compare-and-replace itself is killed, the canonical lock
+// stays the INTACT stale bytes (nothing partial), and a subsequent acquire still
 // takes over cleanly.
-func TestStaleTakeoverIsDeleteThenCreate(t *testing.T) {
+func TestStaleTakeoverIsAtomicReplace(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
 		t.Run(string(osk), func(t *testing.T) {
@@ -822,16 +825,16 @@ func TestStaleTakeoverIsDeleteThenCreate(t *testing.T) {
 			aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
 			stale := `{"owner":"dead","op":"deploy","started_utc":"` + aged + `","token":"stale"}`
 
-			// (a) Interrupted delete: the compare-and-delete is killed once. The
+			// (a) Interrupted replace: the compare-and-replace is killed once. The
 			// canonical lock is left INTACT (never partial/empty), and a retry
 			// takes over cleanly with the stale WARN.
 			f := newLockFake(osk)
 			f.set(pp.Lock, stale)
 			var killed bool
 			f.failOn = func(op, s string) (transport.Result, error, bool) {
-				if op == "casdelete" && !killed {
+				if op == "casreplace" && !killed {
 					killed = true
-					return transport.Result{}, fmt.Errorf("killed mid-delete"), true
+					return transport.Result{}, fmt.Errorf("killed mid-replace"), true
 				}
 				return transport.Result{}, nil, false
 			}
@@ -840,11 +843,11 @@ func TestStaleTakeoverIsDeleteThenCreate(t *testing.T) {
 				t.Fatalf("interrupted takeover must fail, got lk=%v err=%v", lk, err)
 			}
 			if got := f.get(pp.Lock); got != stale {
-				t.Fatalf("interrupted delete left a corrupted/partial lock: %q", got)
+				t.Fatalf("interrupted replace left a corrupted/partial lock: %q", got)
 			}
 
-			// (b) Clean takeover: delete-then-create succeeds, WARN names the
-			// stale owner, and the new lock is ours.
+			// (b) Clean takeover: the compare-and-replace succeeds, the WARN names
+			// the stale owner, and the new lock is ours.
 			f2 := newLockFake(osk)
 			f2.set(pp.Lock, stale)
 			lk2, warn, err2 := AcquireLock(context.Background(), f2, pp, "successor", "deploy", 900)
@@ -856,6 +859,77 @@ func TestStaleTakeoverIsDeleteThenCreate(t *testing.T) {
 			}
 			if !strings.Contains(f2.get(pp.Lock), `"owner":"successor"`) {
 				t.Fatalf("stale lock not replaced by us: %q", f2.get(pp.Lock))
+			}
+		})
+	}
+}
+
+// TestLateNewcomerDuringTakeoverStillWarns is the DISTINCT interleaving demanded
+// by evaluator item 1: a late newcomer B that races a takeover must NOT be able to
+// acquire warning-less through a gap. We deterministically pin contender A at the
+// moment it is about to run its compare-and-replace (identified by the owner in
+// the bytes it is about to install, NOT by timing) and, while A is paused, let
+// newcomer B run a COMPLETE takeover attempt. Because the takeover is a single
+// atomic compare-and-replace with NO absent slot, B — being the actor that
+// overrides the stale bytes — wins WITH the stale WARN, and A then observes B's
+// fresh bytes (mismatch) and is refused ERR_LOCKED. There is no interleaving in
+// which the successful acquirer returns an empty warn.
+func TestLateNewcomerDuringTakeoverStillWarns(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			p := lockFakePaths(osk)
+			f := newLockFake(osk)
+			aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+			f.set(p.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+aged+`","token":"stale"}`)
+
+			replaceOwner := func(s string) string {
+				var nb string
+				if osk == spec.OSWindows {
+					nb, _ = firstGroup(lfNewB64Win, s)
+				} else {
+					nb, _ = firstGroup(lfNewB64Sh, s)
+				}
+				raw, _ := base64.StdEncoding.DecodeString(nb)
+				return string(raw)
+			}
+
+			bDone := make(chan struct{})
+			var bLk *Lock
+			var bWarn string
+			var bErr error
+			var once sync.Once
+			f.hook = func(op, s string) {
+				// Pin A exactly at its own compare-and-replace, then run B fully.
+				if op == "casreplace" && strings.Contains(replaceOwner(s), `"owner":"A"`) {
+					once.Do(func() {
+						bLk, bWarn, bErr = AcquireLock(context.Background(), f, p, "B", "deploy", 900)
+						close(bDone)
+					})
+					<-bDone
+				}
+			}
+
+			aLk, aWarn, aErr := AcquireLock(context.Background(), f, p, "A", "deploy", 900)
+
+			// B (the late newcomer) won the takeover and MUST carry the stale WARN.
+			if bErr != nil || bLk == nil {
+				t.Fatalf("late newcomer B must win the takeover, got lk=%v err=%v", bLk, bErr)
+			}
+			if !strings.Contains(bWarn, "stale") || !strings.Contains(bWarn, "dead") {
+				t.Fatalf("late newcomer acquired WITHOUT the stale warning: warn=%q", bWarn)
+			}
+			// A observed B's fresh lock and was correctly refused — never a
+			// warn-less success.
+			if aLk != nil || aErr == nil {
+				t.Fatalf("A must be refused against B's fresh lock, got lk=%v warn=%q err=%v", aLk, aWarn, aErr)
+			}
+			var ce *CodedError
+			if !asCoded(aErr, &ce) || ce.Code != "ERR_LOCKED" {
+				t.Fatalf("A must fail ERR_LOCKED, got %v", aErr)
+			}
+			if !strings.Contains(f.get(p.Lock), `"owner":"B"`) {
+				t.Fatalf("winner B's lock not installed: %q", f.get(p.Lock))
 			}
 		})
 	}
@@ -1208,9 +1282,9 @@ type lockFake struct {
 	osk   spec.OSKind
 	files map[string]string
 	// hook, if set, is called with the classified op ("read"/"create"/"write"/
-	// "casdelete"/"delete") and the raw script BEFORE f.mu is taken, so
-	// a test can block a goroutine at a chosen primitive (e.g. rendezvous both
-	// takeover contenders on the compare-and-delete) WITHOUT holding the fake's
+	// "casreplace"/"casdelete"/"delete") and the raw script BEFORE f.mu is taken,
+	// so a test can block a goroutine at a chosen primitive (e.g. rendezvous both
+	// takeover contenders on the compare-and-replace) WITHOUT holding the fake's
 	// mutex across the pause — the mutex is released between Execs, so command
 	// interleaving is genuinely modeled.
 	hook func(op, script string)
@@ -1284,11 +1358,17 @@ func firstGroup(re *regexp.Regexp, s string) (string, bool) {
 }
 
 // classify maps a lock script to exactly one primitive. Order matters: the CAS
-// compare-and-delete (which reuses base64 read fragments and, on POSIX, `rm -f`)
-// MUST be recognized BEFORE the plain read/delete cases, and the atomic
-// create-publish (`Move($tmp,...)`/`ln "$tmp"`) before a plain temp write.
+// compare-and-REPLACE (atomic stale takeover; reuses the exclusive-gate open and
+// base64 fragments) MUST be recognized BEFORE the compare-and-delete, which in
+// turn precedes the plain read/delete cases, and the atomic create-publish
+// (`Move($tmp,...)`/`ln "$tmp"`) before a plain temp write. casreplace is keyed on
+// the in-place `$fs.SetLength(` (Windows) or the temp `mv -f "$tmp"` (POSIX),
+// neither of which appears in any other primitive.
 func (f *lockFake) classify(s string) string {
 	switch {
+	case strings.Contains(s, "$fs.SetLength(") ||
+		(strings.Contains(s, "flock -n 9") && strings.Contains(s, `mv -f "$tmp"`)):
+		return "casreplace"
 	case strings.Contains(s, "[IO.File]::Delete(") ||
 		(strings.Contains(s, "flock -n 9") && strings.Contains(s, "rm -f '")):
 		return "casdelete"
@@ -1309,11 +1389,12 @@ func (f *lockFake) classify(s string) string {
 // at command boundaries (the interleaving the evaluator asked us to model).
 // Create PUBLISHES a fully-formed file atomically (temp then Move/ln), so a
 // concurrent acquirer NEVER observes an empty/partial `.lock`; a HELD lock is
-// removed by one exclusive-handle compare-and-delete (casdelete). Takeover is
-// delete-then-recreate, each step atomic, so two contenders can never both win
-// and there is no in-place mutation to corrupt. It HONORS context cancellation
-// (a canceled ctx fails the op) so tests can prove cleanup uses a
-// cancellation-detached context (evaluator items 1 & 4).
+// removed by one exclusive-handle compare-and-delete (casdelete). Stale TAKEOVER
+// is a single exclusive-gate compare-and-replace (casreplace) that installs the
+// successor's bytes in place of the stale bytes with NO intervening absent slot,
+// so two contenders can never both win and no late newcomer can slip into a gap
+// and acquire warning-less. It HONORS context cancellation (a canceled ctx fails
+// the op) so tests can prove cleanup uses a cancellation-detached context.
 func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
 	win := f.osk == spec.OSWindows
@@ -1375,6 +1456,28 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		raw, _ := base64.StdEncoding.DecodeString(newB64)
 		f.files[path] = string(raw)
+		return transport.Result{ExitCode: 0}, nil
+
+	case "casreplace": // single exclusive-gate compare-and-replace (stale takeover)
+		var path, expB64, newB64 string
+		if win {
+			path, _ = firstGroup(lfCasOpenWin, s)
+			expB64, _ = firstGroup(lfCurEqWin, s)
+			newB64, _ = firstGroup(lfNewB64Win, s)
+		} else {
+			path, _ = firstGroup(lfCasPathSh, s)
+			expB64, _ = firstGroup(lfCurNeSh, s)
+			newB64, _ = firstGroup(lfNewB64Sh, s)
+		}
+		cur, ok := f.files[path]
+		if !ok {
+			return transport.Result{ExitCode: 48}, nil // slot vanished (released)
+		}
+		if b64(cur) != expB64 {
+			return transport.Result{ExitCode: 10}, nil // a fresh successor already installed
+		}
+		raw, _ := base64.StdEncoding.DecodeString(newB64)
+		f.files[path] = string(raw) // atomic replace: never absent/empty/partial
 		return transport.Result{ExitCode: 0}, nil
 
 	case "casdelete": // single exclusive-handle compare-and-delete of a HELD lock
