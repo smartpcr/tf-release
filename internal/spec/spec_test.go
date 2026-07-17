@@ -2,6 +2,7 @@ package spec
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -704,4 +705,89 @@ func TestValidationMatrix(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Golden canonical-JSON hashes (DESIGN §Testing "canonical hash stability (key
+// order)", D7). The two committed testdata fixtures encode the SAME logical
+// Deployment with object keys emitted in different orders; canonicalization
+// (sorted keys, no insignificant whitespace) MUST collapse both to the same
+// byte string and therefore the same sha256. These constants pin the exact
+// bytes so an accidental change to the emitter is caught (T2 preservation).
+const (
+	goldenCanonicalHash = "1cea4fe84fd61900622d357f0bd89cdbce7d7f1c1876a2a2e2b42f398f3e623a"
+	goldenSpecHash      = "5390097b78b3d51afcf668613fc26dc68ea9c6b0b0e2dad7062a7527b169e395"
+)
+
+// TestCanonicalHashKeyOrderStable is the T2 preservation proof: a committed
+// canonical-JSON fixture rendered with keys in different orders hashes to a
+// byte-identical spec_hash (DESIGN §Testing, §6, D7).
+func TestCanonicalHashKeyOrderStable(t *testing.T) {
+	a := readTestdata(t, "canonical_order_a.json")
+	b := readTestdata(t, "canonical_order_b.json")
+
+	// 1. Raw canonical hash: sorting keys collapses both orderings to one hash.
+	ha, err := CanonicalHash([]byte(a))
+	if err != nil {
+		t.Fatalf("canonical hash A: %v", err)
+	}
+	hb, err := CanonicalHash([]byte(b))
+	if err != nil {
+		t.Fatalf("canonical hash B: %v", err)
+	}
+	if ha != hb {
+		t.Fatalf("canonical hash not key-order stable: %s vs %s", ha, hb)
+	}
+	if ha != goldenCanonicalHash {
+		t.Fatalf("canonical hash drifted from golden: got %s want %s", ha, goldenCanonicalHash)
+	}
+
+	// 2. Full pipeline: parse (substitution + override no-op) then spec_hash.
+	// Byte-identical spec_hash regardless of source key order (DESIGN D7).
+	_, sa, err := ParseDeploymentLenient(a, nil, "")
+	if err != nil {
+		t.Fatalf("parse fixture A: %v", err)
+	}
+	_, sb, err := ParseDeploymentLenient(b, nil, "")
+	if err != nil {
+		t.Fatalf("parse fixture B: %v", err)
+	}
+	if sa != sb {
+		t.Fatalf("spec_hash not key-order stable: %s vs %s", sa, sb)
+	}
+	if sa != goldenSpecHash {
+		t.Fatalf("spec_hash drifted from golden: got %s want %s", sa, goldenSpecHash)
+	}
+}
+
+// TestVersionOverrideChangesHash is the in-process proof that version_override
+// is applied to artifact.version BEFORE hashing so the pipeline build number
+// drives the release dir name (DESIGN §6, §Testing).
+func TestVersionOverrideChangesHash(t *testing.T) {
+	base := readTestdata(t, "canonical_order_a.json")
+	dBase, hBase, err := ParseDeploymentLenient(base, nil, "")
+	if err != nil {
+		t.Fatalf("base parse: %v", err)
+	}
+	if dBase.Artifact.Version != "1.0.0" {
+		t.Fatalf("base version: got %q want 1.0.0", dBase.Artifact.Version)
+	}
+	dOv, hOv, err := ParseDeploymentLenient(base, nil, "2.0.0")
+	if err != nil {
+		t.Fatalf("override parse: %v", err)
+	}
+	if dOv.Artifact.Version != "2.0.0" {
+		t.Fatalf("override not applied: got %q want 2.0.0", dOv.Artifact.Version)
+	}
+	if hOv == hBase {
+		t.Fatalf("spec_hash must differ after version_override: %s", hOv)
+	}
+}
+
+func readTestdata(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return string(b)
 }

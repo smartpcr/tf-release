@@ -1,0 +1,36 @@
+{
+  "apiVersion": "labdeploy/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "sample-svc"
+  },
+  "target": {
+    "transport": "winrm",
+    "hosts": ["lab-01"],
+    "os": "windows",
+    "credentials": {
+      "username": "LAB\\deploy",
+      "password_env": "LABDEPLOY_PASSWORD"
+    }
+  },
+  "artifact": {
+    "type": "zip",
+    "version": "1.0.0",
+    "checksum": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source": {
+      "type": "http",
+      "url": "https://x/y.zip"
+    }
+  },
+  "pattern": {
+    "type": "windows_service",
+    "service_name": "SampleSvc",
+    "exe": "bin\\SampleSvc.exe"
+  },
+  "health_check": {
+    "type": "http",
+    "http": {
+      "url": "http://localhost:8080/health"
+    }
+  }
+}
