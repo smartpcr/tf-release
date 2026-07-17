@@ -45,6 +45,64 @@ func (e *Engine) warnf(format string, a ...interface{}) {
 	e.Warnings = append(e.Warnings, fmt.Sprintf(format, a...))
 }
 
+// stepLogger emits the DESIGN §8.5/§15 structured step record. EVERY fixed step
+// (VALIDATE CONNECT PREFLIGHT LOCK FETCH CHECKSUM STAGE EXTRACT RENDER CONFIGURE
+// STOP SWITCH START HEALTH FINALIZE PRUNE UNLOCK, plus ROLLBACK/FORCE_KILL/
+// MOVE_GROUP) is logged through tflog carrying app/host/step/version and a
+// numeric duration_ms. A step is emitted whether it succeeded or failed — a
+// failed step is still an executed step — so the log is a faithful trace of the
+// state machine. Conditional steps (FETCH/CHECKSUM/EXTRACT when a release is
+// cached) are simply never entered, so they never appear.
+type stepLogger struct {
+	app     string
+	host    string
+	version string
+}
+
+func newStepLogger(s *spec.Deployment, host string) stepLogger {
+	return stepLogger{app: s.Metadata.Name, host: strings.ToLower(host), version: s.Artifact.Version}
+}
+
+// forHost returns a copy of the logger bound to a different host (cluster nodes
+// share the same app/version but log per-node).
+func (sl stepLogger) forHost(host string) stepLogger {
+	sl.host = strings.ToLower(host)
+	return sl
+}
+
+// emit writes one structured step record measuring elapsed time from start.
+func (sl stepLogger) emit(ctx context.Context, step string, start time.Time) {
+	tflog.Info(ctx, "deploy step", map[string]interface{}{
+		"app":         sl.app,
+		"host":        sl.host,
+		"step":        step,
+		"version":     sl.version,
+		"duration_ms": time.Since(start).Milliseconds(),
+	})
+}
+
+// timed runs fn and emits the step record afterward regardless of outcome.
+func (sl stepLogger) timed(ctx context.Context, step string, fn func() error) error {
+	start := time.Now()
+	err := fn()
+	sl.emit(ctx, step, start)
+	return err
+}
+
+// isChecksumErr reports whether err (or any error it wraps) is a coded
+// ERR_CHECKSUM_MISMATCH, so the caller can record the CHECKSUM step as the
+// failing step even though verification happens inside the fetch.
+func isChecksumErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce *CodedError
+	if errors.As(err, &ce) {
+		return ce.Code == "ERR_CHECKSUM_MISMATCH"
+	}
+	return false
+}
+
 // Deploy is the entry point for Create and Update (DESIGN §10.1/§10.2).
 func (e *Engine) Deploy(ctx context.Context, s *spec.Deployment) (*Status, error) {
 	if s.Pattern.Type == spec.PatternClusterGeneric {
@@ -55,27 +113,36 @@ func (e *Engine) Deploy(ctx context.Context, s *spec.Deployment) (*Status, error
 
 func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status, error) {
 	host := strings.ToLower(s.Target.Hosts[0])
+	sl := newStepLogger(s, host)
+	vstart := time.Now()
 	t, err := e.NewTransport(&s.Target, host)
 	if err != nil {
+		sl.emit(ctx, "VALIDATE", vstart)
 		return nil, coded("ERR_SPEC_INVALID", host, "VALIDATE", err)
 	}
+	pat, verr := pattern.For(s.Pattern.Type)
+	sl.emit(ctx, "VALIDATE", vstart)
+	if verr != nil {
+		return nil, coded("ERR_UNSUPPORTED", host, "VALIDATE", verr)
+	}
+	cstart := time.Now()
 	if err := t.Connect(ctx); err != nil {
+		sl.emit(ctx, "CONNECT", cstart)
 		return nil, wrapTransportErr(err, host, "CONNECT")
 	}
+	sl.emit(ctx, "CONNECT", cstart)
 	defer t.Close()
 
 	p := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, s.Artifact.Version)
-	pat, err := pattern.For(s.Pattern.Type)
-	if err != nil {
-		return nil, coded("ERR_UNSUPPORTED", host, "VALIDATE", err)
-	}
 	rc := releaseCtx(s, p)
 
-	if err := e.preflight(ctx, t, s, p, pat, rc); err != nil {
+	if err := sl.timed(ctx, "PREFLIGHT", func() error { return e.preflight(ctx, t, s, p, pat, rc) }); err != nil {
 		return nil, err
 	}
 
+	lstart := time.Now()
 	lk, warn, err := AcquireLock(ctx, t, p, lockOwner(), "deploy", s.Strategy.EffectiveLockTimeout())
+	sl.emit(ctx, "LOCK", lstart)
 	if err != nil {
 		return nil, err
 	}
@@ -85,9 +152,11 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	defer func() {
 		rctx, cancel := lockCleanupContext(ctx)
 		defer cancel()
+		ustart := time.Now()
 		if rerr := ReleaseLock(rctx, lk); rerr != nil {
 			e.warnf("lock release failed on %s: %v", host, rerr)
 		}
+		sl.emit(ctx, "UNLOCK", ustart)
 	}()
 
 	m, err := ReadManifest(ctx, t, p)
@@ -97,7 +166,7 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 
 	// Docker never uses staging/junction (DESIGN §9.6).
 	if s.Pattern.Type == spec.PatternDockerCont {
-		return e.deployDocker(ctx, t, s, p, pat.(*pattern.DockerContainer), rc, m)
+		return e.deployDocker(ctx, sl, t, s, p, pat.(*pattern.DockerContainer), rc, m)
 	}
 
 	// Idempotency short-circuit (DESIGN §10.1 step 2).
@@ -111,8 +180,10 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	}
 
 	prev := ""
+	prevChecksum := ""
 	if m != nil {
 		prev = m.CurrentVersion
+		prevChecksum = m.ArtifactChecksum
 	}
 	started := time.Now().UTC()
 	// Best-effort collection of logs.paths + windows_event_logs since operation
@@ -121,17 +192,19 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	defer e.collectDeploymentLogs(ctx, t, s, p, started)
 
 	// STAGE / FETCH / CHECKSUM / EXTRACT / RENDER — no live mutation yet.
-	if err := e.stageOnHost(ctx, t, s, p, pat, rc); err != nil {
+	if err := e.stageOnHost(ctx, sl, t, s, p, pat, rc); err != nil {
 		return nil, err
 	}
 
 	// SWITCHOVER — from here on, failures trigger rollback (DESIGN §10.3).
-	switchErr := e.switchOn(ctx, t, s, p, pat, rc)
+	switchErr := e.switchOn(ctx, sl, t, s, p, pat, rc)
 	if switchErr == nil {
-		switchErr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Current, rc.Env)
+		switchErr = sl.timed(ctx, "HEALTH", func() error {
+			return RunHealthCheck(ctx, t, &s.HealthCheck, p.Current, rc.Env)
+		})
 	}
 	if switchErr != nil {
-		return nil, e.rollbackSingle(ctx, t, s, p, pat, prev, started, switchErr)
+		return nil, e.rollbackSingle(ctx, sl, t, s, p, pat, prev, prevChecksum, started, switchErr)
 	}
 
 	// FINALIZE + PRUNE (DESIGN §10.1 steps 12–13).
@@ -143,10 +216,11 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 		LastOperation: LastOp{Type: "deploy", Result: "success",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
-	if err := WriteManifest(ctx, t, p, nm); err != nil {
-		return nil, coded("ERR_CONNECT", host, "FINALIZE", err)
+	ferr := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, p, nm) })
+	if ferr != nil {
+		return nil, coded("ERR_CONNECT", host, "FINALIZE", ferr)
 	}
-	if err := e.pruneReleases(ctx, t, s, p, nm); err != nil {
+	if err := sl.timed(ctx, "PRUNE", func() error { return e.pruneReleases(ctx, t, s, p, nm) }); err != nil {
 		e.warnf("prune failed on %s: %v", host, err) // never fails the apply
 	}
 	st, _ := pat.Status(ctx, t, rc)
@@ -155,62 +229,129 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 
 // rollbackSingle implements DESIGN §10.3 for one host. Returns the ORIGINAL
 // error (annotated) on successful rollback; ERR_ROLLBACK_FAILED otherwise.
-func (e *Engine) rollbackSingle(ctx context.Context, t transport.Transport, s *spec.Deployment,
-	p layout.Paths, pat pattern.Pattern, prev string, started time.Time, orig error) error {
+func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
+	p layout.Paths, pat pattern.Pattern, prev, prevChecksum string, started time.Time, orig error) error {
 	host := t.Host()
 	if !s.Strategy.EffectiveRollback() {
-		e.finalizeFailed(ctx, t, s, p, prev, started, "failed")
-		return fmt.Errorf("%w; rollback_on_failure=false — target left as-is for inspection", orig)
+		// §10.2 last row: record last_operation=failed so Read reports drift. A
+		// failed-manifest write error must not be swallowed — it is folded into the
+		// surfaced error so the caller learns the failed state was not persisted
+		// (evaluator item 4). On a FRESH failure (prev=="") the attempted version
+		// is recorded so §10.2 persistence still happens instead of no-op'ing on an
+		// empty version (evaluator iter5 item 1).
+		failVer := prev
+		if failVer == "" {
+			failVer = s.Artifact.Version
+		}
+		ferr := e.finalizeFailed(ctx, sl, t, s, p, failVer, started, "failed")
+		out := fmt.Errorf("%w; rollback_on_failure=false — target left as-is for inspection", orig)
+		if ferr != nil {
+			return coded("ERR_CONNECT", host, "FINALIZE",
+				fmt.Errorf("%v; failed-manifest write error: %v", out, ferr))
+		}
+		return out
 	}
+	rbStart := time.Now()
 	if prev == "" {
-		// Fresh install failure ⇒ clean the machine (DESIGN §10.3 row 1).
+		// Fresh install failure ⇒ clean the machine (DESIGN §10.3 row 1). Every
+		// cleanup action's error is collected: a failed cleanup means the machine
+		// is NOT actually clean, so we surface ERR_ROLLBACK_FAILED rather than
+		// falsely report a cleaned target (evaluator iter2 item 6).
 		rcNew := releaseCtx(s, p)
-		_ = pat.Stop(ctx, t, rcNew)
-		_ = pat.Uninstall(ctx, t, rcNew, false)
-		_ = e.removeJunction(ctx, t, p)
-		_ = e.removePath(ctx, t, p.Manifest)
+		var cleanupErrs []error
+		if err := pat.Stop(ctx, t, rcNew); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("stop: %w", err))
+		}
+		if err := pat.Uninstall(ctx, t, rcNew, false); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("uninstall: %w", err))
+		}
+		if err := e.removeJunction(ctx, t, p); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("junction: %w", err))
+		}
+		if err := e.removePath(ctx, t, p.Manifest); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("manifest: %w", err))
+		}
+		sl.emit(ctx, "ROLLBACK", rbStart)
+		if len(cleanupErrs) > 0 {
+			// §10.6: persist a failed manifest recording the unknown state before
+			// surfacing ERR_ROLLBACK_FAILED. The fresh cleanup may have removed the
+			// manifest, so write one at the attempted (current) version recording
+			// last_operation.result=failed; a write failure is folded into the
+			// diagnostic so we never claim persistence that did not happen.
+			ferr := e.finalizeFailed(ctx, sl, t, s, p, s.Artifact.Version, started, "failed")
+			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; fresh-install cleanup error: %v",
+				host, orig, errors.Join(cleanupErrs...))
+			if ferr != nil {
+				detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, ferr)
+			}
+			return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
+		}
 		return fmt.Errorf("%w; fresh install failed — target cleaned (no service, no junction, no manifest)", orig)
 	}
 	tflog.Warn(ctx, "deploy failed; rolling back", map[string]interface{}{
 		"host": host, "from": s.Artifact.Version, "to": prev, "cause": orig.Error()})
 
 	pp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, prev)
-	rcPrev := releaseCtx(s, pp)
+	// Restore the PREVIOUS release: thread `prev` so LD_VERSION/ReleaseCtx.Version
+	// reflect the version being brought back up, not the failed s.Artifact.Version
+	// (DESIGN §9.1). Otherwise Configure would bake the new version's LD_VERSION
+	// into the restored previous-version service's SCM Environment value.
+	rcPrev := releaseCtxVersion(s, pp, prev)
 	rb := func() error {
-		if err := pat.Stop(ctx, t, rcPrev); err != nil {
+		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rcPrev) }); err != nil {
 			return err
 		}
-		if err := e.switchJunction(ctx, t, pp); err != nil {
+		if err := sl.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, t, pp) }); err != nil {
 			return err
 		}
-		if err := pat.Configure(ctx, t, rcPrev); err != nil {
+		if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rcPrev) }); err != nil {
 			return err
 		}
-		if err := pat.Start(ctx, t, rcPrev); err != nil {
+		if err := sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rcPrev) }); err != nil {
 			return err
 		}
-		return RunHealthCheck(ctx, t, &s.HealthCheck, pp.Current, rcPrev.Env)
+		return sl.timed(ctx, "HEALTH", func() error {
+			return RunHealthCheck(ctx, t, &s.HealthCheck, pp.Current, rcPrev.Env)
+		})
 	}
-	if rerr := rb(); rerr != nil {
-		e.finalizeFailed(ctx, t, s, pp, prev, started, "failed")
-		return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-			fmt.Errorf("MACHINE IN UNKNOWN STATE — manual intervention required; deploy error: %v; rollback error: %v", orig, rerr))
+	rerr := rb()
+	sl.emit(ctx, "ROLLBACK", rbStart)
+	if rerr != nil {
+		fmErr := e.finalizeFailed(ctx, sl, t, s, pp, prev, started, "failed")
+		detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; rollback error: %v", host, orig, rerr)
+		if fmErr != nil {
+			detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
+		}
+		return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
 	}
+	// Restore succeeded: persist a manifest reflecting the previous version as the
+	// current state, INCLUDING its artifact checksum so the recorded manifest is
+	// consistent with what is actually running. A WriteManifest failure leaves the
+	// manifest out of sync with the restored machine, so it is surfaced as
+	// ERR_ROLLBACK_FAILED rather than silently ignored (evaluator iter2 item 7).
 	m := &Manifest{
 		Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
-		CurrentVersion: prev, CurrentRelease: pp.Release,
+		CurrentVersion: prev, CurrentRelease: pp.Release, ArtifactChecksum: prevChecksum,
 		ProviderVersion: ProviderVersion,
 		LastOperation: LastOp{Type: "deploy", Result: "rolled_back",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
-	_ = WriteManifest(ctx, t, pp, m)
+	if werr := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, pp, m) }); werr != nil {
+		return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
+			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — restored to %s but manifest write failed: %v; deploy error: %v",
+				host, prev, werr, orig))
+	}
 	return fmt.Errorf("%w; rolled back to %s (healthy)", orig, prev)
 }
 
-func (e *Engine) finalizeFailed(ctx context.Context, t transport.Transport, s *spec.Deployment,
-	p layout.Paths, current string, started time.Time, result string) {
+// finalizeFailed persists a manifest recording last_operation.result=<result>
+// (DESIGN §10.2/§10.6). The manifest write is emitted as a structured FINALIZE
+// step (every executed fixed step, including failure/rollback occurrences, must
+// carry app/host/step/version/duration_ms — evaluator iter5 item 3).
+func (e *Engine) finalizeFailed(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
+	p layout.Paths, current string, started time.Time, result string) error {
 	if current == "" {
-		return
+		return nil
 	}
 	m, _ := ReadManifest(ctx, t, p)
 	if m == nil {
@@ -219,13 +360,21 @@ func (e *Engine) finalizeFailed(ctx context.Context, t transport.Transport, s *s
 	}
 	m.LastOperation = LastOp{Type: "deploy", Result: result,
 		Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)}
-	_ = WriteManifest(ctx, t, p, m)
+	if err := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, p, m) }); err != nil {
+		e.warnf("failed-manifest write on %s: %v", t.Host(), err)
+		return err
+	}
+	return nil
 }
 
-// deployDocker = D-steps (DESIGN §9.6) with image-id rollback.
-func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spec.Deployment,
+// deployDocker = D-steps (DESIGN §9.6) with image-id rollback. Emits the same
+// structured step records as the file-based path for its executed steps: FETCH
+// (image pull), START (rm -f old + run new), HEALTH, FINALIZE (manifest write),
+// and ROLLBACK on failure — each carrying app/host/step/version/duration_ms.
+func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, dc *pattern.DockerContainer, rc pattern.ReleaseCtx, m *Manifest) (*Status, error) {
 	host := t.Host()
+	sl = sl.forHost(host)
 	started := time.Now().UTC()
 	if m != nil && m.CurrentVersion == s.Artifact.Version {
 		if st, err := dc.Status(ctx, t, rc); err == nil && st == "running" {
@@ -240,27 +389,88 @@ func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spe
 	// Best-effort log/event collection on every exit path from here (including
 	// image-pull failure) — DESIGN §6.5. No-op when nothing is configured.
 	defer e.collectDeploymentLogs(ctx, t, s, p, started)
-	if err := dc.Pull(ctx, t, rc); err != nil {
-		return nil, err
+	fetchStart := time.Now()
+	perr := dc.Pull(ctx, t, rc)
+	sl.emit(ctx, "FETCH", fetchStart)
+	if perr != nil {
+		return nil, perr
 	}
 	if cur, err := dc.CurrentImageID(ctx, t, rc); err == nil && cur != "" {
 		oldImage = cur
 	}
-	runErr := dc.Start(ctx, t, rc) // rm -f old + run new
+	runErr := sl.timed(ctx, "START", func() error { return dc.Start(ctx, t, rc) }) // rm -f old + run new
 	if runErr == nil {
-		runErr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rc.Env)
+		runErr = sl.timed(ctx, "HEALTH", func() error {
+			return RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rc.Env)
+		})
 	}
 	if runErr != nil {
 		if !s.Strategy.EffectiveRollback() || oldImage == "" {
-			return nil, fmt.Errorf("%w; no docker rollback performed (prev image unknown or rollback disabled)", runErr)
+			// §10.2: record last_operation=failed so Read reports drift even when no
+			// rollback is performed (rollback disabled or previous image unknown).
+			// Record at the previous version if known, else the attempted version so
+			// a fresh docker failure still persists failed state (evaluator iter5 item 2).
+			failVer := prev
+			if failVer == "" {
+				failVer = s.Artifact.Version
+			}
+			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started)
+			out := fmt.Errorf("%w; no docker rollback performed (prev image unknown or rollback disabled)", runErr)
+			if fmErr != nil {
+				return nil, coded("ERR_CONNECT", host, "FINALIZE",
+					fmt.Errorf("%v; failed-manifest write error: %v", out, fmErr))
+			}
+			return nil, out
 		}
-		if rerr := dc.RunNew(ctx, t, rc, oldImage); rerr != nil {
-			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-				fmt.Errorf("MACHINE IN UNKNOWN STATE; deploy: %v; rollback: %v", runErr, rerr))
+		rbStart := time.Now()
+		rerr := dc.RunNew(ctx, t, rc, oldImage)
+		if rerr == nil {
+			rerr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rc.Env)
 		}
-		if herr := RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rc.Env); herr != nil {
-			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-				fmt.Errorf("MACHINE IN UNKNOWN STATE; deploy: %v; rollback health: %v", runErr, herr))
+		sl.emit(ctx, "ROLLBACK", rbStart)
+		if rerr != nil {
+			// §10.6: persist a failed manifest before surfacing ERR_ROLLBACK_FAILED.
+			// When the old container exists but no prior manifest does (prev==""),
+			// record at the attempted version so the failed state is still persisted
+			// (evaluator iter6 item 2).
+			failVer := prev
+			if failVer == "" {
+				failVer = s.Artifact.Version
+			}
+			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started)
+			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy: %v; rollback: %v", host, runErr, rerr)
+			if fmErr != nil {
+				detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
+			}
+			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
+		}
+		// §10.2/§10.4: the container is back on the previous image and running.
+		// Persist a rolled_back manifest at the previous version (image id = the
+		// restored image) so Read reports the restored state instead of treating the
+		// resource as absent — mirroring the file-based rollback (rollbackSingle) and
+		// the docker failed-rollback branch, both of which persist a manifest. A
+		// FINALIZE failure here leaves the machine restored but unrecorded, so it is
+		// surfaced as ERR_ROLLBACK_FAILED (UNKNOWN STATE) exactly like the file path.
+		// Skipped when no previous version is known (unmanaged container): there is
+		// no version to record.
+		if prev != "" {
+			rm := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
+				CurrentVersion: prev, CurrentRelease: "docker://" + rc.Spec.Pattern.ContainerName,
+				ProviderVersion: ProviderVersion,
+				Extra:           map[string]string{"image_id": oldImage},
+				LastOperation: LastOp{Type: "deploy", Result: "rolled_back",
+					Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
+			}
+			if werr := sl.timed(ctx, "FINALIZE", func() error {
+				if derr := ensureDir(ctx, t, p.Root); derr != nil {
+					return derr
+				}
+				return WriteManifest(ctx, t, p, rm)
+			}); werr != nil {
+				return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
+					fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — restored to previous image %s but manifest write failed: %v; deploy error: %v",
+						host, short(oldImage), werr, runErr))
+			}
 		}
 		return nil, fmt.Errorf("%w; rolled back to previous image %s", runErr, short(oldImage))
 	}
@@ -273,11 +483,46 @@ func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spe
 		LastOperation: LastOp{Type: "deploy", Result: "success",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
-	if err := ensureDir(ctx, t, p.Root); err == nil {
-		_ = WriteManifest(ctx, t, p, nm)
+	// A FINALIZE failure means the new container is running but its manifest was
+	// not persisted — the deploy is NOT durably recorded, so fail closed instead
+	// of reporting success (evaluator item 9).
+	if ferr := sl.timed(ctx, "FINALIZE", func() error {
+		if err := ensureDir(ctx, t, p.Root); err != nil {
+			return err
+		}
+		return WriteManifest(ctx, t, p, nm)
+	}); ferr != nil {
+		return nil, coded("ERR_CONNECT", host, "FINALIZE", ferr)
 	}
 	st, _ := dc.Status(ctx, t, rc)
 	return statusFrom(nm, host, st), nil
+}
+
+// dockerFinalizeFailed persists a failed manifest for the docker path (DESIGN
+// §10.2/§10.6) recording last_operation.result=failed. The manifest write is
+// emitted as a structured FINALIZE step (evaluator iter5 item 3).
+func (e *Engine) dockerFinalizeFailed(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
+	p layout.Paths, prev, prevImage string, started time.Time) error {
+	if prev == "" {
+		return nil
+	}
+	m := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
+		CurrentVersion: prev, CurrentRelease: "docker://" + s.Pattern.ContainerName,
+		ProviderVersion: ProviderVersion,
+		Extra:           map[string]string{"image_id": prevImage},
+		LastOperation: LastOp{Type: "deploy", Result: "failed",
+			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
+	}
+	if err := sl.timed(ctx, "FINALIZE", func() error {
+		if derr := ensureDir(ctx, t, p.Root); derr != nil {
+			return derr
+		}
+		return WriteManifest(ctx, t, p, m)
+	}); err != nil {
+		e.warnf("docker failed-manifest write on %s: %v", t.Host(), err)
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -339,13 +584,29 @@ func isAbsTargetPath(os spec.OSKind, g string) bool {
 	return strings.HasPrefix(g, "/")
 }
 
+// releaseCtx builds the pattern context for a FORWARD operation, whose release
+// version is the spec's desired artifact version (paths and env agree).
 func releaseCtx(s *spec.Deployment, p layout.Paths) pattern.ReleaseCtx {
+	return releaseCtxVersion(s, p, s.Artifact.Version)
+}
+
+// releaseCtxVersion builds the pattern context for the release identified by
+// `version` — the version actually being (re)configured on the target, which is
+// NOT necessarily s.Artifact.Version. layout.Paths carries only the version-
+// independent `current` junction (LD_RELEASE_DIR), so the running version has to
+// be threaded in explicitly. Rollback/restore MUST pass the PREVIOUS version so
+// LD_VERSION (and ReleaseCtx.Version) reflect the running release per DESIGN
+// §9.1: windows_service bakes rc.Env — including LD_VERSION — into the SCM
+// Environment value, so a restored previous-version service would otherwise come
+// up advertising the failed/new version and its /health body `v=<LD_VERSION>`
+// (§18) would be wrong.
+func releaseCtxVersion(s *spec.Deployment, p layout.Paths, version string) pattern.ReleaseCtx {
 	nodePort := 0
 	if s.Pattern.Type == spec.PatternNodeWebApp {
 		nodePort = s.Pattern.Port
 	}
-	env := layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, s.Artifact.Version, p, nodePort), s.Environment)
-	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: s.Artifact.Version,
+	env := layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, version, p, nodePort), s.Environment)
+	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: version,
 		P: p, Spec: s, Env: env}
 }
 
@@ -396,17 +657,29 @@ avail=$(df -Pm "$(dirname %s)" | awk 'NR==2{print $4}')
 
 // stageOnHost = FETCH+CHECKSUM+EXTRACT+deps+RENDER into the immutable release
 // dir. Cached releases (marker sha match) skip fetch/extract (DESIGN §10.5).
-func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec.Deployment,
+// Every fixed step is logged through sl in execution order; conditional steps
+// (FETCH/CHECKSUM/EXTRACT) are simply not entered when the release is cached, so
+// they never appear in the log (DESIGN §10.5 / test "conditional steps").
+func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, pat pattern.Pattern, rc pattern.ReleaseCtx) (err error) {
 	host := t.Host()
+	sl = sl.forHost(host)
+	stageStart := time.Now()
 	if err := ensureLayout(ctx, t, p); err != nil {
+		sl.emit(ctx, "STAGE", stageStart)
 		return coded("ERR_CONNECT", host, "STAGE", err)
 	}
 	// STAGING WIPE (start): staging/ is scratch, wiped whole at the start of
 	// EVERY op — cached or not (DESIGN §9.1 "wiped at start & end of every op").
 	if err := e.wipeStaging(ctx, t, p); err != nil {
+		sl.emit(ctx, "STAGE", stageStart)
 		return coded("ERR_CONNECT", host, "STAGE", err)
 	}
+	// NOTE: staging-dir prep (ensureLayout + wipe) runs first physically, but the
+	// canonical step order (implementation-plan.md:224 / DESIGN §8.5) is
+	// FETCH → CHECKSUM → STAGE → EXTRACT. The STAGE record is therefore emitted
+	// AFTER fetch+verify below (the verified package is what gets "staged" for
+	// extraction), so the emitted trace matches the pinned fixed-step order.
 	// STAGING WIPE (end): declared FIRST so it runs LAST (LIFO) — after the
 	// incomplete-release cleanup below has settled `err`. A cleanup failure is
 	// surfaced as the op error when the op otherwise succeeded (never leave a
@@ -439,13 +712,29 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 		return coded("ERR_CONNECT", host, "STAGE", cerr)
 	}
 	if !cached {
-		if ferr := e.fetchToStaging(ctx, t, s, p); ferr != nil {
+		fetchStart := time.Now()
+		ferr := e.fetchToStaging(ctx, t, s, p)
+		// FETCH covers the download; CHECKSUM covers artifact verification. Both
+		// are emitted even on failure so the step trace always records where
+		// staging stopped. A checksum-mismatch is surfaced by fetchToStaging as a
+		// CodedError(ERR_CHECKSUM_MISMATCH): the download reached the verify
+		// stage, so FETCH is recorded as done and CHECKSUM is recorded as the
+		// failing step.
+		sl.emit(ctx, "FETCH", fetchStart)
+		if isChecksumErr(ferr) {
+			sl.emit(ctx, "CHECKSUM", time.Now())
+			return ferr
+		}
+		if ferr != nil {
 			return ferr // fetch writes only to staging; release tree untouched
 		}
+		sl.emit(ctx, "CHECKSUM", time.Now())
+		// STAGE: the verified package is now staged, ready for extraction.
+		sl.emit(ctx, "STAGE", stageStart)
 		// extract creates the release dir — from here the release is "ours" and
 		// every failure below trips the incomplete-release cleanup defer.
 		createdRelease = true
-		if xerr := e.extract(ctx, t, p); xerr != nil {
+		if xerr := sl.timed(ctx, "EXTRACT", func() error { return e.extract(ctx, t, p) }); xerr != nil {
 			return xerr
 		}
 		if n, ok := pat.(*pattern.NodeWebApp); ok {
@@ -457,11 +746,15 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 			return coded("ERR_CONNECT", host, "STAGE", merr)
 		}
 	} else {
+		// Cached release: FETCH/CHECKSUM/EXTRACT are skipped (conditional steps),
+		// but STAGE still records that the cached package is staged for this op.
+		sl.emit(ctx, "STAGE", stageStart)
 		tflog.Info(ctx, "release cached; skipping fetch/extract",
 			map[string]interface{}{"host": host, "version": s.Artifact.Version})
 	}
 	// RENDER: files land in the release dir every apply (DESIGN §6.4). A failure
 	// here on a freshly-created release trips the incomplete-release cleanup.
+	renderStart := time.Now()
 	for _, f := range s.Files {
 		var dest string
 		if t.OS() == spec.OSWindows {
@@ -470,9 +763,11 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 			dest = p.Release + "/" + strings.TrimLeft(f.Path, "/")
 		}
 		if werr := writeSmallFile(ctx, t, dest, f.Content); werr != nil {
+			sl.emit(ctx, "RENDER", renderStart)
 			return coded("ERR_EXTRACT", host, "RENDER", werr)
 		}
 	}
+	sl.emit(ctx, "RENDER", renderStart)
 	// post_install hook runs in release dir after extract, before switchover;
 	// non-zero exit ⇒ ERR_SERVICE_INSTALL (DESIGN §6.4).
 	if hook := s.Pattern.PostInstall; hook != "" {
@@ -509,18 +804,19 @@ func (e *Engine) cleanupIncompleteRelease(ctx context.Context, t transport.Trans
 }
 
 // switchOn = STOP + SWITCH + CONFIGURE + START for one host (DESIGN §10.1 7–10).
-func (e *Engine) switchOn(ctx context.Context, t transport.Transport, s *spec.Deployment,
+func (e *Engine) switchOn(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, pat pattern.Pattern, rc pattern.ReleaseCtx) error {
-	if err := pat.Stop(ctx, t, rc); err != nil {
+	sl = sl.forHost(t.Host())
+	if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
 		return err
 	}
-	if err := e.switchJunction(ctx, t, p); err != nil {
+	if err := sl.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, t, p) }); err != nil {
 		return err
 	}
-	if err := pat.Configure(ctx, t, rc); err != nil {
+	if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
 		return err
 	}
-	return pat.Start(ctx, t, rc)
+	return sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rc) })
 }
 
 func (e *Engine) fetchToStaging(ctx context.Context, t transport.Transport, s *spec.Deployment, p layout.Paths) error {
@@ -560,7 +856,14 @@ func (e *Engine) fetchToStaging(ctx context.Context, t transport.Transport, s *s
 	f, err := artifact.Fetch(ctx, &s.Artifact)
 	if err != nil {
 		if ce, ok := err.(*artifact.CodedError); ok {
-			return coded(ce.Code, host, "FETCH", ce.Err)
+			// A checksum mismatch is a CHECKSUM-step failure even though it is
+			// detected during the runner-side fetch+verify (DESIGN §8.5: the
+			// diagnostic step must match the actual failing operation).
+			step := "FETCH"
+			if ce.Code == "ERR_CHECKSUM_MISMATCH" {
+				step = "CHECKSUM"
+			}
+			return coded(ce.Code, host, step, ce.Err)
 		}
 		return coded("ERR_ARTIFACT_FETCH", host, "FETCH", err)
 	}

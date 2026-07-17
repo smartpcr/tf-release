@@ -33,17 +33,23 @@ type fakeHost struct {
 	current    string          // junction target
 	svc        string          // "", "Stopped", "Running"
 	fail       map[string]bool // step toggles: "switch","health","start","extract"
+	failN      map[string]int  // one-shot step failures: fail the first N calls, then succeed
 	healthGate func() bool     // optional dynamic health failure (true => fail)
 	log        []string        // executed step markers, in order
 }
 
 func newFakeHost(name string) *fakeHost {
-	return &fakeHost{host: name, files: map[string][]byte{}, dirs: map[string]bool{}, dirTS: map[string]int64{}, fail: map[string]bool{}}
+	return &fakeHost{host: name, files: map[string][]byte{}, dirs: map[string]bool{}, dirTS: map[string]int64{}, fail: map[string]bool{}, failN: map[string]int{}}
 }
 
 func (f *fakeHost) mark(s string) { f.log = append(f.log, s) }
 
-func (f *fakeHost) Connect(ctx context.Context) error { return nil }
+func (f *fakeHost) Connect(ctx context.Context) error {
+	if f.fail["connect"] {
+		return fmt.Errorf("simulated connect failure")
+	}
+	return nil
+}
 func (f *fakeHost) Close() error                      { return nil }
 func (f *fakeHost) OS() spec.OSKind                   { return spec.OSWindows }
 func (f *fakeHost) Host() string                      { return f.host }
@@ -77,6 +83,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 	s := c.Script
 	switch {
 	case strings.Contains(s, "$PSVersionTable"): // preflight
+		if f.fail["preflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "preflight gate failed"}, nil
+		}
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
@@ -113,6 +122,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case reLock.MatchString(s): // AcquireLock atomic create (temp then Move publish)
+		if f.fail["lock"] {
+			return transport.Result{}, fmt.Errorf("simulated lock acquire transport failure")
+		}
 		p := reLock.FindStringSubmatch(s)[1]
 		if _, held := f.files[p]; held {
 			return transport.Result{ExitCode: 48}, nil // create-with-content: fail if exists
@@ -129,6 +141,11 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case reWrite.MatchString(s): // writeSmallFile
 		m := reWrite.FindStringSubmatch(s)
+		// RENDER failure is scoped to the rendered config file so it does not also
+		// break manifest writes (which also flow through writeSmallFile).
+		if f.fail["render"] && strings.Contains(m[1], "render.conf") {
+			return transport.Result{ExitCode: 1, Stderr: "render write failed"}, nil
+		}
 		raw, err := base64.StdEncoding.DecodeString(m[2])
 		if err != nil {
 			return transport.Result{ExitCode: 1, Stderr: "b64"}, nil
@@ -138,6 +155,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case reRead.MatchString(s): // readSmallFile
 		p := reRead.FindStringSubmatch(s)[1]
+		if f.fail["read"] {
+			return transport.Result{}, fmt.Errorf("simulated manifest read transport failure")
+		}
 		raw, exists := f.files[p]
 		if !exists {
 			return transport.Result{ExitCode: 3}, nil
@@ -152,9 +172,16 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "New-Item -ItemType Directory"): // ensureLayout/ensureDir
+		if f.fail["stage"] {
+			return transport.Result{ExitCode: 1, Stderr: "mkdir failed"}, nil
+		}
 		return ok(""), nil
 
 	case reMklink.MatchString(s): // switchJunction
+		if f.failN["switch"] > 0 {
+			f.failN["switch"]--
+			return transport.Result{ExitCode: 42, Stderr: "mklink failed"}, nil
+		}
 		if f.fail["switch"] {
 			return transport.Result{ExitCode: 42, Stderr: "mklink failed"}, nil
 		}
@@ -164,6 +191,13 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "sc.exe create") || strings.Contains(s, "sc.exe config"): // Configure
+		if f.failN["configure"] > 0 {
+			f.failN["configure"]--
+			return transport.Result{ExitCode: 46, Stderr: "configure failed"}, nil
+		}
+		if f.fail["configure"] {
+			return transport.Result{ExitCode: 46, Stderr: "configure failed"}, nil
+		}
 		f.mark("CONFIGURE")
 		if f.svc == "" {
 			f.svc = "Stopped"
@@ -178,6 +212,10 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "Start-Service"): // Start
+		if f.failN["start"] > 0 {
+			f.failN["start"]--
+			return transport.Result{ExitCode: 44, Stderr: "start timeout"}, nil
+		}
 		if f.fail["start"] {
 			return transport.Result{ExitCode: 44, Stderr: "start timeout"}, nil
 		}
@@ -186,6 +224,12 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "exit 41"): // target-pull fetch script (checksum marker)
+		if f.fail["checksum"] {
+			return transport.Result{ExitCode: 41, Stderr: "sha256 mismatch"}, nil
+		}
+		if f.fail["fetch"] {
+			return transport.Result{ExitCode: 40, Stderr: "download failed"}, nil
+		}
 		f.mark("FETCH")
 		return ok(""), nil
 
@@ -249,6 +293,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "sc.exe query") && strings.Contains(s, "sc.exe delete"): // Uninstall
+		if f.fail["uninstall"] {
+			return transport.Result{ExitCode: 46, Stderr: "sc delete failed"}, nil
+		}
 		f.mark("UNINSTALL")
 		f.svc = ""
 		return ok(""), nil
@@ -346,6 +393,15 @@ func winSvcSpecPostInstall(t *testing.T, url, checksum string) *spec.Deployment 
 	t.Helper()
 	d := winSvcSpec(t, url, checksum)
 	d.Pattern.PostInstall = "LDPOSTINSTALL"
+	return d
+}
+
+// winSvcSpecRender is winSvcSpec plus a rendered config file (render.conf) so the
+// RENDER step actually writes a file the fake transport can fail on demand.
+func winSvcSpecRender(t *testing.T, url, checksum string) *spec.Deployment {
+	t.Helper()
+	d := winSvcSpec(t, url, checksum)
+	d.Files = []spec.RenderedFile{{Path: "render.conf", Content: "x"}}
 	return d
 }
 
@@ -962,6 +1018,9 @@ pass_criteria: { exit_codes: [0] }
 	if err != nil {
 		t.Fatalf("spec: %v", err)
 	}
+	// Direct runner/results output to a per-test temp dir so tests never write
+	// generated `labdeploy-results/**` artifacts into the repo working tree.
+	tr.Collect.DestinationDir = t.TempDir()
 	return tr
 }
 
