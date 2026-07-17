@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 )
 
 // ValidationError carries the ERR_SPEC_INVALID contract (DESIGN §12).
@@ -311,8 +312,8 @@ func ValidateDeployment(d *Deployment) error {
 		}
 	}
 	for i, f := range d.Files {
-		if f.Path == "" {
-			return vErr("files[%d].path: required", i)
+		if err := validateRelPath(f.Path, i); err != nil {
+			return err
 		}
 	}
 	if d.Pattern.Account.PasswordEnv != "" {
@@ -368,6 +369,49 @@ func ValidateTestRun(t *TestRun) error {
 		}
 	}
 	return nil
+}
+
+// validateRelPath enforces DESIGN §6.5: files[].path is "relative to release
+// dir". It rejects empty paths, absolute paths (both POSIX "/x" and Windows
+// "C:\x" / "\\host\share"), and any ".." traversal component so a spec can never
+// write outside the release dir. Detection is OS-independent because a spec may
+// be authored for a Windows target while validated on a Linux runner.
+func validateRelPath(p string, i int) error {
+	if p == "" {
+		return vErr("files[%d].path: required", i)
+	}
+	if isAbsPath(p) {
+		return vErr("files[%d].path: must be relative to the release dir, got absolute path %q", i, p)
+	}
+	// Normalise separators, then inspect components for "..".
+	norm := strings.ReplaceAll(p, `\`, "/")
+	for _, seg := range strings.Split(norm, "/") {
+		if seg == ".." {
+			return vErr("files[%d].path: must not contain \"..\" traversal, got %q", i, p)
+		}
+	}
+	return nil
+}
+
+// isAbsPath reports whether p is absolute under either POSIX or Windows rules,
+// independent of the host OS running validation.
+func isAbsPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	// POSIX absolute or Windows root-relative / UNC ("/x", "\x", "\\host\share").
+	if p[0] == '/' || p[0] == '\\' {
+		return true
+	}
+	// Windows drive-letter absolute: "C:\x" or "C:/x".
+	if len(p) >= 3 && isDriveLetter(p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
+		return true
+	}
+	return false
+}
+
+func isDriveLetter(c byte) bool {
+	return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')
 }
 
 func equalsFold(a, b string) bool {

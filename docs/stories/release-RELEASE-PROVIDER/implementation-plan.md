@@ -48,7 +48,7 @@ storyId: "release:RELEASE-PROVIDER"
 
 ### Implementation Steps
 - [x] Implement `internal/spec/validate.go` covering the DESIGN sec 6/sec 7 rules that are landed: envelope regex, target merge + required fields, artifact regex/checksum rules, pattern x os matrix (sec 14), artifact x pattern matrix, and `files[].path` required (validate.go lines 313-317).
-- [ ] Add the missing `files[].path` relative-path constraint (DESIGN.md line 323): `validate.go` lines 313-317 only reject an empty path; reject absolute paths and `..` traversal so a spec cannot write outside the release dir.
+- [x] Add the missing `files[].path` relative-path constraint (DESIGN.md line 323): `validate.go` lines 313-317 only reject an empty path; reject absolute paths and `..` traversal so a spec cannot write outside the release dir.
 - [x] Implement `${var:NAME}` substitution sourced only from the resource `variables` map, with `$${var:...}` escape and unresolved-token error `unresolved variable NAME at <json-path>`.
 - [x] Implement env-var NAME hygiene: specs carry env-var names only; a referenced-but-unset env var yields `ERR_SPEC_INVALID env var <NAME> ... is not set` before any dial.
 - [x] Emit every `ERR_SPEC_INVALID` with the offending JSON path, matching the VAL-01..VAL-09 message contracts.
@@ -59,7 +59,7 @@ storyId: "release:RELEASE-PROVIDER"
 ### Test Scenarios
 - [ ] Scenario: Validation matrix -- Given the table of VAL-01..VAL-09 invalid specs, When each is validated, Then each returns `ERR_SPEC_INVALID` with the expected JSON path and message fragment [proof: in-process; deps: none]
 - [ ] Scenario: Variable substitution and escape -- Given a spec with `${var:X}` and `$${var:Y}`, When substituted with `variables={X:...}`, Then `X` is replaced, literal `${var:Y}` is preserved, and an unknown name yields `ERR_SPEC_INVALID` [proof: in-process; deps: none]
-- [ ] Scenario: files path traversal rejected -- Given specs whose `files[].path` is (a) absolute (`/etc/x` or `C:\x`) and (b) contains `..` traversal (`../escape`), When validated, Then each returns `ERR_SPEC_INVALID` naming the offending `files[i].path`, while a plain relative path passes [proof: in-process; deps: none]
+- [x] Scenario: files path traversal rejected -- Given specs whose `files[].path` is (a) absolute (`/etc/x` or `C:\x`) and (b) contains `..` traversal (`../escape`), When validated, Then each returns `ERR_SPEC_INVALID` naming the offending `files[i].path`, while a plain relative path passes [proof: in-process; deps: none]
 
 ## Stage 1.4: Canonical JSON and Spec Hashing
 

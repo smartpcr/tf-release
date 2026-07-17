@@ -438,3 +438,50 @@ func TestMergeTargetDefaults(t *testing.T) {
 		t.Fatal("merge did not apply username")
 	}
 }
+
+func TestFilesPathTraversalRejected(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	base, _, err := ParseDeployment(winSvcYAML, map[string]string{"HOST": "lab-01"}, "")
+	if err != nil {
+		t.Fatalf("base parse: %v", err)
+	}
+
+	// A plain relative path passes.
+	base.Files = []RenderedFile{{Path: "config/app.json", Content: "{}"}}
+	if err := ValidateDeployment(base); err != nil {
+		t.Fatalf("relative path should pass: %v", err)
+	}
+
+	bad := []string{
+		"/etc/x",           // POSIX absolute
+		`C:\x`,             // Windows drive-letter absolute
+		"C:/x",             // Windows drive-letter absolute, forward slash
+		`\host\share\x`,    // Windows root-relative / UNC
+		"../escape",        // parent traversal
+		"a/../../escape",   // nested traversal
+		`sub\..\..\escape`, // Windows-separator traversal
+	}
+	for _, p := range bad {
+		base.Files = []RenderedFile{{Path: p, Content: "x"}}
+		err := ValidateDeployment(base)
+		if err == nil {
+			t.Fatalf("path %q must be rejected", p)
+		}
+		if !strings.Contains(err.Error(), "files[0].path") {
+			t.Fatalf("path %q: error must name files[0].path, got %v", p, err)
+		}
+	}
+}
+
+func TestFilesPathEmptyRejected(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	base, _, err := ParseDeployment(winSvcYAML, map[string]string{"HOST": "lab-01"}, "")
+	if err != nil {
+		t.Fatalf("base parse: %v", err)
+	}
+	base.Files = []RenderedFile{{Path: "", Content: "x"}}
+	err = ValidateDeployment(base)
+	if err == nil || !strings.Contains(err.Error(), "files[0].path") {
+		t.Fatalf("empty path must be rejected naming files[0].path, got %v", err)
+	}
+}
