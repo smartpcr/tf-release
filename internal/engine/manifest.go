@@ -141,6 +141,39 @@ func WriteManifest(ctx context.Context, t transport.Transport, p layout.Paths, m
 	return writeSmallFile(ctx, t, p.Manifest, string(b))
 }
 
+// FailedMarker is the suffix appended to deployed_version when the last
+// recorded operation failed, so a subsequent plan always shows drift and forces
+// a converging apply (DESIGN §10.4).
+const FailedMarker = "!failed"
+
+// ReconcileManifest maps a manifest read from the target into the Read-refresh
+// outcome (DESIGN §10.4):
+//   - absent manifest (m == nil) ⇒ present=false ⇒ caller RemoveResource.
+//   - last_operation.result == "failed" ⇒ deployedVersion carries the
+//     "<current_version>!failed" marker and warn carries a human-readable
+//     diagnostic so the plan surfaces the failed state.
+//   - otherwise deployedVersion == current_version and warn is empty.
+func ReconcileManifest(m *Manifest) (present bool, deployedVersion, warn string) {
+	if m == nil {
+		return false, "", ""
+	}
+	deployedVersion = m.CurrentVersion
+	if m.LastOperation.Result == "failed" {
+		deployedVersion = m.CurrentVersion + FailedMarker
+		warn = fmt.Sprintf(
+			"last %s operation on version %s failed (started %s); deployed_version marked %q to force a converging apply",
+			opOrUnknown(m.LastOperation.Type), m.CurrentVersion, m.LastOperation.Started, deployedVersion)
+	}
+	return true, deployedVersion, warn
+}
+
+func opOrUnknown(s string) string {
+	if s == "" {
+		return "deploy"
+	}
+	return s
+}
+
 // ------------------------------- locking (DESIGN §13) ----------------------
 
 type lockInfo struct {

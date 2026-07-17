@@ -719,8 +719,12 @@ func (e *Engine) ReadStatus(ctx context.Context, s *spec.Deployment) (*Status, e
 	if err != nil {
 		return nil, coded("ERR_CONNECT", host, "PREFLIGHT", err)
 	}
-	if m == nil {
+	present, deployedVer, warn := ReconcileManifest(m)
+	if !present {
 		return nil, nil
+	}
+	if warn != "" {
+		e.warnf("%s", warn)
 	}
 	pat, err := pattern.For(s.Pattern.Type)
 	if err != nil {
@@ -729,6 +733,7 @@ func (e *Engine) ReadStatus(ctx context.Context, s *spec.Deployment) (*Status, e
 	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
 	st, _ := pat.Status(ctx, t, releaseCtx(s, rp))
 	out := statusFrom(m, host, st)
+	out.DeployedVersion = deployedVer
 	if s.Pattern.Type == spec.PatternClusterGeneric {
 		out.Hosts = lowerAll(s.Target.Hosts)
 	}

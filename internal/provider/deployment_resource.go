@@ -223,6 +223,9 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	}
 	eng := engine.New()
 	st, err := eng.ReadStatus(ctx, d)
+	for _, w := range eng.Warnings {
+		resp.Diagnostics.AddWarning("labdeploy", w)
+	}
 	if err != nil {
 		// Unreachable target ≠ deleted resource (DESIGN §10.4): keep state.
 		resp.Diagnostics.AddWarning("labdeploy read degraded", err.Error())
