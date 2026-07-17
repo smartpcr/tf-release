@@ -153,8 +153,9 @@ func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + 
 // shQuote single-quotes for POSIX sh.
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// withEnvPS prepends $env:K='V'; lines in sorted key order (deterministic for
-// golden tests, DESIGN §17 transport).
+// withEnvPS prepends `$env:K='V';` lines in sorted key order (deterministic for
+// golden tests; DESIGN §8.1/§17 transport). Each assignment is single-quote
+// escaped and semicolon-terminated per DESIGN §8.1 line 420.
 func withEnvPS(script string, env map[string]string) string {
 	if len(env) == 0 {
 		return script
@@ -166,7 +167,7 @@ func withEnvPS(script string, env map[string]string) string {
 	sort.Strings(keys)
 	var b strings.Builder
 	for _, k := range keys {
-		fmt.Fprintf(&b, "$env:%s=%s\n", k, psQuote(env[k]))
+		fmt.Fprintf(&b, "$env:%s=%s;\n", k, psQuote(env[k]))
 	}
 	b.WriteString(script)
 	return b.String()

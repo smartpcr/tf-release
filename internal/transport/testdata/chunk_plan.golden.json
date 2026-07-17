@@ -1,0 +1,45 @@
+[
+  {
+    "size": 0,
+    "count": 0,
+    "chunks": null
+  },
+  {
+    "size": 1,
+    "count": 1,
+    "chunks": [
+      {
+        "Offset": 0,
+        "Len": 1,
+        "First": true
+      }
+    ]
+  },
+  {
+    "size": 48000,
+    "count": 1,
+    "chunks": [
+      {
+        "Offset": 0,
+        "Len": 48000,
+        "First": true
+      }
+    ]
+  },
+  {
+    "size": 48001,
+    "count": 2,
+    "chunks": [
+      {
+        "Offset": 0,
+        "Len": 48000,
+        "First": true
+      },
+      {
+        "Offset": 48000,
+        "Len": 1,
+        "First": false
+      }
+    ]
+  }
+]
