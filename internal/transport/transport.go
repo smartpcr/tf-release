@@ -79,8 +79,14 @@ func noRetry(err error) error { return &nonRetryable{err: err} }
 // sleep. An attempt may short-circuit the loop by returning a noRetry-wrapped
 // error (e.g. ERR_AUTH), which is returned verbatim. Any other non-nil error is
 // retryable; once attempts are exhausted the last one is wrapped in ERR_CONNECT.
+// A negative retries (nothing bounds target.connect_retries >= 0 in the spec
+// validators) is clamped so the helper always performs at least one real attempt
+// rather than returning a garbled "after 0 attempts" error wrapping a nil error.
 func retryConnect(ctx context.Context, retries int, backoff time.Duration, attempt func() error) error {
 	attempts := retries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
 	var lastErr error
 	for i := 0; i < attempts; i++ {
 		err := attempt()
