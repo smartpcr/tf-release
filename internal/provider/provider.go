@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
@@ -17,6 +18,14 @@ import (
 // advertises (DESIGN §16.1). main.go serves the provider under this address and
 // the provider test asserts it, keeping the two in sync.
 const Address = "registry.local/smartpcr/labdeploy"
+
+// ServeOpts returns the base providerserver.ServeOpts main.go serves the
+// provider with. Centralizing the served source address here keeps main.go and
+// the acceptance harness reading from a single source of truth (DESIGN §16.1);
+// callers set Debug per-invocation.
+func ServeOpts() providerserver.ServeOpts {
+	return providerserver.ServeOpts{Address: Address}
+}
 
 var _ provider.Provider = (*LabDeployProvider)(nil)
 
