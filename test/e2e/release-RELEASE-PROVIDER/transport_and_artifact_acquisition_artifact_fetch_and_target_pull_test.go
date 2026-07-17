@@ -12,7 +12,10 @@
 //     against the good route must reproduce the payload sha256 and spool the
 //     bytes to a runner temp file; Fetch against the 404 route must fail closed
 //     with an ERR_ARTIFACT_FETCH coded error whose message carries the 404
-//     status (DESIGN ART-02/ART-03, §8.2).
+//     status (DESIGN ART-01/ART-03, §8.2). The checksum-mismatch fail-closed
+//     path (ART-02, ERR_CHECKSUM_MISMATCH with the runner temp file deleted,
+//     DESIGN §18.3 / §8.2) is not exercised here; it is covered by the sibling
+//     unit test internal/artifact/fetch_test.go.
 //   - NuGet URL and target-pull script -> builds the flat-container download
 //     URL and the Windows/Linux target-pull scripts for a nuget_feed source and
 //     asserts they reproduce the committed goldens under
