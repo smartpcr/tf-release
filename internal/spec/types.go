@@ -166,13 +166,23 @@ type Pattern struct {
 	RestartPolicy string   `json:"restart_policy,omitempty" yaml:"restart_policy,omitempty"`
 	RunArgs       []string `json:"run_args,omitempty" yaml:"run_args,omitempty"`
 
-	// Concrete discriminated-union members (DESIGN §6.4). After decoding,
-	// exactly ONE of these is non-nil — selected by Type — and all others are
-	// nil. They are populated by Pattern.UnmarshalJSON via type-directed
-	// decoding and are excluded from JSON marshaling (json:"-") so the canonical
-	// spec hash is unaffected. The flat fields above remain the source consumed
-	// by validate.go and the pattern implementations; the concrete members give
-	// callers a type-safe, mutually-exclusive view of the union.
+	// Concrete discriminated-union members (DESIGN §6.4). They are populated by
+	// Pattern.UnmarshalJSON via type-directed decoding — the member named by Type
+	// is filled and every other member is left nil — and are excluded from JSON
+	// marshaling (json:"-") so the canonical spec hash is unaffected. The flat
+	// fields above remain the source consumed by validate.go and the pattern
+	// implementations; the concrete members give callers a type-safe,
+	// mutually-exclusive view of the union.
+	//
+	// INVARIANT: exactly ONE member is non-nil (the one named by Type) ONLY after
+	// ValidateDeployment / ParseDeployment succeeds. On the non-validating lenient
+	// path (ParseDeploymentLenient, used by the merge-then-validate flow in DESIGN
+	// §6.2) a Pattern whose Type is empty decodes with ALL members nil, because
+	// decodeUnion cannot select a variant; a non-empty but unknown Type is instead
+	// rejected at decode time. pattern.type is required (§6.4) and is NOT sourced
+	// from default_target, so ValidateDeployment is what enforces the discriminant.
+	// Lenient-path callers must therefore switch on the flat Type (which always
+	// says which member to expect) and/or validate before dereferencing a member.
 	ConsoleApp      *ConsoleAppPattern      `json:"-" yaml:"-"`
 	WindowsService  *WindowsServicePattern  `json:"-" yaml:"-"`
 	NodeWebApp      *NodeWebAppPattern      `json:"-" yaml:"-"`
@@ -358,7 +368,11 @@ func (p *Pattern) decodeUnion(data []byte) error {
 		}
 		p.DockerContainer = &m
 	case "":
-		// lenient: kind/type may be validated later
+		// Lenient path: no discriminant yet, so no variant is selected and every
+		// concrete member stays nil. This deliberately breaks the "exactly one
+		// non-nil" invariant (see the Pattern union-member doc); pattern.type is
+		// required (DESIGN §6.4), so ValidateDeployment rejects this state before
+		// any caller relies on a member being populated.
 	default:
 		return fmt.Errorf("pattern.type: %q unknown", p.Type)
 	}
