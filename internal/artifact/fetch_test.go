@@ -364,19 +364,32 @@ func TestFetchFileSource(t *testing.T) {
 	}
 }
 
-// docker sources are passthrough: no runner fetch (§8.2, pull deferred to
-// the docker pattern §9.6).
+// A docker_image never reaches runner-side Fetch in practice: spec validation
+// pins docker_image to the docker_container pattern, and the engine
+// short-circuits that pattern to deployDocker *before* the staging/fetch path,
+// so the image is pulled on the target by the §9.6 D-steps. §8.2's "no fetch on
+// runner; returns ref string" and its bad-creds/pull-failure ERR_ARTIFACT_FETCH
+// therefore describe the docker *pattern* (§9.6), not this function — so this
+// test does NOT cite §8.2 to justify a runner-side refusal.
+//
+// What it pins is the defensive guard in Fetch's default case: should a future
+// caller ever route a docker source here, Fetch must fail closed with
+// ERR_ARTIFACT_FETCH rather than silently return an empty/unhashed Fetched.
+// This is guard behavior, not §8.2 spec behavior.
 func TestDockerNotFetchedOnRunner(t *testing.T) {
 	a := &spec.Artifact{
 		Type:    spec.ArtifactDocker,
 		Version: "1.0.0",
 		Source:  spec.Source{Type: "docker_registry", Image: "registry.example.com/app", Tag: "1.0.0"},
 	}
+	// docker defaults to runner_push (UseTargetPull=false, §8.3); the guard below
+	// is the backstop that stops the runner_push branch from ever spooling a
+	// docker source into a temp package.
 	if UseTargetPull(a) {
 		t.Error("docker should not use runner target-pull")
 	}
 	if _, err := Fetch(context.Background(), a); err == nil {
-		t.Error("expected Fetch to refuse docker source on the runner")
+		t.Error("defensive guard: Fetch must fail closed on a docker source, not return a package")
 	} else if c := codeOf(err); c != "ERR_ARTIFACT_FETCH" {
 		t.Errorf("code = %q, want ERR_ARTIFACT_FETCH", c)
 	}
