@@ -26,7 +26,9 @@ jobs:
       - name: Run goreleaser
         uses: goreleaser/goreleaser-action@v6
         with:
-          version: latest
+          # Pin a validated GoReleaser v2 release so tag builds stay reproducible
+          # and compatible with the version: 2 .goreleaser.yml.
+          version: v2.17.0
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

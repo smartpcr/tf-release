@@ -41,5 +41,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          # Pin the verified golangci-lint v2 release so a future major version
+          # cannot invalidate .golangci.yml (version: "2") and break the gate.
+          version: v2.12.2
           args: --timeout=5m
