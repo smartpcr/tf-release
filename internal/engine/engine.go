@@ -444,6 +444,34 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 			}
 			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
 		}
+		// §10.2/§10.4: the container is back on the previous image and running.
+		// Persist a rolled_back manifest at the previous version (image id = the
+		// restored image) so Read reports the restored state instead of treating the
+		// resource as absent — mirroring the file-based rollback (rollbackSingle) and
+		// the docker failed-rollback branch, both of which persist a manifest. A
+		// FINALIZE failure here leaves the machine restored but unrecorded, so it is
+		// surfaced as ERR_ROLLBACK_FAILED (UNKNOWN STATE) exactly like the file path.
+		// Skipped when no previous version is known (unmanaged container): there is
+		// no version to record.
+		if prev != "" {
+			rm := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
+				CurrentVersion: prev, CurrentRelease: "docker://" + rc.Spec.Pattern.ContainerName,
+				ProviderVersion: ProviderVersion,
+				Extra:           map[string]string{"image_id": oldImage},
+				LastOperation: LastOp{Type: "deploy", Result: "rolled_back",
+					Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
+			}
+			if werr := sl.timed(ctx, "FINALIZE", func() error {
+				if derr := ensureDir(ctx, t, p.Root); derr != nil {
+					return derr
+				}
+				return WriteManifest(ctx, t, p, rm)
+			}); werr != nil {
+				return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
+					fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — restored to previous image %s but manifest write failed: %v; deploy error: %v",
+						host, short(oldImage), werr, runErr))
+			}
+		}
 		return nil, fmt.Errorf("%w; rolled back to previous image %s", runErr, short(oldImage))
 	}
 	newImage, _ := dc.CurrentImageID(ctx, t, rc)
