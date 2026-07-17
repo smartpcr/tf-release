@@ -282,6 +282,11 @@ func maybeWriteGolden(t *testing.T, name, content string) {
 
 // NuGet URL + target-pull script match committed goldens (DESIGN §6.3, §8.3).
 func TestNugetURLAndTargetPullGolden(t *testing.T) {
+	// Set a real token so the secret-hygiene assertions below have an actual
+	// secret value to hunt for. The generated scripts reference only
+	// $env:LD_AUTH_VALUE and never embed the token, so the committed goldens
+	// stay stable regardless of this value (DESIGN §11, §8.3).
+	t.Setenv("LD_NUGET_TOKEN", "sentinel-secret")
 	a := nugetFixture()
 
 	url, err := ResolveURL(a)
@@ -302,15 +307,22 @@ func TestNugetURLAndTargetPullGolden(t *testing.T) {
 		t.Fatalf("TargetPullScriptLinux: %v", err)
 	}
 
-	// Auth value must be injected via env, never inlined into the script.
-	if _, ok := winEnv["LD_AUTH_VALUE"]; !ok {
-		t.Error("windows env missing LD_AUTH_VALUE")
+	// Auth value must be injected via env, never inlined into the script. The
+	// env map must carry the exact "Bearer <token>" value, while the scripts
+	// reference only $env:LD_AUTH_VALUE — so neither the secret token value nor
+	// the scheme word may appear in the generated script text (DESIGN §11, §8.3).
+	const wantAuthValue = "Bearer sentinel-secret"
+	if got := winEnv["LD_AUTH_VALUE"]; got != wantAuthValue {
+		t.Errorf("windows LD_AUTH_VALUE = %q, want %q", got, wantAuthValue)
 	}
-	if _, ok := linEnv["LD_AUTH_VALUE"]; !ok {
-		t.Error("linux env missing LD_AUTH_VALUE")
+	if got := linEnv["LD_AUTH_VALUE"]; got != wantAuthValue {
+		t.Errorf("linux LD_AUTH_VALUE = %q, want %q", got, wantAuthValue)
+	}
+	if strings.Contains(winScript, "sentinel-secret") || strings.Contains(linScript, "sentinel-secret") {
+		t.Error("secret token value leaked into generated script")
 	}
 	if strings.Contains(winScript, "Bearer") || strings.Contains(linScript, "Bearer") {
-		t.Error("auth scheme/token leaked into generated script")
+		t.Error("auth scheme leaked into generated script")
 	}
 
 	maybeWriteGolden(t, "nuget_url.txt", url)
