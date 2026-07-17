@@ -524,7 +524,9 @@ func (e *Engine) clusterRollback(ctx context.Context, cc *clusterCtx, oldOwner s
 	if err := slOwner.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[oldOwner], pPrevOwner) }); err != nil {
 		restoreErrs = append(restoreErrs, fmt.Errorf("owner %s junction restore: %w", oldOwner, err))
 	}
-	if err := slOwner.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[oldOwner], releaseCtx(s, pPrevOwner)) }); err != nil {
+	if err := slOwner.timed(ctx, "CONFIGURE", func() error {
+		return cc.cg.Configure(ctx, cc.tr[oldOwner], releaseCtxVersion(s, pPrevOwner, prevVersion))
+	}); err != nil {
 		restoreErrs = append(restoreErrs, fmt.Errorf("owner %s reconfigure: %w", oldOwner, err))
 	}
 	if err := slOwner.timed(ctx, "MOVE_GROUP", func() error {
@@ -563,7 +565,7 @@ func (e *Engine) clusterRollback(ctx context.Context, cc *clusterCtx, oldOwner s
 			restoreErrs = append(restoreErrs, fmt.Errorf("passive %s junction restore: %w", h, err))
 			continue
 		}
-		if err := slp.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[h], releaseCtx(s, pp)) }); err != nil {
+		if err := slp.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[h], releaseCtxVersion(s, pp, prevVersion)) }); err != nil {
 			restoreErrs = append(restoreErrs, fmt.Errorf("passive %s reconfigure: %w", h, err))
 		}
 	}
@@ -639,7 +641,12 @@ func (e *Engine) clusterHealthOn(ctx context.Context, cc *clusterCtx, host strin
 
 func (e *Engine) clusterHealthOnVersion(ctx context.Context, cc *clusterCtx, host, version string) error {
 	p := cc.paths(host, version)
-	rc := releaseCtx(cc.s, p)
+	// Thread `version` through to the env so LD_VERSION reflects the release
+	// actually running on the node (rollback passes prevVersion). Using the
+	// forward releaseCtx here would bake LD_VERSION=spec (new) version into the
+	// probe env, making the /health `v=<LD_VERSION>` (DESIGN §18) check the wrong
+	// version on a restored owner (CLU-04 expects v=prev).
+	rc := releaseCtxVersion(cc.s, p, version)
 	return RunHealthCheck(ctx, cc.tr[host], &cc.s.HealthCheck, p.Current, rc.Env)
 }
 
