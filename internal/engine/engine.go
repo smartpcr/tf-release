@@ -505,12 +505,12 @@ func (e *Engine) releaseCached(ctx context.Context, t transport.Transport, p lay
 	if err != nil || !ok {
 		return false, err
 	}
-	return strings.Contains(raw, `"checksum": "`+wantChecksum+`"`), nil
+	return strings.Contains(raw, `"sha256": "`+wantChecksum+`"`), nil
 }
 
 func (e *Engine) writeReleaseMarker(ctx context.Context, t transport.Transport, p layout.Paths, s *spec.Deployment) error {
 	marker := p.Release + sepFor(t.OS()) + releaseMarker
-	content := fmt.Sprintf("{\n  \"version\": %q,\n  \"checksum\": %q,\n  \"staged_utc\": %q\n}\n",
+	content := fmt.Sprintf("{\n  \"version\": %q,\n  \"sha256\": %q,\n  \"extracted_at\": %q\n}\n",
 		s.Artifact.Version, s.Artifact.Checksum, time.Now().UTC().Format(time.RFC3339))
 	return writeSmallFile(ctx, t, marker, content)
 }
@@ -526,29 +526,11 @@ func sepFor(os spec.OSKind) string {
 // to ERR_EXTRACT (DESIGN §12).
 func (e *Engine) extract(ctx context.Context, t transport.Transport, p layout.Paths) error {
 	host := t.Host()
+	shell := transport.ShellSh
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`$ErrorActionPreference='Stop'
-if(Test-Path %s){ Remove-Item -Recurse -Force %s }
-New-Item -ItemType Directory -Force -Path %s | Out-Null
-try { Expand-Archive -Path %s -DestinationPath %s -Force }
-catch { Write-Error $_.Exception.Message; exit 1 }
-Remove-Item -Force -ErrorAction SilentlyContinue %s
-exit 0`, psq(p.Release), psq(p.Release), psq(p.Release), psq(p.StagePkg), psq(p.Release), psq(p.StagePkg))
-		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 900})
-		if err != nil {
-			return wrapTransportErr(err, host, "EXTRACT")
-		}
-		if r.ExitCode != 0 {
-			return coded("ERR_EXTRACT", host, "EXTRACT", fmt.Errorf("%s", strings.TrimSpace(r.Stderr+r.Stdout)))
-		}
-		return nil
+		shell = transport.ShellPowerShell
 	}
-	script := fmt.Sprintf(`set -e
-rm -rf '%s'
-mkdir -p '%s'
-unzip -o -q '%s' -d '%s'
-rm -f '%s'`, p.Release, p.Release, p.StagePkg, p.Release, p.StagePkg)
-	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 900})
+	r, err := t.Exec(ctx, transport.Cmd{Shell: shell, Script: extractScript(p), TimeoutSec: 900})
 	if err != nil {
 		return wrapTransportErr(err, host, "EXTRACT")
 	}
@@ -561,23 +543,11 @@ rm -f '%s'`, p.Release, p.Release, p.StagePkg, p.Release, p.StagePkg)
 // switchJunction = S3: atomic-ish repoint of `current` (DESIGN §9.2). Exit 42.
 func (e *Engine) switchJunction(ctx context.Context, t transport.Transport, p layout.Paths) error {
 	host := t.Host()
+	shell := transport.ShellSh
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`if(Test-Path %s){ & cmd /c rmdir %s; if($LASTEXITCODE -ne 0){ Write-Error 'rmdir current failed'; exit 42 } }
-& cmd /c mklink /J %s %s | Out-Null
-if($LASTEXITCODE -ne 0){ Write-Error 'mklink failed'; exit 42 }
-exit 0`, psq(p.Current), quoteCmd(p.Current), quoteCmd(p.Current), quoteCmd(p.Release))
-		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
-		if err != nil {
-			return wrapTransportErr(err, host, "SWITCH")
-		}
-		if r.ExitCode != 0 {
-			return coded("ERR_SWITCH", host, "SWITCH", fmt.Errorf("%s", strings.TrimSpace(r.Stderr+r.Stdout)))
-		}
-		return nil
+		shell = transport.ShellPowerShell
 	}
-	script := fmt.Sprintf(`ln -sfn '%s' '%s.tmp' && mv -Tf '%s.tmp' '%s' || exit 42`,
-		p.Release, p.Current, p.Current, p.Current)
-	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
+	r, err := t.Exec(ctx, transport.Cmd{Shell: shell, Script: switchScript(p), TimeoutSec: 60})
 	if err != nil {
 		return wrapTransportErr(err, host, "SWITCH")
 	}

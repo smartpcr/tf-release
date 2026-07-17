@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
@@ -28,6 +29,7 @@ type fakeHost struct {
 	host       string
 	files      map[string][]byte // path -> content (case-sensitive; engine is consistent)
 	dirs       map[string]bool
+	dirTS      map[string]int64 // optional per-dir mtime ticks for deterministic prune
 	current    string          // junction target
 	svc        string          // "", "Stopped", "Running"
 	fail       map[string]bool // step toggles: "switch","health","start","extract"
@@ -36,7 +38,7 @@ type fakeHost struct {
 }
 
 func newFakeHost(name string) *fakeHost {
-	return &fakeHost{host: name, files: map[string][]byte{}, dirs: map[string]bool{}, fail: map[string]bool{}}
+	return &fakeHost{host: name, files: map[string][]byte{}, dirs: map[string]bool{}, dirTS: map[string]int64{}, fail: map[string]bool{}}
 }
 
 func (f *fakeHost) mark(s string) { f.log = append(f.log, s) }
@@ -155,7 +157,11 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		var b strings.Builder
 		i := int64(1000)
 		for d := range f.dirs {
-			fmt.Fprintf(&b, "%s|%d\n", d, i)
+			ts := i
+			if v, ok := f.dirTS[d]; ok {
+				ts = v
+			}
+			fmt.Fprintf(&b, "%s|%d\n", d, ts)
 			i++
 		}
 		return ok(b.String()), nil
@@ -442,8 +448,6 @@ func TestDestroyPurge(t *testing.T) { // DST-01
 
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 
-func asCoded(err error, out **CodedError) bool { return errors.As(err, out) }
-
 func keysOf(m map[string][]byte) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -451,3 +455,41 @@ func keysOf(m map[string][]byte) []string {
 	}
 	return out
 }
+
+func asCoded(err error, out **CodedError) bool { return errors.As(err, out) }
+
+// TestPruneKeepsPrevious drives pruneReleases against the fake transport with
+// keep_releases=2 and a previous_version whose mtime is OLDER than a kept
+// non-protected release. The oldest release must be removed while both the
+// current and (old) previous versions are retained (Stage 3.3 scenario
+// "Prune keeps previous", DESIGN §10.1 step 13 / strategy.keep_releases).
+func TestPruneKeepsPrevious(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("prune"))
+	defer done()
+	d := winSvcSpec(t, url, sum) // strategy.keep_releases: 2
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	p := layout.NewPaths(spec.OSWindows, `C:\deploy`, "sample-svc", "1.2.0")
+	// Newest→oldest. previous (1.0.0) is intentionally older than the kept
+	// non-protected 1.1.0 to prove previous is never pruned by age.
+	f.dirs = map[string]bool{"1.2.0": true, "1.1.0": true, "1.0.0": true, "0.9.0": true}
+	f.dirTS = map[string]int64{"1.2.0": 400, "1.1.0": 300, "1.0.0": 200, "0.9.0": 100}
+
+	m := &Manifest{CurrentVersion: "1.2.0", PreviousVersion: "1.0.0"}
+	if err := eng.pruneReleases(context.Background(), f, d, p, m); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	joined := strings.Join(f.log, ">")
+	oldest := `RM C:\deploy\sample-svc\releases\0.9.0`
+	if !strings.Contains(joined, oldest) {
+		t.Fatalf("oldest release must be pruned; log=%v", f.log)
+	}
+	for _, keep := range []string{"1.2.0", "1.1.0", "1.0.0"} {
+		if strings.Contains(joined, `RM C:\deploy\sample-svc\releases\`+keep) {
+			t.Fatalf("release %s must be retained (current/previous/kept), log=%v", keep, f.log)
+		}
+	}
+}
+
