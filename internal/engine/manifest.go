@@ -278,8 +278,16 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		if created {
 			return &Lock{t: t, paths: p, content: content, token: token}, pendingWarn, nil
 		}
+		if exit == 71 {
+			// Operational failure from the remote create (disk full, permission
+			// denied, read-only/again filesystem) — NOT contention. Surface it as a
+			// connectivity/operational error so it is logged and retried rather than
+			// masquerading as ERR_LOCKED (evaluator item 2).
+			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK",
+				fmt.Errorf("lock create failed operationally (exit 71: disk/permission/filesystem error)"))
+		}
 		if exit != 48 {
-			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock create failed (exit %d)", exit))
+			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", fmt.Errorf("lock create failed (unexpected exit %d)", exit))
 		}
 
 		// Held: inspect age. A lock may be overridden ONLY when its metadata
@@ -326,6 +334,15 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		// the two steps leaves the slot either the intact stale lock (delete
 		// killed) or simply absent (delete done, re-create pending) — never a
 		// mixed/partial file that could permanently wedge acquisition.
+		//
+		// Record the stale-takeover WARN NOW, before the compare-and-delete
+		// (evaluator item 1). Under concurrent takeover only ONE contender's
+		// casDelete returns casDone; the others receive casAbsent/casMismatch yet
+		// may still win the ensuing atomic re-create and install the successor
+		// lock. Assigning pendingWarn here — keyed on having PROVEN this lock stale
+		// — guarantees whichever contender ultimately installs the lock returns the
+		// required WARN, instead of only the contender that personally deleted it.
+		pendingWarn = staleWarnMsg(existing, t.Host())
 		outcome, serr := casDelete(ctx, t, p.Lock, raw)
 		if serr != nil {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", serr)
@@ -335,8 +352,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 			// The stale lock is gone; the next iteration re-creates the slot.
 			// Whoever wins that atomic create owns it — if a third party beats
 			// us, our create returns 48, we read the now-FRESH lock and correctly
-			// report ERR_LOCKED. Carry the WARN for the handle we may install.
-			pendingWarn = staleWarnMsg(existing, t.Host())
+			// report ERR_LOCKED. pendingWarn was already recorded above.
 			if attempt < maxAttempts {
 				continue
 			}
@@ -472,7 +488,12 @@ func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Pa
 // createExclusiveAt publishes a fully-formed lock file ATOMICALLY, with
 // create-new (fail-if-exists) semantics and NO empty/partial window (DESIGN §13).
 // Returns (created, exitCode, transportErr): created=true on exit 0; exitCode==48
-// signals the file already existed.
+// signals the file already existed (contention); exitCode==71 signals an
+// OPERATIONAL failure (disk full, permission denied, read-only/absent filesystem)
+// that must NOT be conflated with contention — the publish step distinguishes the
+// two by re-checking whether the destination actually exists after a failed
+// rename/hard-link, so a missing-destination IO error surfaces as 71 rather than a
+// spurious 48 (evaluator item 2).
 //
 // The old approach (an exclusive create-new redirect / open-then-Write) created the file
 // FIRST and wrote its bytes SECOND, exposing a transient EMPTY file that a
@@ -495,16 +516,18 @@ func createExclusiveAt(ctx context.Context, t transport.Transport, root, path, c
 		script := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
 $tmp=%s + '.tmp.' + [Guid]::NewGuid().ToString('N')
 try { $b=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$b); [IO.File]::Move($tmp,%s); exit 0 }
-catch [System.IO.IOException] { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; exit 48 }
+catch [System.IO.IOException] { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; if ([IO.File]::Exists(%s)) { exit 48 } else { exit 71 } }
 catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; exit 71 }`,
-			psq(root), psq(path), psq(b64), psq(path))
+			psq(root), psq(path), psq(b64), psq(path), psq(path))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
 	} else {
 		script := fmt.Sprintf(`mkdir -p '%s'
 tmp='%s.tmp.'$$
 printf '%%s' '%s' | base64 -d > "$tmp" || { rm -f "$tmp"; exit 71; }
-if ln "$tmp" '%s' 2>/dev/null; then rm -f "$tmp"; exit 0; else rm -f "$tmp"; exit 48; fi`,
-			root, path, b64, path)
+if ln "$tmp" '%s' 2>/dev/null; then rm -f "$tmp"; exit 0; fi
+rm -f "$tmp"
+if [ -e '%s' ]; then exit 48; else exit 71; fi`,
+			root, path, b64, path, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {

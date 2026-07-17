@@ -312,6 +312,14 @@ func TestAcquireLockConcurrentTakeover(t *testing.T) {
 					switch {
 					case r.err == nil && r.lk != nil:
 						winners++
+						// The winner performed a stale TAKEOVER, so it MUST surface
+						// the WARN naming the dead owner — even if a peer contender
+						// is the one whose compare-and-delete removed the stale bytes
+						// (evaluator item 1). An empty warn here means the required
+						// diagnostic was dropped on the concurrent path.
+						if !strings.Contains(r.warn, "stale") || !strings.Contains(r.warn, "dead") {
+							t.Fatalf("trial %d: takeover winner dropped the stale WARN: %q", trial, r.warn)
+						}
 					case r.err != nil && r.lk == nil:
 						var ce *CodedError
 						if !asCoded(r.err, &ce) || ce.Code != "ERR_LOCKED" {
@@ -854,13 +862,16 @@ func TestStaleTakeoverIsDeleteThenCreate(t *testing.T) {
 }
 
 // TestConcurrentCreateNeverExposesEmptyResidue is the deterministic concurrent
-// test for evaluator item 3. Two acquirers race for a FREE slot; a hook pauses the
-// first one's create just before it publishes, and only releases it after the
-// second acquirer has run a full attempt. Because create publishes atomically
-// (temp then Move/ln — the file is never empty at the canonical path) and the
-// empty-residue recovery branch is gone, the second acquirer can NEVER observe or
-// "recover" an empty file: exactly one acquirer wins and the stored lock is always
-// a complete, owner-bearing JSON — never the empty string.
+// test for evaluator item 3. Two acquirers race for a FREE slot. The hook pauses
+// EXACTLY acquirer A's create — identified deterministically by the owner embedded
+// in the published bytes, NOT by timing — and holds it until acquirer B has run a
+// full attempt. Because create publishes atomically (temp then Move/ln — the file
+// is never empty at the canonical path) and the empty-residue recovery branch is
+// gone, B can NEVER observe or "recover" an empty file: exactly one acquirer wins
+// and the stored lock is always a complete, owner-bearing JSON — never the empty
+// string. Ordering is signalled through channels (A reaching its create gates B's
+// start, and B's completion releases A), so there is no time.Sleep and no path on
+// which a goroutine can block waiting on a signal only it could send.
 func TestConcurrentCreateNeverExposesEmptyResidue(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
@@ -868,41 +879,51 @@ func TestConcurrentCreateNeverExposesEmptyResidue(t *testing.T) {
 			pp := lockFakePaths(osk)
 			f := newLockFake(osk)
 
-			// Rendezvous: hold the FIRST create at the moment it is classified,
-			// let a second acquirer complete an attempt, then release. A one-shot
-			// token channel ensures ONLY the first create pauses (later creates,
-			// including the second acquirer's, pass straight through — no deadlock).
-			firstCreate := make(chan struct{}, 1)
-			firstCreate <- struct{}{}
-			secondDone := make(chan struct{})
+			// Deterministic rendezvous. aAtCreate is closed the instant acquirer
+			// A's create is classified (A is pinned by owner="A" in its payload,
+			// so ONLY A's create pauses — B's create is never gated). B waits on
+			// aAtCreate before it even starts, guaranteeing A is parked mid-create
+			// with NO file yet published; B then runs a whole attempt and closes
+			// bDone, which releases A. No wall-clock timing, no self-wait deadlock.
+			aAtCreate := make(chan struct{})
+			bDone := make(chan struct{})
+			var aOnce sync.Once
 			f.hook = func(op, script string) {
 				if op != "create" {
 					return
 				}
-				select {
-				case <-firstCreate: // I am the first create — block until B is done.
-					<-secondDone
-				default: // a later create — proceed immediately.
+				var payloadB64 string
+				if osk == spec.OSWindows {
+					payloadB64, _ = firstGroup(lfNewB64Win, script)
+				} else {
+					payloadB64, _ = firstGroup(lfNewB64Sh, script)
 				}
+				raw, _ := base64.StdEncoding.DecodeString(payloadB64)
+				if !strings.Contains(string(raw), `"owner":"A"`) {
+					return // B's (or any non-A) create proceeds without pausing.
+				}
+				aOnce.Do(func() { close(aAtCreate) })
+				<-bDone // hold A mid-create until B has finished a full attempt.
 			}
 
 			var wg sync.WaitGroup
 			wins := make(chan bool, 2)
-			// Acquirer A (its create is the one that gets paused).
+			// Acquirer A: its create is parked at the canonical publish point.
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				lk, _, err := AcquireLock(context.Background(), f, pp, "A", "deploy", 900)
 				wins <- (err == nil && lk != nil)
 			}()
-			// Acquirer B runs while A is paused; it must never see an empty file.
+			// Acquirer B: starts only once A is parked mid-create, runs a full
+			// attempt (it must never observe an empty file), then releases A.
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				time.Sleep(20 * time.Millisecond) // let A enter its paused create
+				<-aAtCreate
 				lk, _, err := AcquireLock(context.Background(), f, pp, "B", "deploy", 900)
 				wins <- (err == nil && lk != nil)
-				close(secondDone)
+				close(bDone)
 			}()
 			wg.Wait()
 			close(wins)
@@ -928,7 +949,40 @@ func TestConcurrentCreateNeverExposesEmptyResidue(t *testing.T) {
 	}
 }
 
-// TestAcquireLockFastFailsOnLiveLock is the regression for evaluator item 5: a
+// TestCreateOperationalFailureIsNotContention is the regression for evaluator
+// item 2: an OPERATIONAL create failure (disk full, permission denied, missing
+// filesystem — modeled by the publish step returning exit 71 while the
+// destination is ABSENT) must surface as an operational error (ERR_CONNECT), NOT
+// as ERR_LOCKED. Previously every failed rename/hard-link mapped to exit 48 and
+// then to ERR_LOCKED, so a broken disk masqueraded as a held lock.
+func TestCreateOperationalFailureIsNotContention(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			pp := lockFakePaths(osk)
+			f := newLockFake(osk) // slot is FREE: a 48 here would be a misclassification
+			f.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "create" {
+					return transport.Result{ExitCode: 71}, nil, true // operational, not EEXIST
+				}
+				return transport.Result{}, nil, false
+			}
+			lk, warn, err := AcquireLock(context.Background(), f, pp, "me", "deploy", 900)
+			if err == nil || lk != nil || warn != "" {
+				t.Fatalf("operational create failure must fail (no lock/warn), got lk=%v warn=%q err=%v", lk, warn, err)
+			}
+			var ce *CodedError
+			if !asCoded(err, &ce) || ce.Code != "ERR_CONNECT" {
+				t.Fatalf("operational create failure must be ERR_CONNECT (not ERR_LOCKED), got %v", err)
+			}
+			if f.has(pp.Lock) {
+				t.Fatalf("a failed create must not leave a lock behind: %q", f.get(pp.Lock))
+			}
+		})
+	}
+}
+
+
 // genuinely LIVE (non-stale) held lock must be refused promptly — a handful of
 // commands, no spinning — to honor DESIGN §13 "fail fast, <5s, no wait". We assert
 // both a bounded command count and a short elapsed time.
