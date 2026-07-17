@@ -36,6 +36,8 @@ package e2e
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -562,16 +564,44 @@ func TestHarnessProviderServedProtocolV6(t *testing.T) {
 	})
 }
 
+// terraformArtifactSHA256 pins the SHA-256 of each terraform release zip, keyed
+// by "<goos>_<goarch>". The values are copied verbatim from the official
+// terraform_1.9.8_SHA256SUMS published at
+// https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_SHA256SUMS and
+// MUST be kept in lockstep with terraformVersion. The opt-in direct download
+// verifies the fetched artifact against the entry for the running platform and
+// fails closed on any mismatch, because the extracted binary is subsequently
+// executed by the harness subprocess.
+var terraformArtifactSHA256 = map[string]string{
+	"darwin_amd64":  "be591e8c59c49d0cfbc7664d24910a4b43840b89d0a4bbca662149bbf0397e91",
+	"darwin_arm64":  "873d7b925d08578fb6bb9c12c7cd92ae73e289e07c360f2fdd69f9036b7baaab",
+	"freebsd_386":   "b1b56dbaa0ddda52a42b4398a1cebfd4ebc175391ef64b14747c65fa6debe072",
+	"freebsd_amd64": "aa7a936aeb5254abd1761282f4f0b2850b7507166f0344683f37a1e82da23f46",
+	"freebsd_arm":   "bdef3da36aa736bcc14767bd353667773d46aaf562b1d85dfa66e5266290247d",
+	"linux_386":     "aa85bb2e0c68f2ee148d1ea854ee0aa78086017cbda9058371be8be2f4c18d10",
+	"linux_amd64":   "186e0145f5e5f2eb97cbd785bc78f21bae4ef15119349f6ad4fa535b83b10df8",
+	"linux_arm":     "cb6db8471e361bb9ad6bbd43d9c780d37208e6dbe416900fdc8999af9e459b77",
+	"linux_arm64":   "f85868798834558239f6148834884008f2722548f84034c9b0f62934b2d73ebb",
+	"openbsd_386":   "851fa5b84efb78c31491f364ac1cdd6ea8e013ba04f9657acacc9401cfd479db",
+	"openbsd_amd64": "e9311ffaa728c31a40493e6de35c13e1f7879468dd568d32ace2458725fb02d0",
+	"solaris_amd64": "a8eaecd78c68e2b748fd5d6e2cf1a1e97ad891aa36d53509c7ad04bb86bd24cc",
+	"windows_386":   "b9c5a8c3b4a91b89b67f8f58a84b27d0ad423f0286df959176691e077d9f6966",
+	"windows_amd64": "2667de56106bc6707968286357e29c20f8dbbb2f429ef57099b04994f82d9684",
+}
+
 // ensureTerraform returns a path to a terraform CLI the harness can drive, or an
 // error when none is available. It prefers a binary already on PATH or named by
 // TF_ACC_TERRAFORM_PATH, then a previously cached download. Only when none of
 // those exist AND the opt-in downloadTerraformEnv is set does it fetch the
 // official release zip directly over HTTPS and extract the binary. That direct
-// download deliberately bypasses hc-install's OpenPGP signature verification
-// (whose bundled key has expired on the gate host) while still fetching the
-// authentic HashiCorp release artifact. Keeping the download opt-in (and its
-// failure non-fatal to the caller) ensures a live third-party fetch is never a
-// mandatory merge gate on egress-restricted, air-gapped, or rate-limited hosts.
+// download replaces hc-install's OpenPGP signature verification (whose bundled
+// key has expired on the gate host) with a pinned SHA-256 integrity check: the
+// fetched zip is verified against the official terraform_<ver>_SHA256SUMS value
+// for the running platform BEFORE extraction and fails closed on any mismatch,
+// so a corrupted/truncated download or a compromised mirror/CDN entry is never
+// extracted or executed. Keeping the download opt-in (and its failure non-fatal
+// to the caller) ensures a live third-party fetch is never a mandatory merge
+// gate on egress-restricted, air-gapped, or rate-limited hosts.
 func ensureTerraform() (string, error) {
 	if p, err := exec.LookPath("terraform"); err == nil {
 		return p, nil
@@ -596,20 +626,31 @@ func ensureTerraform() (string, error) {
 		return "", fmt.Errorf("no terraform CLI on PATH or TF_ACC_TERRAFORM_PATH; set %s=1 to allow a direct release download for the optional harness leg", downloadTerraformEnv)
 	}
 
+	platform := runtime.GOOS + "_" + runtime.GOARCH
+	wantSHA, ok := terraformArtifactSHA256[platform]
+	if !ok {
+		return "", fmt.Errorf("no pinned terraform %s SHA-256 for platform %q; refusing to run an unverified download", terraformVersion, platform)
+	}
+
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return "", err
 	}
 	url := fmt.Sprintf("https://releases.hashicorp.com/terraform/%s/terraform_%s_%s_%s.zip",
 		terraformVersion, terraformVersion, runtime.GOOS, runtime.GOARCH)
-	if err := downloadAndExtractTerraform(url, cacheDir, binName); err != nil {
+	if err := downloadAndExtractTerraform(url, cacheDir, binName, wantSHA); err != nil {
 		return "", err
 	}
 	return binPath, nil
 }
 
-// downloadAndExtractTerraform fetches the terraform release zip at url and writes
-// the extracted CLI binary (binName) into destDir.
-func downloadAndExtractTerraform(url, destDir, binName string) error {
+// downloadAndExtractTerraform fetches the terraform release zip at url, verifies
+// the downloaded bytes against wantSHA (the pinned SHA-256 from the official
+// terraform_<ver>_SHA256SUMS) and only on a match writes the extracted CLI binary
+// (binName) into destDir. A checksum mismatch fails closed: the temp zip is
+// discarded and nothing is extracted, because the extracted binary is later
+// executed by the harness subprocess -- so a corrupted/truncated download or a
+// compromised mirror/CDN entry must never reach extraction.
+func downloadAndExtractTerraform(url, destDir, binName, wantSHA string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
@@ -632,12 +673,23 @@ func downloadAndExtractTerraform(url, destDir, binName string) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+
+	// Hash while streaming so the fetched artifact can be verified against the
+	// pinned release checksum before anything is extracted or executed.
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, hasher), resp.Body); err != nil {
 		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
 		return err
+	}
+
+	// Fail closed on any checksum mismatch (corrupted/truncated download or a
+	// compromised mirror/CDN entry); the temp zip is removed by the defer above.
+	if gotSHA := hex.EncodeToString(hasher.Sum(nil)); !strings.EqualFold(gotSHA, wantSHA) {
+		return fmt.Errorf("terraform %s artifact checksum mismatch for %s: got %s, want %s",
+			terraformVersion, url, gotSHA, wantSHA)
 	}
 
 	zr, err := zip.OpenReader(tmpName)
