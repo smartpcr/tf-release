@@ -16,6 +16,13 @@ import (
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
+// BuildProbeCmd renders the real single-attempt health-probe command for the
+// given target OS and health_check config, encoding the expect_status /
+// expect_body_regex logic (DESIGN §6.5). Used by the Stage 3.4 golden e2e.
+func BuildProbeCmd(os spec.OSKind, hc *spec.HealthCheck, workDir string, env map[string]string) transport.Cmd {
+	return buildProbeCmd(os, hc, workDir, env)
+}
+
 // ExtractScript renders the real staging→release extraction script for p.OS.
 func ExtractScript(p layout.Paths) string { return extractScript(p) }
 
