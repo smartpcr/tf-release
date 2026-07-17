@@ -100,7 +100,7 @@ func (s *encState) thenEscapingIsCorrect() error {
 	gi := strings.Index(decoded, "$env:GREETING")
 	ti := strings.Index(decoded, "$env:TOKEN")
 	si := strings.Index(decoded, "Write-Output $env:GREETING")
-	if !(gi < ti && ti < si) {
+	if gi >= ti || ti >= si {
 		return fmt.Errorf("env prefix not in sorted order before script body; decoded:\n%s", decoded)
 	}
 	return nil
