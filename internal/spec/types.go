@@ -194,6 +194,16 @@ type Pattern struct {
 // --- Concrete pattern union members (one struct per pattern.type) ------------
 // Each carries ONLY the fields legal for its pattern.type per DESIGN §6.4, so a
 // populated member is a self-describing, type-safe projection of the union.
+//
+// SCHEMA-PARITY CONTRACT: the flat Pattern above and the selected concrete member
+// are BOTH strict-decoded (DisallowUnknownFields), so a field legal for a variant
+// MUST appear in the flat struct AND that variant's concrete struct — otherwise a
+// valid spec silently fails to parse with "json: unknown field ...". types_drift_test.go
+// enforces this: TestPatternFlatConcreteSchemaParity asserts the flat field set
+// equals the union of the concrete field sets, and TestPatternConcreteSchemaRoundTrip
+// parses a spec exercising EVERY §6.4 field of each pattern.type. When adding a
+// §6.4 field, update the flat struct, the concrete struct, AND that test's
+// per-variant spec together.
 
 type ConsoleAppPattern struct {
 	Type          PatternType `json:"type"`
