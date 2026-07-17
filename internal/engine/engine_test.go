@@ -474,8 +474,10 @@ func TestPruneKeepsPrevious(t *testing.T) {
 	eng := engineWith(f)
 
 	p := layout.NewPaths(spec.OSWindows, `C:\deploy`, "sample-svc", "1.2.0")
-	// Newest→oldest. previous (1.0.0) is intentionally older than the kept
-	// non-protected 1.1.0 to prove previous is never pruned by age.
+	// keep_releases=2 is the TOTAL retention budget (DESIGN CAP-02). current
+	// (1.2.0) + previous (1.0.0) are always protected and fill the entire budget,
+	// so BOTH non-protected dirs (1.1.0, 0.9.0) must be pruned — even though
+	// 1.1.0 is newer than previous (proves protection is by identity, not age).
 	f.dirs = map[string]bool{"1.2.0": true, "1.1.0": true, "1.0.0": true, "0.9.0": true}
 	f.dirTS = map[string]int64{"1.2.0": 400, "1.1.0": 300, "1.0.0": 200, "0.9.0": 100}
 
@@ -485,13 +487,14 @@ func TestPruneKeepsPrevious(t *testing.T) {
 	}
 
 	joined := strings.Join(f.log, ">")
-	oldest := `RM C:\deploy\sample-svc\releases\0.9.0`
-	if !strings.Contains(joined, oldest) {
-		t.Fatalf("oldest release must be pruned; log=%v", f.log)
+	for _, del := range []string{"1.1.0", "0.9.0"} {
+		if !strings.Contains(joined, `RM C:\deploy\sample-svc\releases\`+del) {
+			t.Fatalf("non-protected release %s must be pruned (keep=2 total); log=%v", del, f.log)
+		}
 	}
-	for _, keep := range []string{"1.2.0", "1.1.0", "1.0.0"} {
+	for _, keep := range []string{"1.2.0", "1.0.0"} {
 		if strings.Contains(joined, `RM C:\deploy\sample-svc\releases\`+keep) {
-			t.Fatalf("release %s must be retained (current/previous/kept), log=%v", keep, f.log)
+			t.Fatalf("protected release %s (current/previous) must be retained, log=%v", keep, f.log)
 		}
 	}
 }
@@ -516,7 +519,7 @@ func TestPruneReportsDeletionFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("prune must return an error when a deletion fails")
 	}
-	if !strings.Contains(err.Error(), "0.9.0") {
+	if !strings.Contains(err.Error(), "1.1.0") {
 		t.Fatalf("prune error should name the failed release: %v", err)
 	}
 }
@@ -619,6 +622,11 @@ func TestStagingWipedOnExtractFailure(t *testing.T) {
 	if _, present := f.files[`C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`]; present {
 		t.Fatal("release marker must NOT be written when extract fails")
 	}
+	// Item 5 (DESIGN §10.2): a failed extract must leave a staging-only failure
+	// state — the partially-created release dir is removed, not left dangling.
+	if !strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\releases\1.0.0`) {
+		t.Fatalf("partial release dir must be removed on extract failure; log=%v", f.log)
+	}
 }
 
 // TestStagingWipedOnChecksumFailure proves a runner-side checksum mismatch fails
@@ -642,6 +650,106 @@ func TestStagingWipedOnChecksumFailure(t *testing.T) {
 	// The start-of-op staging wipe must have executed.
 	if !strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\staging`) {
 		t.Fatalf("staging must be wiped on checksum failure; log=%v", f.log)
+	}
+}
+
+// TestCachedReleaseStillWipesStaging proves the whole-directory staging wipe
+// runs on EVERY op, including a cache hit that skips fetch/extract (evaluator
+// feedback item 3; DESIGN §9.1 "wiped at start & end of every op").
+func TestCachedReleaseStillWipesStaging(t *testing.T) {
+	payload := []byte("cached zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Pre-seed a matching release marker so releaseCached() returns true, and a
+	// stale pkg.zip left behind by a prior op that the wipe must clear.
+	marker := `C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`
+	f.files[marker] = []byte(fmt.Sprintf("{\n  \"version\": \"1.0.0\",\n  \"sha256\": %q,\n  \"extracted_at\": \"x\"\n}\n", sum))
+	f.files[`C:\deploy\sample-svc\staging\pkg.zip`] = []byte("stale")
+
+	if _, err := eng.Deploy(context.Background(), runnerPushSpec(t, url, sum)); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	joined := strings.Join(f.log, ">")
+	if !strings.Contains(joined, `RM C:\deploy\sample-svc\staging`) {
+		t.Fatalf("cached deploy must still wipe staging; log=%v", f.log)
+	}
+	if strings.Contains(joined, "EXTRACT") {
+		t.Fatalf("cached deploy must skip extraction; log=%v", f.log)
+	}
+	if _, present := f.files[`C:\deploy\sample-svc\staging\pkg.zip`]; present {
+		t.Fatal("stale staging pkg.zip must be wiped on a cached deploy")
+	}
+}
+
+// recLinux is a minimal Linux-OS recording transport: it captures every script
+// the engine emits and returns success (empty listings) so orchestration paths
+// run to completion. Used to assert POSIX shell-quoting of hostile paths.
+type recLinux struct {
+	host    string
+	scripts []string
+}
+
+func (r *recLinux) Connect(ctx context.Context) error { return nil }
+func (r *recLinux) Close() error                       { return nil }
+func (r *recLinux) OS() spec.OSKind                    { return spec.OSLinux }
+func (r *recLinux) Host() string                       { return r.host }
+func (r *recLinux) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
+	r.scripts = append(r.scripts, c.Script)
+	return transport.Result{ExitCode: 0}, nil // empty stdout => empty prune listing
+}
+func (r *recLinux) Upload(ctx context.Context, _ io.Reader, _ int64, _ string) error { return nil }
+func (r *recLinux) Download(ctx context.Context, _, _ string) error                  { return nil }
+
+var _ transport.Transport = (*recLinux)(nil)
+
+// TestLinuxOrchestrationQuotesHostileRoot drives the REAL staging/prune
+// orchestration (wipeStaging + pruneReleases, not just the script generators)
+// with an install_root that embeds a single quote and a shell metacharacter
+// payload, and asserts every emitted script POSIX-escapes it via shq (`'\''`)
+// so the payload can never break out of its quotes (evaluator feedback item 4).
+func TestLinuxOrchestrationQuotesHostileRoot(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("x"))
+	defer done()
+	d := winSvcSpec(t, url, sum) // keep_releases: 2
+	rec := &recLinux{host: "node-01"}
+	eng := New()
+
+	root := `/opt/'; touch /tmp/pwned; '`
+	p := layout.NewPaths(spec.OSLinux, root, "sample-svc", "1.0.0")
+
+	if err := eng.wipeStaging(context.Background(), rec, p); err != nil {
+		t.Fatalf("wipeStaging: %v", err)
+	}
+	m := &Manifest{CurrentVersion: "1.0.0"}
+	if err := eng.pruneReleases(context.Background(), rec, d, p, m); err != nil {
+		t.Fatalf("pruneReleases: %v", err)
+	}
+
+	if len(rec.scripts) == 0 {
+		t.Fatal("expected orchestration to emit scripts")
+	}
+	sawRoot := false
+	for _, s := range rec.scripts {
+		if !strings.Contains(s, "touch /tmp/pwned") {
+			continue // script that doesn't interpolate the hostile root
+		}
+		sawRoot = true
+		// shq must have escaped the embedded quote as '\'' ...
+		if !strings.Contains(s, `'\''`) {
+			t.Fatalf("hostile root not POSIX-escaped in script:\n%s", s)
+		}
+		// ... and the naked breakout forms an unquoted interpolation would
+		// produce must NOT appear (payload must stay inside quotes).
+		for _, breakout := range []string{`mkdir -p '/opt/'; `, `-rf '/opt/'; `, `for d in '/opt/'; `} {
+			if strings.Contains(s, breakout) {
+				t.Fatalf("command injection breakout %q present in script:\n%s", breakout, s)
+			}
+		}
+	}
+	if !sawRoot {
+		t.Fatal("no emitted script interpolated the install_root; test ineffective")
 	}
 }
 

@@ -59,7 +59,7 @@ func runnerCommand(t *spec.TestRun) string {
 // RunTest = fetch+extract test package on target, execute runner, collect
 // results+logs to runner destination_dir, parse, evaluate pass criteria.
 // Collection ALWAYS runs before pass evaluation (E2E-05: collect-then-fail).
-func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, error) {
+func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOutcome, err error) {
 	host := strings.ToLower(tr.Target.Hosts[0])
 	t, err := e.NewTransport(&tr.Target, host)
 	if err != nil {
@@ -80,22 +80,39 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 	if err := ensureLayout(ctx, t, p); err != nil {
 		return nil, coded("ERR_CONNECT", host, "STAGE", err)
 	}
+	// STAGING WIPE (start): whole-directory wipe on EVERY run, cached or not
+	// (DESIGN §9.1 "wiped at start & end of every op").
+	if err := e.wipeStaging(ctx, t, p); err != nil {
+		return nil, coded("ERR_CONNECT", host, "STAGE", err)
+	}
+	// STAGING WIPE (end): surface a cleanup failure as the op error when the run
+	// otherwise succeeded; warn (preserving root cause) when it already failed.
+	defer func() {
+		if werr := e.wipeStaging(ctx, t, p); werr != nil {
+			if err == nil {
+				err = coded("ERR_CONNECT", host, "STAGE", fmt.Errorf("staging cleanup: %w", werr))
+				outcome = nil
+			} else {
+				e.warnf("staging cleanup failed on %s after prior error: %v", host, werr)
+			}
+		}
+	}()
 	cached, err := e.releaseCached(ctx, t, p, tr.Artifact.Checksum)
 	if err != nil {
 		return nil, coded("ERR_CONNECT", host, "STAGE", err)
 	}
 	if !cached {
-		if err := e.wipeStaging(ctx, t, p); err != nil {
-			return nil, coded("ERR_CONNECT", host, "STAGE", err)
-		}
-		defer func() { _ = e.wipeStaging(ctx, t, p) }()
 		if err := e.fetchToStaging(ctx, t, dep, p); err != nil {
-			return nil, err
+			return nil, err // fetch writes only to staging; release tree untouched
 		}
+		// Release dir now (partially) created; on any failure remove the
+		// incomplete release to keep a staging-only failure state (DESIGN §10.2).
 		if err := e.extract(ctx, t, p); err != nil {
+			_ = e.removePath(ctx, t, p.Release)
 			return nil, err
 		}
 		if err := e.writeReleaseMarker(ctx, t, p, dep); err != nil {
+			_ = e.removePath(ctx, t, p.Release)
 			return nil, coded("ERR_CONNECT", host, "STAGE", err)
 		}
 	}
@@ -119,7 +136,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 		script := fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(workDir), cmdline)
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, Env: env, TimeoutSec: timeout})
 	} else {
-		script := fmt.Sprintf("cd '%s' && %s", workDir, cmdline)
+		script := fmt.Sprintf("cd %s && %s", shq(workDir), cmdline)
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, Env: env, TimeoutSec: timeout})
 	}
 	duration := int(time.Since(startedAt).Seconds())

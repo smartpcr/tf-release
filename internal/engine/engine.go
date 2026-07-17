@@ -302,9 +302,9 @@ exit 0`, psq(p.Root))
 	} else {
 		script := fmt.Sprintf(`command -v unzip >/dev/null || { echo 'unzip missing' >&2; exit 1; }
 command -v curl >/dev/null || { echo 'curl missing' >&2; exit 1; }
-mkdir -p '%s' 2>/dev/null || true
-avail=$(df -Pm "$(dirname '%s')" | awk 'NR==2{print $4}')
-[ "$avail" -ge 500 ] || { echo "free space ${avail}MB < 500MB" >&2; exit 1; }`, p.Root, p.Root)
+mkdir -p %s 2>/dev/null || true
+avail=$(df -Pm "$(dirname %s)" | awk 'NR==2{print $4}')
+[ "$avail" -ge 500 ] || { echo "free space ${avail}MB < 500MB" >&2; exit 1; }`, shq(p.Root), shq(p.Root))
 		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 		if err != nil {
 			return wrapTransportErr(err, host, "PREFLIGHT")
@@ -325,35 +325,52 @@ avail=$(df -Pm "$(dirname '%s')" | awk 'NR==2{print $4}')
 // stageOnHost = FETCH+CHECKSUM+EXTRACT+deps+RENDER into the immutable release
 // dir. Cached releases (marker sha match) skip fetch/extract (DESIGN §10.5).
 func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec.Deployment,
-	p layout.Paths, pat pattern.Pattern, rc pattern.ReleaseCtx) error {
+	p layout.Paths, pat pattern.Pattern, rc pattern.ReleaseCtx) (err error) {
 	host := t.Host()
 	if err := ensureLayout(ctx, t, p); err != nil {
 		return coded("ERR_CONNECT", host, "STAGE", err)
 	}
+	// STAGING WIPE (start): staging/ is scratch, wiped whole at the start of
+	// EVERY op — cached or not (DESIGN §9.1 "wiped at start & end of every op").
+	if err := e.wipeStaging(ctx, t, p); err != nil {
+		return coded("ERR_CONNECT", host, "STAGE", err)
+	}
+	// STAGING WIPE (end): runs on every exit path. A cleanup failure is surfaced
+	// as the op error when the op otherwise succeeded (never leave a dirty
+	// staging silently); when the op already failed we warn so the root cause
+	// is preserved.
+	defer func() {
+		if werr := e.wipeStaging(ctx, t, p); werr != nil {
+			if err == nil {
+				err = coded("ERR_CONNECT", host, "STAGE", fmt.Errorf("staging cleanup: %w", werr))
+			} else {
+				e.warnf("staging cleanup failed on %s after prior error: %v", host, werr)
+			}
+		}
+	}()
 	cached, err := e.releaseCached(ctx, t, p, s.Artifact.Checksum)
 	if err != nil {
 		return coded("ERR_CONNECT", host, "STAGE", err)
 	}
 	if !cached {
-		// STAGING WIPE (start): staging/ is scratch; it is wiped whole before
-		// fetch and again on every exit (defer) so partial downloads/extracts
-		// never leak across ops (DESIGN §9.1 "wiped at start & end of every op").
-		if err := e.wipeStaging(ctx, t, p); err != nil {
-			return coded("ERR_CONNECT", host, "STAGE", err)
-		}
-		defer func() { _ = e.wipeStaging(ctx, t, p) }()
 		if err := e.fetchToStaging(ctx, t, s, p); err != nil {
-			return err
+			return err // fetch writes only to staging; release tree untouched
 		}
+		// From here the release dir is (partially) created; any failure must
+		// leave a staging-only failure state (DESIGN §10.2), so remove the
+		// incomplete release before returning.
 		if err := e.extract(ctx, t, p); err != nil {
+			_ = e.removePath(ctx, t, p.Release)
 			return err
 		}
 		if n, ok := pat.(*pattern.NodeWebApp); ok {
 			if err := n.InstallDeps(ctx, t, rc); err != nil {
+				_ = e.removePath(ctx, t, p.Release)
 				return err
 			}
 		}
 		if err := e.writeReleaseMarker(ctx, t, p, s); err != nil {
+			_ = e.removePath(ctx, t, p.Release)
 			return coded("ERR_CONNECT", host, "STAGE", err)
 		}
 	} else {
@@ -381,7 +398,7 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 				Script: fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(p.Release), hook)})
 		} else {
 			r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Env: rc.Env, TimeoutSec: 600,
-				Script: fmt.Sprintf("cd '%s' && %s", p.Release, hook)})
+				Script: fmt.Sprintf("cd %s && %s", shq(p.Release), hook)})
 		}
 		if xerr != nil {
 			return wrapTransportErr(xerr, host, "STAGE")
@@ -497,7 +514,7 @@ func ensureDir(ctx context.Context, t transport.Transport, dir string) error {
 		return nil
 	}
 	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh,
-		Script: fmt.Sprintf(`mkdir -p '%s'`, dir), TimeoutSec: 60})
+		Script: fmt.Sprintf(`mkdir -p %s`, shq(dir)), TimeoutSec: 60})
 	if err != nil || r.ExitCode != 0 {
 		return fmt.Errorf("mkdir %s: err=%v", dir, err)
 	}
@@ -571,7 +588,7 @@ func (e *Engine) removeJunction(ctx context.Context, t transport.Transport, p la
 		return err
 	}
 	_, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh,
-		Script: fmt.Sprintf(`rm -f '%s'`, p.Current), TimeoutSec: 60})
+		Script: fmt.Sprintf(`rm -f %s`, shq(p.Current)), TimeoutSec: 60})
 	return err
 }
 
@@ -631,7 +648,7 @@ func (e *Engine) pruneReleases(ctx context.Context, t transport.Transport, s *sp
 		listing = r.Stdout
 	} else {
 		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, TimeoutSec: 60,
-			Script: fmt.Sprintf(`for d in '%s'/*/; do [ -d "$d" ] && printf '%%s|%%s\n' "$(basename "$d")" "$(stat -c %%Y "$d")"; done`, p.Releases)})
+			Script: fmt.Sprintf(`for d in %s/*/; do [ -d "$d" ] && printf '%%s|%%s\n' "$(basename "$d")" "$(stat -c %%Y "$d")"; done`, shq(p.Releases))})
 		if err != nil || r.ExitCode != 0 {
 			return fmt.Errorf("list releases: err=%v %s", err, r.Stderr)
 		}
@@ -656,19 +673,31 @@ func (e *Engine) pruneReleases(ctx context.Context, t transport.Transport, s *sp
 		rels = append(rels, rel{parts[0], ts})
 	}
 	sort.Slice(rels, func(i, j int) bool { return rels[i].ts > rels[j].ts }) // newest first
+	// keep_releases is the TOTAL retention budget (DESIGN CAP-02: keep=2 ⇒ exactly
+	// 2 dirs = newest+previous). current + previous are ALWAYS retained and count
+	// toward the budget; remaining slots go to the newest non-protected releases.
 	protected := map[string]bool{m.CurrentVersion: true}
 	if m.PreviousVersion != "" {
 		protected[m.PreviousVersion] = true
 	}
-	kept := 0
-	var firstErr error
+	protectedExisting := 0
 	for _, r := range rels {
 		if protected[r.name] {
-			kept++
-			continue
+			protectedExisting++
 		}
-		if kept < keep {
-			kept++
+	}
+	slots := keep - protectedExisting // budget left for non-protected releases
+	if slots < 0 {
+		slots = 0 // protected (current+previous) is never deleted, even if > keep
+	}
+	filled := 0
+	var firstErr error
+	for _, r := range rels { // newest first
+		if protected[r.name] {
+			continue // current/previous: always retained
+		}
+		if filled < slots {
+			filled++
 			continue
 		}
 		if err := e.removePath(ctx, t, p.Releases+sepFor(t.OS())+r.name); err != nil && firstErr == nil {
