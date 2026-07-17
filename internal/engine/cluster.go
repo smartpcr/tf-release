@@ -257,19 +257,28 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 	time.Sleep(time.Duration(s.Strategy.Cluster.EffectiveSettle()) * time.Second)
 	ownerHost, ownerErr := e.clusterOwnerHost(ctx, cc)
 	if ownerErr != nil {
-		return nil, foldFinalize(ownerErr, e.clusterFinalize(ctx, cc, "", started, "failed"))
+		// The group was brought Online in C4; a failed create must leave it Offline
+		// (DESIGN §9.5). Stop it and surface any StopGroup failure — an un-stopped
+		// group is an unknown state, not a clean Offline (evaluator iter6 item 4).
+		return nil, e.clusterCreateStop(ctx, cc, started, ownerErr)
 	}
 	if err := newStepLogger(s, ownerHost).timed(ctx, "HEALTH", func() error { return e.clusterHealthOn(ctx, cc, ownerHost) }); err != nil {
-		_ = cc.cg.StopGroup(ctx, cc.coord(), s.Pattern.RoleName)
-		ferr := e.clusterFinalize(ctx, cc, "", started, "failed")
-		return nil, foldFinalize(fmt.Errorf("%w; role stopped after failed create (CLU-01 failure path)", err), ferr)
+		return nil, e.clusterCreateStop(ctx, cc, started,
+			fmt.Errorf("%w; role stopped after failed create (CLU-01 failure path)", err))
 	}
 	// C6: manifests + prune. A finalize (manifest-write) failure means the deploy
 	// is not durably recorded, so fail closed instead of returning success (item 1).
 	if ferr := e.clusterFinalize(ctx, cc, "", started, "success"); ferr != nil {
 		return nil, coded("ERR_CONNECT", cc.hosts[0], "FINALIZE", ferr)
 	}
-	st, _ := cc.cg.Status(ctx, cc.coord(), releaseCtx(s, cc.paths(cc.hosts[0], s.Artifact.Version)))
+	st, sterr := cc.cg.Status(ctx, cc.coord(), releaseCtx(s, cc.paths(cc.hosts[0], s.Artifact.Version)))
+	if sterr != nil {
+		// A failed remote status probe must be surfaced, not swallowed into an
+		// empty service_status on an otherwise-successful deploy (evaluator iter6
+		// item 6). The manifest is already durably finalized, so the next apply
+		// idempotency-skips.
+		return nil, wrapTransportErr(sterr, cc.hosts[0], "READ")
+	}
 	m, merr := ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
 	if m == nil {
 		// clusterFinalize just wrote the manifest; a read-back failure must not
@@ -286,6 +295,23 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 	return out, nil
 }
 
+// clusterCreateStop brings the role Offline after a failed create so C5 leaves
+// the guaranteed Offline failure state (DESIGN §9.5), then persists a failed
+// manifest (§10.6). A StopGroup failure means the group may still be Online — an
+// unknown state — so it escalates to ERR_ROLLBACK_FAILED rather than assuming a
+// clean Offline (evaluator iter6 item 4).
+func (e *Engine) clusterCreateStop(ctx context.Context, cc *clusterCtx, started time.Time, orig error) error {
+	s := cc.s
+	stopErr := cc.cg.StopGroup(ctx, cc.coord(), s.Pattern.RoleName)
+	ferr := e.clusterFinalize(ctx, cc, "", started, "failed")
+	if stopErr != nil {
+		detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — role could not be brought Offline after failed create: %v; deploy: %w",
+			cc.hosts[0], stopErr, orig)
+		return coded("ERR_ROLLBACK_FAILED", cc.hosts[0], "ROLLBACK", foldFinalize(detail, ferr))
+	}
+	return foldFinalize(orig, ferr)
+}
+
 // clusterCreateCleanup rolls back a partial fresh cluster create (DESIGN §10.3
 // row 1: a fresh create failure cleans the machine). Every node whose junction
 // was already switched is stopped, uninstalled, and its junction removed, then a
@@ -293,6 +319,12 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 // collected and force ERR_ROLLBACK_FAILED rather than a falsely-clean report.
 func (e *Engine) clusterCreateCleanup(ctx context.Context, cc *clusterCtx, switched []string, started time.Time, orig error) error {
 	s := cc.s
+	if len(switched) == 0 {
+		// Pre-switch failure on the FIRST node: nothing was switched/configured, so
+		// the machine is unmutated. Preserve that no-mutation state — do NOT write
+		// failed manifests on nodes that were never touched (evaluator iter6 item 3).
+		return orig
+	}
 	rbStart := time.Now()
 	var cleanupErrs []error
 	for _, h := range switched {
@@ -332,7 +364,17 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 			fmt.Errorf("role owner not among spec hosts %v", cc.hosts))
 	}
 	prevVersion := ""
-	if m, _ := ReadManifest(ctx, cc.tr[owner], cc.paths(owner, s.Artifact.Version)); m != nil {
+	// The owner manifest is the rollback target. A genuine read error (transport /
+	// corrupt) must NOT be swallowed into an empty prevVersion — that would let the
+	// update mutate the cluster with no valid rollback target and lose the
+	// previous-version metadata (evaluator iter6 item 5). An absent manifest
+	// (nil,nil) is tolerated as "no recorded previous version".
+	m, merr := ReadManifest(ctx, cc.tr[owner], cc.paths(owner, s.Artifact.Version))
+	if merr != nil {
+		return nil, coded("ERR_PREFLIGHT", owner, "VALIDATE",
+			fmt.Errorf("read owner manifest to determine rollback target: %w", merr))
+	}
+	if m != nil {
 		prevVersion = m.CurrentVersion
 	}
 	var passives []string
@@ -422,8 +464,13 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 	if ferr := e.clusterFinalize(ctx, cc, prevVersion, started, "success"); ferr != nil {
 		return nil, coded("ERR_CONNECT", cc.hosts[0], "FINALIZE", ferr)
 	}
-	st, _ := cc.cg.Status(ctx, cc.coord(), releaseCtx(s, cc.paths(cc.hosts[0], s.Artifact.Version)))
-	m, merr := ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
+	st, sterr := cc.cg.Status(ctx, cc.coord(), releaseCtx(s, cc.paths(cc.hosts[0], s.Artifact.Version)))
+	if sterr != nil {
+		// Surface a failed remote status probe instead of returning an empty
+		// service_status on an otherwise-successful update (evaluator iter6 item 6).
+		return nil, wrapTransportErr(sterr, cc.hosts[0], "READ")
+	}
+	m, merr = ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
 	if m == nil {
 		// clusterFinalize just wrote the manifest; a read-back failure must not
 		// pass nil to statusFrom and panic (evaluator iter5 item 5).

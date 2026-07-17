@@ -426,7 +426,14 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		sl.emit(ctx, "ROLLBACK", rbStart)
 		if rerr != nil {
 			// §10.6: persist a failed manifest before surfacing ERR_ROLLBACK_FAILED.
-			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, prev, oldImage, started)
+			// When the old container exists but no prior manifest does (prev==""),
+			// record at the attempted version so the failed state is still persisted
+			// (evaluator iter6 item 2).
+			failVer := prev
+			if failVer == "" {
+				failVer = s.Artifact.Version
+			}
+			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started)
 			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy: %v; rollback: %v", host, runErr, rerr)
 			if fmErr != nil {
 				detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
@@ -459,8 +466,6 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 	return statusFrom(nm, host, st), nil
 }
 
-// dockerFinalizeFailed persists a failed manifest for the docker path (DESIGN
-// §10.6) recording last_operation.result=failed at the previous version/image.
 // dockerFinalizeFailed persists a failed manifest for the docker path (DESIGN
 // §10.2/§10.6) recording last_operation.result=failed. The manifest write is
 // emitted as a structured FINALIZE step (evaluator iter5 item 3).

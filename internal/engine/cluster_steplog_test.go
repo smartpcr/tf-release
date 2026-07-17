@@ -239,6 +239,119 @@ func TestClusterCreatePartialCleanup(t *testing.T) {
 	}
 }
 
+// TestClusterCreateFirstNodeNoMutation covers evaluator iter6 item 3: a C1
+// staging failure on the FIRST node mutated nothing, so no failed manifests may
+// be written on any node — the pre-switch no-mutation state is preserved and the
+// original error is surfaced (not ERR_ROLLBACK_FAILED).
+func TestClusterCreateFirstNodeNoMutation(t *testing.T) {
+	payload := []byte("cluster create zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  false, svc: "SampleSvc", owner: "", state: "Offline",
+	}
+	n1 := &clusterNode{fakeHost: newFakeHost("lab-01"), cl: cl}
+	n2 := &clusterNode{fakeHost: newFakeHost("lab-02"), cl: cl}
+	// First node's staging fails before anything is switched/configured.
+	n1.fakeHost.fail["stage"] = true
+
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	_, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if err == nil {
+		t.Fatalf("expected fresh cluster create to fail at lab-01 STAGE")
+	}
+	// No mutation ⇒ NO manifest may be written on any node.
+	for name, n := range nodes {
+		if _, has := n.fakeHost.files[`C:\deploy\sample-svc\manifest.json`]; has {
+			t.Fatalf("pre-switch first-node failure must leave NO manifest on %s: %q",
+				name, string(n.fakeHost.files[`C:\deploy\sample-svc\manifest.json`]))
+		}
+		if n.fakeHost.current != "" {
+			t.Fatalf("pre-switch first-node failure must leave NO junction on %s, got %q", name, n.fakeHost.current)
+		}
+	}
+	var ce *CodedError
+	if asCoded(err, &ce) && ce.Code == "ERR_ROLLBACK_FAILED" {
+		t.Fatalf("first-node no-mutation failure must NOT escalate to ERR_ROLLBACK_FAILED, got: %v", err)
+	}
+}
+
+// TestClusterCreateHealthBringsOffline covers evaluator iter6 item 4: a C5
+// health failure must bring the role Offline (the required failure state,
+// DESIGN §9.5) — the group was brought Online in C4 and must not be left Online.
+func TestClusterCreateHealthBringsOffline(t *testing.T) {
+	payload := []byte("cluster create zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	// Fresh create; owner preset so clusterOwnerHost resolves lab-01 after the
+	// role is created, letting C5 reach the HEALTH step.
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  false, svc: "SampleSvc", owner: "lab-01", state: "Offline",
+	}
+	n1 := &clusterNode{fakeHost: newFakeHost("lab-01"), cl: cl}
+	n2 := &clusterNode{fakeHost: newFakeHost("lab-02"), cl: cl}
+	n1.fakeHost.healthGate = func() bool { return true } // C5 health always fails
+
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	_, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if err == nil {
+		t.Fatalf("expected fresh cluster create to fail at C5 HEALTH")
+	}
+	// C4 brought the group Online; the failed create must leave it Offline.
+	if cl.state != "Offline" {
+		t.Fatalf("failed create must bring the role Offline, got state=%q", cl.state)
+	}
+	if !strings.Contains(err.Error(), "role stopped after failed create") {
+		t.Fatalf("want 'role stopped after failed create' detail, got: %v", err)
+	}
+}
+
+// TestClusterCreateOwnerResolutionBringsOffline covers evaluator iter6 item 4:
+// an owner-resolution failure at C5 must also stop the started group (the old
+// code returned without a StopGroup, leaving it Online).
+func TestClusterCreateOwnerResolutionBringsOffline(t *testing.T) {
+	payload := []byte("cluster create zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	// owner="" ⇒ after CreateRole the RoleBinding reports an empty owner, so
+	// clusterOwnerHost fails to resolve a valid owner (unknown-owner ERR_PREFLIGHT).
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  false, svc: "SampleSvc", owner: "", state: "Offline",
+	}
+	n1 := &clusterNode{fakeHost: newFakeHost("lab-01"), cl: cl}
+	n2 := &clusterNode{fakeHost: newFakeHost("lab-02"), cl: cl}
+
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	_, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if err == nil {
+		t.Fatalf("expected fresh cluster create to fail at C5 owner resolution")
+	}
+	if cl.state != "Offline" {
+		t.Fatalf("owner-resolution failure must still bring the role Offline, got state=%q", cl.state)
+	}
+}
+
 // clusterUpdateSpec is a 2-node cluster_generic_service Deployment updating to
 // 2.0.0 with lab-01 as preferred owner and a short settle to keep the test fast.
 func clusterUpdateSpec(t *testing.T, url, checksum string) *spec.Deployment {
