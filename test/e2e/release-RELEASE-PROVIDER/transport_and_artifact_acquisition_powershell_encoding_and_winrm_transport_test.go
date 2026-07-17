@@ -80,8 +80,12 @@ func (s *encState) thenEscapingIsCorrect() error {
 		return fmt.Errorf("missing expected flags prefix: %q", s.got)
 	}
 	b64 := strings.TrimPrefix(s.got, prefix)
-	if strings.Contains(prefix, "s3cr3t-value") {
-		return fmt.Errorf("secret value leaked onto the visible command line")
+	// Secret hygiene: the plaintext secret must never appear on the visible
+	// command line. It only survives base64-encoded inside the -EncodedCommand
+	// blob (which cannot contain the literal "s3cr3t-value" — the hyphen is not
+	// in the base64 alphabet), so assert against the real command line s.got.
+	if strings.Contains(s.got, "s3cr3t-value") {
+		return fmt.Errorf("secret value leaked onto the visible command line: %q", s.got)
 	}
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
