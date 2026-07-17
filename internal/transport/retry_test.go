@@ -52,18 +52,23 @@ func TestRetryConnectExhaustsToErrConnect(t *testing.T) {
 // backoff is applied only BETWEEN attempts — twice, never after the final one.
 // A trailing sleep would push elapsed time to ~3× backoff.
 func TestRetryConnectNoTrailingBackoff(t *testing.T) {
-	const backoff = 40 * time.Millisecond
+	const backoff = 100 * time.Millisecond
 	start := time.Now()
 	_ = retryConnect(context.Background(), 2, backoff, func() error {
 		return errors.New("always fails")
 	})
 	elapsed := time.Since(start)
-	// 3 attempts → exactly 2 backoffs. Assert it slept ~2× and clearly < 3×.
+	// 3 attempts → exactly 2 backoffs. The lower bound (2×backoff) is safe
+	// because Go timers never fire early. For the upper bound we use a larger
+	// backoff unit — so absolute scheduler/GC jitter is proportionally smaller —
+	// and threshold at the 2.5× midpoint (5*backoff/2): correct behaviour lands
+	// near 2×backoff (~200ms) and a trailing sleep near 3×backoff (~300ms),
+	// leaving ~50ms of slack on each side so this stays robust on loaded CI.
 	if elapsed < 2*backoff {
 		t.Fatalf("elapsed %v < 2×backoff %v: backoff not applied between attempts", elapsed, 2*backoff)
 	}
-	if elapsed >= 3*backoff {
-		t.Fatalf("elapsed %v >= 3×backoff %v: a trailing backoff was slept after the final attempt", elapsed, 3*backoff)
+	if threshold := 5 * backoff / 2; elapsed >= threshold {
+		t.Fatalf("elapsed %v >= 2.5×backoff %v: a trailing backoff was slept after the final attempt", elapsed, threshold)
 	}
 }
 
