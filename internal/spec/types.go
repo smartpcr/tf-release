@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"time"
 )
 
 type OSKind string
@@ -572,6 +574,10 @@ func (h *HealthCheck) EffectiveType() string {
 
 func (h *HealthCheck) Budget() (initial, interval, timeout int) {
 	initial, interval, timeout = h.InitialDelaySeconds, h.IntervalSeconds, h.TimeoutSeconds
+	// initial_delay_seconds defaults to 5 per DESIGN §6.5 (normative). The health
+	// runner still enforces timeout_seconds as a HARD total-budget deadline via a
+	// context, so even when the default initial delay exceeds a small timeout the
+	// probe loop cannot run past the budget.
 	if initial <= 0 {
 		initial = 5
 	}
@@ -633,10 +639,16 @@ func (t *TestRun) EffectiveWorkRoot(os OSKind) string {
 	return `C:\deploy`
 }
 
-// EffectiveDestinationDir on the RUNNER (DESIGN §7.4); default ./labdeploy-results.
-func (c *Collect) EffectiveDestinationDir() string {
+// EffectiveDestinationDir on the RUNNER (DESIGN §7.4). Default is a RUN-SPECIFIC
+// `./labdeploy-results/<name>-<unix>` directory (DESIGN §7.4:375) so repeated
+// runs never reuse a dir and recount stale extracted results. `name` is the
+// TestRun metadata.name.
+func (c *Collect) EffectiveDestinationDir(name string) string {
 	if c.DestinationDir != "" {
 		return c.DestinationDir
 	}
-	return "labdeploy-results"
+	if name == "" {
+		name = "run"
+	}
+	return filepath.Join("labdeploy-results", fmt.Sprintf("%s-%d", name, time.Now().Unix()))
 }

@@ -1,0 +1,14 @@
+$code=0; $body=''
+try {
+  $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://localhost:8080/health' -TimeoutSec 10
+  $code = [int]$r.StatusCode; $body = [string]$r.Content
+} catch [System.Net.WebException] {
+  if ($_.Exception.Response -ne $null) {
+    $resp = $_.Exception.Response
+    $code = [int]$resp.StatusCode
+    $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+    $body = $sr.ReadToEnd(); $sr.Close()
+  } else { Write-Output $_.Exception.Message; exit 1 }
+} catch { Write-Output $_.Exception.Message; exit 1 }
+if($code -ne 200){ Write-Output ("status " + $code); exit 1 }
+exit 0

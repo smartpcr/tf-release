@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -59,7 +58,7 @@ func runnerCommand(t *spec.TestRun) string {
 // RunTest = fetch+extract test package on target, execute runner, collect
 // results+logs to runner destination_dir, parse, evaluate pass criteria.
 // Collection ALWAYS runs before pass evaluation (E2E-05: collect-then-fail).
-func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, error) {
+func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOutcome, err error) {
 	host := strings.ToLower(tr.Target.Hosts[0])
 	t, err := e.NewTransport(&tr.Target, host)
 	if err != nil {
@@ -80,21 +79,57 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 	if err := ensureLayout(ctx, t, p); err != nil {
 		return nil, coded("ERR_CONNECT", host, "STAGE", err)
 	}
-	cached, err := e.releaseCached(ctx, t, p, tr.Artifact.Checksum)
-	if err != nil {
+	// STAGING WIPE (start): whole-directory wipe on EVERY run, cached or not
+	// (DESIGN §9.1 "wiped at start & end of every op").
+	if err := e.wipeStaging(ctx, t, p); err != nil {
 		return nil, coded("ERR_CONNECT", host, "STAGE", err)
 	}
+	// STAGING WIPE (end): declared FIRST so it runs LAST (LIFO), after the
+	// incomplete-release cleanup below. Surface a cleanup failure as the op error
+	// when the run otherwise succeeded; warn (preserving root cause) otherwise.
+	defer func() {
+		if werr := e.wipeStaging(ctx, t, p); werr != nil {
+			if err == nil {
+				err = coded("ERR_CONNECT", host, "STAGE", fmt.Errorf("staging cleanup: %w", werr))
+				outcome = nil
+			} else {
+				e.warnf("staging cleanup failed on %s after prior error: %v", host, werr)
+			}
+		}
+	}()
+	// INCOMPLETE-RELEASE CLEANUP: declared SECOND so it runs FIRST, while `err`
+	// still holds the genuine run result. Only a release THIS run created is
+	// removed, and only on a pre-execution failure (DESIGN §10.2). Cleanup
+	// failures are joined onto the op error.
+	createdRelease := false
+	defer func() {
+		if err != nil && createdRelease {
+			err = e.cleanupIncompleteRelease(ctx, t, p, host, err)
+		}
+	}()
+	cached, cerr := e.releaseCached(ctx, t, p, tr.Artifact.Version, tr.Artifact.Checksum)
+	if cerr != nil {
+		return nil, coded("ERR_CONNECT", host, "STAGE", cerr)
+	}
 	if !cached {
-		if err := e.fetchToStaging(ctx, t, dep, p); err != nil {
-			return nil, err
+		if ferr := e.fetchToStaging(ctx, t, dep, p); ferr != nil {
+			return nil, ferr // fetch writes only to staging; release tree untouched
 		}
-		if err := e.extract(ctx, t, p); err != nil {
-			return nil, err
+		// extract creates the release dir — from here it is "ours".
+		createdRelease = true
+		if xerr := e.extract(ctx, t, p); xerr != nil {
+			return nil, xerr
 		}
-		if err := e.writeReleaseMarker(ctx, t, p, dep); err != nil {
-			return nil, coded("ERR_CONNECT", host, "STAGE", err)
+		if merr := e.writeReleaseMarker(ctx, t, p, dep); merr != nil {
+			return nil, coded("ERR_CONNECT", host, "STAGE", merr)
 		}
 	}
+	// Staging is complete: the release is now fully extracted and marked. Clear
+	// the cleanup guard so a LATER failure (test execution, result collection, or
+	// result parsing) does NOT delete a good release or its collected `_results`
+	// — the incomplete-release cleanup is strictly a pre-execution/staging-only
+	// failure remedy (DESIGN §10.2).
+	createdRelease = false
 
 	env := layout.MergeEnv(layout.BuiltinEnv(tr.Metadata.Name, tr.Artifact.Version, p, 0), tr.Runner.Env)
 	cmdline := runnerCommand(tr)
@@ -115,20 +150,25 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 		script := fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(workDir), cmdline)
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, Env: env, TimeoutSec: timeout})
 	} else {
-		script := fmt.Sprintf("cd '%s' && %s", workDir, cmdline)
+		script := fmt.Sprintf("cd %s && %s", shq(workDir), cmdline)
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, Env: env, TimeoutSec: timeout})
 	}
 	duration := int(time.Since(startedAt).Seconds())
-	if xerr != nil {
-		if strings.Contains(xerr.Error(), "timed out") {
-			return nil, coded("ERR_TIMEOUT", host, "TEST", xerr)
-		}
-		return nil, wrapTransportErr(xerr, host, "TEST")
-	}
 
-	// COLLECT (always) — results dirs + configured logs + event logs.
-	dest := tr.Collect.EffectiveDestinationDir()
+	// COLLECT (always) — results dirs + configured logs + event logs. This block
+	// runs even when the runner timed out or the transport failed, so partial
+	// results/logs are captured BEFORE the error is surfaced (DESIGN §5.3
+	// "collection always happens before returning a test-failure error"; E2E-04
+	// "partial logs collected" on runner.timeout_seconds). The timeout/transport
+	// error is surfaced right after the collection block below.
+	dest := tr.Collect.EffectiveDestinationDir(tr.Metadata.Name)
 	if err := os.MkdirAll(dest, 0o755); err != nil {
+		// If the runner already failed, THAT is the primary error and the
+		// missing local results dir is secondary; otherwise the run succeeded
+		// and an uncreatable results dir is itself the failure.
+		if xerr != nil {
+			return nil, testRunErr(xerr, host)
+		}
 		return nil, fmt.Errorf("mkdir results dir %s: %w", dest, err)
 	}
 	var collectWarns []string
@@ -141,22 +181,26 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 			resultGlobs = append(resultGlobs, p.Release+"/"+strings.TrimLeft(rp, "/"))
 		}
 	}
-	files, warns := logs.CollectFiles(ctx, t, resultGlobs, filepath.Join(dest, "results"))
+	// CollectFiles extracts the archive itself (preserving relative paths) and
+	// returns the result files; parse them by walking the whole results tree.
+	_, warns := logs.CollectFiles(ctx, t, resultGlobs, filepath.Join(dest, "results"))
 	collectWarns = append(collectWarns, warns...)
-	localResults := filepath.Join(dest, "results", sanitizeHost(host))
-	if len(files) > 0 {
-		if err := unpackLocal(files[0], localResults); err != nil {
-			collectWarns = append(collectWarns, fmt.Sprintf("unpack results: %v", err))
-		}
-	}
-	// 2. Extra log globs.
+	localResults := filepath.Join(dest, "results")
+	// 2. Extra log globs — CollectFiles extracts them into results_dir/logs/<host>/.
+	// Relative globs resolve under the named deployment's shared dir when
+	// `collect.app_shared_of` is set (DESIGN §7:373); absolute globs pass through.
 	if len(tr.Collect.Logs) > 0 {
-		_, w := logs.CollectFiles(ctx, t, tr.Collect.Logs, filepath.Join(dest, "logs"))
+		logGlobs := tr.Collect.Logs
+		if tr.Collect.AppSharedOf != "" {
+			sp := layout.NewPaths(t.OS(), tr.EffectiveWorkRoot(t.OS()), tr.Collect.AppSharedOf, "")
+			logGlobs = resolveTargetGlobs(t.OS(), sp.Shared, tr.Collect.Logs)
+		}
+		_, w := logs.CollectFiles(ctx, t, logGlobs, filepath.Join(dest, "logs"))
 		collectWarns = append(collectWarns, w...)
 	}
 	// 3. Windows event logs since test start.
 	if len(tr.Collect.WindowsEventLogs) > 0 {
-		_, w := logs.CollectEventLogs(ctx, t, tr.Collect.WindowsEventLogs, startedAt.Add(-time.Minute), filepath.Join(dest, "events"))
+		_, w := logs.CollectEventLogs(ctx, t, tr.Collect.WindowsEventLogs, startedAt, filepath.Join(dest, "events"))
 		collectWarns = append(collectWarns, w...)
 	}
 	for _, w := range collectWarns {
@@ -166,11 +210,18 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 	_ = os.WriteFile(filepath.Join(dest, "runner-stdout.txt"), []byte(tail(r.Stdout, 200_000)), 0o644)
 	_ = os.WriteFile(filepath.Join(dest, "runner-stderr.txt"), []byte(tail(r.Stderr, 200_000)), 0o644)
 
+	// Best-effort collection has run; NOW surface a runner timeout / transport
+	// failure so an always() publish step still sees the partial results_dir
+	// (DESIGN §5.3; E2E-04). Result parsing and pass evaluation are skipped.
+	if xerr != nil {
+		return nil, testRunErr(xerr, host)
+	}
+
 	out := &TestOutcome{ExitCode: r.ExitCode, ResultsDir: dest, DurationSeconds: duration}
 
 	// PARSE results if a format is configured.
 	if f := tr.Results.Format; f == "trx" || f == "junit" {
-		c, matched, perr := logs.SumResults(f, localResults, flatten(tr.Results.Paths))
+		c, matched, perr := logs.SumResults(f, localResults, tr.Results.Paths)
 		if perr != nil {
 			// Missing/corrupt results with format set ⇒ ERR_TEST_FAILED (E2E-06).
 			return out, coded("ERR_TEST_FAILED", host, "TEST",
@@ -204,6 +255,16 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 	return out, nil
 }
 
+// testRunErr classifies a runner transport failure so it can be surfaced AFTER
+// best-effort collection (DESIGN §5.3; E2E-04): a "timed out" transport error
+// maps to ERR_TIMEOUT, anything else to the standard transport-mapped error.
+func testRunErr(xerr error, host string) error {
+	if strings.Contains(xerr.Error(), "timed out") {
+		return coded("ERR_TIMEOUT", host, "TEST", xerr)
+	}
+	return wrapTransportErr(xerr, host, "TEST")
+}
+
 func summarize(o *TestOutcome, exitOK, rateOK bool) string {
 	return fmt.Sprintf("passed=%t exit=%d(ok=%t) tests=%d passed=%d failed=%d skipped=%d rate_ok=%t duration=%ds",
 		o.Passed, o.ExitCode, exitOK, o.Total, o.PassedTests, o.FailedTests, o.SkippedTests, rateOK, o.DurationSeconds)
@@ -225,48 +286,9 @@ func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started tim
 	_ = os.WriteFile(filepath.Join(dest, "summary.json"), b, 0o644)
 }
 
-// unpackLocal expands the downloaded logs.zip/tar.gz into dir for parsing.
-func unpackLocal(archive, dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	if strings.HasSuffix(archive, ".zip") {
-		return runLocal("unzip", "-o", "-q", archive, "-d", dir)
-	}
-	return runLocal("tar", "xzf", archive, "-C", dir)
-}
-
-func runLocal(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %v: %v: %s", name, args, err, tail(string(out), 500))
-	}
-	return nil
-}
-
-// flatten strips directory components so globs match against the unpacked
-// flat archive layout (Compress-Archive flattens; tar preserves — match base).
-func flatten(patterns []string) []string {
-	out := make([]string, 0, len(patterns)*2)
-	for _, p := range patterns {
-		out = append(out, p, filepath.Base(p))
-	}
-	return out
-}
-
 func tail(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return s[len(s)-n:]
-}
-
-func sanitizeHost(h string) string {
-	return strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, strings.ToLower(h))
 }

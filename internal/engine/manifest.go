@@ -76,7 +76,7 @@ func readSmallFile(ctx context.Context, t transport.Transport, path string) (str
 		}
 		return string(raw), true, nil
 	}
-	script := fmt.Sprintf(`[ -f '%s' ] || exit 3; base64 < '%s'`, path, path)
+	script := fmt.Sprintf(`[ -f %s ] || exit 3; base64 < %s`, shq(path), shq(path))
 	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	if err != nil {
 		return "", false, err
@@ -114,7 +114,7 @@ func writeSmallFile(ctx context.Context, t transport.Transport, path, content st
 		}
 		return nil
 	}
-	script := fmt.Sprintf(`printf '%%s' '%s' | base64 -d > '%s'`, b64, path)
+	script := fmt.Sprintf(`printf '%%s' '%s' | base64 -d > %s`, b64, shq(path))
 	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	if err != nil {
 		return err
