@@ -274,3 +274,31 @@ func TestFreshRollbackFailedUnknownState(t *testing.T) {
 		t.Fatalf("want MACHINE IN UNKNOWN STATE host=lab-01 detail, got: %v", err)
 	}
 }
+
+// TestFreshRollbackDisabledPersistsFailed covers the DESIGN §10.2 last row on the
+// FRESH path: with rollback_on_failure=false a failed install must still persist a
+// manifest recording last_operation.result=failed at the ATTEMPTED version (there
+// is no previous version), so Read reports drift. Regression guard for the bug
+// where rollbackSingle passed an empty prev to finalizeFailed, which no-op'd.
+func TestFreshRollbackDisabledPersistsFailed(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("fresh-noroll"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["start"] = true // forward install fails at START (switch phase)
+	d := winSvcSpec(t, url, sum)
+	rb := false
+	d.Strategy.RollbackOnFailure = &rb // §10.2 last row: leave target as-is
+	eng := engineWith(f)
+	_, err := eng.Deploy(context.Background(), d)
+	mustErr(t, err)
+	if !strings.Contains(err.Error(), "rollback_on_failure=false") {
+		t.Fatalf("want rollback_on_failure=false surfaced, got: %v", err)
+	}
+	m := manifestOf(f)
+	if m == "" {
+		t.Fatalf("fresh rollback-disabled failure must persist a failed manifest; none written (log=%v)", f.log)
+	}
+	if !strings.Contains(m, `"current_version": "1.0.0"`) || !strings.Contains(m, `"result": "failed"`) {
+		t.Fatalf("failed manifest must record the attempted version 1.0.0 with result=failed: %s", m)
+	}
+}

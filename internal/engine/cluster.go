@@ -208,19 +208,24 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 	started := time.Now().UTC()
 	// Best-effort per-node log/event collection on every exit path (DESIGN §6.5).
 	defer e.collectClusterLogs(ctx, cc, started)
-	// C1: stage + switch + register (start=demand) on EVERY node.
+	// C1: stage + switch + register (start=demand) on EVERY node. A failure after
+	// earlier nodes were already switched/configured must NOT return a partial
+	// fresh deployment — the already-mutated nodes are cleaned and a failed
+	// manifest persisted per DESIGN §10.3 row 1 (evaluator iter5 item 4).
+	var switched []string
 	for _, h := range cc.hosts {
 		p := cc.paths(h, s.Artifact.Version)
 		rc := releaseCtx(s, p)
 		sl := newStepLogger(s, h)
 		if err := e.stageOnHost(ctx, sl, cc.tr[h], s, p, cc.cg, rc); err != nil {
-			return nil, err
+			return nil, e.clusterCreateCleanup(ctx, cc, switched, started, err)
 		}
 		if err := sl.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[h], p) }); err != nil {
-			return nil, err
+			return nil, e.clusterCreateCleanup(ctx, cc, switched, started, err)
 		}
+		switched = append(switched, h)
 		if err := sl.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[h], rc) }); err != nil {
-			return nil, err
+			return nil, e.clusterCreateCleanup(ctx, cc, switched, started, err)
 		}
 	}
 	// C2: role creation on coordinator (registration = CONFIGURE step, DESIGN §8.5).
@@ -265,10 +270,54 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 		return nil, coded("ERR_CONNECT", cc.hosts[0], "FINALIZE", ferr)
 	}
 	st, _ := cc.cg.Status(ctx, cc.coord(), releaseCtx(s, cc.paths(cc.hosts[0], s.Artifact.Version)))
-	m, _ := ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
+	m, merr := ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
+	if m == nil {
+		// clusterFinalize just wrote the manifest; a read-back failure must not
+		// pass nil to statusFrom and panic (evaluator iter5 item 5). Synthesize the
+		// status from the known deploy values instead.
+		if merr != nil {
+			e.warnf("post-finalize manifest read on %s: %v", cc.hosts[0], merr)
+		}
+		m = &Manifest{CurrentVersion: s.Artifact.Version,
+			CurrentRelease: cc.paths(cc.hosts[0], s.Artifact.Version).Release}
+	}
 	out := statusFrom(m, "", st)
 	out.Hosts = cc.hosts
 	return out, nil
+}
+
+// clusterCreateCleanup rolls back a partial fresh cluster create (DESIGN §10.3
+// row 1: a fresh create failure cleans the machine). Every node whose junction
+// was already switched is stopped, uninstalled, and its junction removed, then a
+// failed manifest is persisted so Read reports the drift. Cleanup errors are
+// collected and force ERR_ROLLBACK_FAILED rather than a falsely-clean report.
+func (e *Engine) clusterCreateCleanup(ctx context.Context, cc *clusterCtx, switched []string, started time.Time, orig error) error {
+	s := cc.s
+	rbStart := time.Now()
+	var cleanupErrs []error
+	for _, h := range switched {
+		p := cc.paths(h, s.Artifact.Version)
+		rc := releaseCtx(s, p)
+		if err := cc.cg.Stop(ctx, cc.tr[h], rc); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("%s stop: %w", h, err))
+		}
+		if err := cc.cg.Uninstall(ctx, cc.tr[h], rc, false); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("%s uninstall: %w", h, err))
+		}
+		if err := e.removeJunction(ctx, cc.tr[h], p); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("%s junction: %w", h, err))
+		}
+		newStepLogger(s, h).emit(ctx, "ROLLBACK", rbStart)
+	}
+	// §10.6: persist failed manifests recording the attempted version before
+	// surfacing the outcome; a write failure is folded into the diagnostic.
+	fmErr := e.clusterFinalize(ctx, cc, "", started, "failed")
+	if len(cleanupErrs) > 0 {
+		detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — fresh cluster create cleanup failed; deploy: %v; cleanup: %v",
+			cc.hosts[0], orig, errors.Join(cleanupErrs...))
+		return coded("ERR_ROLLBACK_FAILED", cc.hosts[0], "ROLLBACK", foldFinalize(detail, fmErr))
+	}
+	return foldFinalize(fmt.Errorf("%w; fresh cluster create failed — nodes cleaned (no service, no junction)", orig), fmErr)
 }
 
 // clusterRollingUpdate = U0..U8 with R-steps rollback (DESIGN §9.5).
@@ -374,7 +423,16 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 		return nil, coded("ERR_CONNECT", cc.hosts[0], "FINALIZE", ferr)
 	}
 	st, _ := cc.cg.Status(ctx, cc.coord(), releaseCtx(s, cc.paths(cc.hosts[0], s.Artifact.Version)))
-	m, _ := ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
+	m, merr := ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
+	if m == nil {
+		// clusterFinalize just wrote the manifest; a read-back failure must not
+		// pass nil to statusFrom and panic (evaluator iter5 item 5).
+		if merr != nil {
+			e.warnf("post-finalize manifest read on %s: %v", cc.hosts[0], merr)
+		}
+		m = &Manifest{CurrentVersion: s.Artifact.Version, PreviousVersion: prevVersion,
+			CurrentRelease: cc.paths(cc.hosts[0], s.Artifact.Version).Release}
+	}
 	out := statusFrom(m, "", st)
 	out.Hosts = cc.hosts
 	return out, nil

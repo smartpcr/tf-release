@@ -190,6 +190,55 @@ func TestStepLogClusterMultiHostUpdateRollback(t *testing.T) {
 	}
 }
 
+// TestClusterCreatePartialCleanup covers evaluator iter5 item 4 / DESIGN §10.3
+// row 1: when a FRESH cluster create fails at C1 after an earlier node was
+// already switched+configured, the partially-deployed nodes must be cleaned
+// (junction removed, service uninstalled) and a failed manifest persisted, not
+// left as a partial deployment.
+func TestClusterCreatePartialCleanup(t *testing.T) {
+	payload := []byte("cluster create zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	// Fresh cluster: no role yet ⇒ deployCluster takes the clusterCreate (C1..C6)
+	// path.
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  false, svc: "SampleSvc", owner: "", state: "Offline",
+	}
+	n1 := &clusterNode{fakeHost: newFakeHost("lab-01"), cl: cl}
+	n2 := &clusterNode{fakeHost: newFakeHost("lab-02"), cl: cl}
+	// C1 processes lab-01 first (stage→switch→configure OK), then lab-02 whose
+	// SWITCH fails — lab-01 is now partially deployed and must be cleaned.
+	n2.fakeHost.fail["switch"] = true
+
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	_, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if err == nil {
+		t.Fatalf("expected fresh cluster create to fail at lab-02 SWITCH")
+	}
+	// lab-01 was switched+configured, so it MUST be cleaned during C1 rollback.
+	if n1.fakeHost.current != "" {
+		t.Fatalf("partially-deployed lab-01 junction must be removed, got %q", n1.fakeHost.current)
+	}
+	if n1.fakeHost.svc != "" {
+		t.Fatalf("partially-deployed lab-01 service must be uninstalled, got %q", n1.fakeHost.svc)
+	}
+	// A failed manifest must be persisted (§10.6) so Read reports the drift.
+	m := string(n1.fakeHost.files[`C:\deploy\sample-svc\manifest.json`])
+	if m == "" || !strings.Contains(m, `"result": "failed"`) {
+		t.Fatalf("fresh cluster create cleanup must persist a failed manifest on lab-01: %q", m)
+	}
+	if !strings.Contains(err.Error(), "nodes cleaned") {
+		t.Fatalf("want cleaned-nodes outcome surfaced, got: %v", err)
+	}
+}
+
 // clusterUpdateSpec is a 2-node cluster_generic_service Deployment updating to
 // 2.0.0 with lab-01 as preferred owner and a short settle to keep the test fast.
 func clusterUpdateSpec(t *testing.T, url, checksum string) *spec.Deployment {

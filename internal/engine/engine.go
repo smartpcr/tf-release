@@ -236,8 +236,14 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 		// §10.2 last row: record last_operation=failed so Read reports drift. A
 		// failed-manifest write error must not be swallowed — it is folded into the
 		// surfaced error so the caller learns the failed state was not persisted
-		// (evaluator item 4).
-		ferr := e.finalizeFailed(ctx, t, s, p, prev, started, "failed")
+		// (evaluator item 4). On a FRESH failure (prev=="") the attempted version
+		// is recorded so §10.2 persistence still happens instead of no-op'ing on an
+		// empty version (evaluator iter5 item 1).
+		failVer := prev
+		if failVer == "" {
+			failVer = s.Artifact.Version
+		}
+		ferr := e.finalizeFailed(ctx, sl, t, s, p, failVer, started, "failed")
 		out := fmt.Errorf("%w; rollback_on_failure=false — target left as-is for inspection", orig)
 		if ferr != nil {
 			return coded("ERR_CONNECT", host, "FINALIZE",
@@ -272,7 +278,7 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 			// manifest, so write one at the attempted (current) version recording
 			// last_operation.result=failed; a write failure is folded into the
 			// diagnostic so we never claim persistence that did not happen.
-			ferr := e.finalizeFailed(ctx, t, s, p, s.Artifact.Version, started, "failed")
+			ferr := e.finalizeFailed(ctx, sl, t, s, p, s.Artifact.Version, started, "failed")
 			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; fresh-install cleanup error: %v",
 				host, orig, errors.Join(cleanupErrs...))
 			if ferr != nil {
@@ -307,7 +313,7 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 	rerr := rb()
 	sl.emit(ctx, "ROLLBACK", rbStart)
 	if rerr != nil {
-		fmErr := e.finalizeFailed(ctx, t, s, pp, prev, started, "failed")
+		fmErr := e.finalizeFailed(ctx, sl, t, s, pp, prev, started, "failed")
 		detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy error: %v; rollback error: %v", host, orig, rerr)
 		if fmErr != nil {
 			detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
@@ -326,7 +332,7 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 		LastOperation: LastOp{Type: "deploy", Result: "rolled_back",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
-	if werr := WriteManifest(ctx, t, pp, m); werr != nil {
+	if werr := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, pp, m) }); werr != nil {
 		return coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
 			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — restored to %s but manifest write failed: %v; deploy error: %v",
 				host, prev, werr, orig))
@@ -334,7 +340,11 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 	return fmt.Errorf("%w; rolled back to %s (healthy)", orig, prev)
 }
 
-func (e *Engine) finalizeFailed(ctx context.Context, t transport.Transport, s *spec.Deployment,
+// finalizeFailed persists a manifest recording last_operation.result=<result>
+// (DESIGN §10.2/§10.6). The manifest write is emitted as a structured FINALIZE
+// step (every executed fixed step, including failure/rollback occurrences, must
+// carry app/host/step/version/duration_ms — evaluator iter5 item 3).
+func (e *Engine) finalizeFailed(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, current string, started time.Time, result string) error {
 	if current == "" {
 		return nil
@@ -346,7 +356,7 @@ func (e *Engine) finalizeFailed(ctx context.Context, t transport.Transport, s *s
 	}
 	m.LastOperation = LastOp{Type: "deploy", Result: result,
 		Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)}
-	if err := WriteManifest(ctx, t, p, m); err != nil {
+	if err := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, p, m) }); err != nil {
 		e.warnf("failed-manifest write on %s: %v", t.Host(), err)
 		return err
 	}
@@ -392,7 +402,21 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 	}
 	if runErr != nil {
 		if !s.Strategy.EffectiveRollback() || oldImage == "" {
-			return nil, fmt.Errorf("%w; no docker rollback performed (prev image unknown or rollback disabled)", runErr)
+			// §10.2: record last_operation=failed so Read reports drift even when no
+			// rollback is performed (rollback disabled or previous image unknown).
+			// Record at the previous version if known, else the attempted version so
+			// a fresh docker failure still persists failed state (evaluator iter5 item 2).
+			failVer := prev
+			if failVer == "" {
+				failVer = s.Artifact.Version
+			}
+			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started)
+			out := fmt.Errorf("%w; no docker rollback performed (prev image unknown or rollback disabled)", runErr)
+			if fmErr != nil {
+				return nil, coded("ERR_CONNECT", host, "FINALIZE",
+					fmt.Errorf("%v; failed-manifest write error: %v", out, fmErr))
+			}
+			return nil, out
 		}
 		rbStart := time.Now()
 		rerr := dc.RunNew(ctx, t, rc, oldImage)
@@ -402,7 +426,7 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		sl.emit(ctx, "ROLLBACK", rbStart)
 		if rerr != nil {
 			// §10.6: persist a failed manifest before surfacing ERR_ROLLBACK_FAILED.
-			fmErr := e.dockerFinalizeFailed(ctx, t, s, p, prev, oldImage, started)
+			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, prev, oldImage, started)
 			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy: %v; rollback: %v", host, runErr, rerr)
 			if fmErr != nil {
 				detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
@@ -437,7 +461,10 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 
 // dockerFinalizeFailed persists a failed manifest for the docker path (DESIGN
 // §10.6) recording last_operation.result=failed at the previous version/image.
-func (e *Engine) dockerFinalizeFailed(ctx context.Context, t transport.Transport, s *spec.Deployment,
+// dockerFinalizeFailed persists a failed manifest for the docker path (DESIGN
+// §10.2/§10.6) recording last_operation.result=failed. The manifest write is
+// emitted as a structured FINALIZE step (evaluator iter5 item 3).
+func (e *Engine) dockerFinalizeFailed(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, prev, prevImage string, started time.Time) error {
 	if prev == "" {
 		return nil
@@ -449,11 +476,12 @@ func (e *Engine) dockerFinalizeFailed(ctx context.Context, t transport.Transport
 		LastOperation: LastOp{Type: "deploy", Result: "failed",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
-	if err := ensureDir(ctx, t, p.Root); err != nil {
-		e.warnf("docker failed-manifest dir on %s: %v", t.Host(), err)
-		return err
-	}
-	if err := WriteManifest(ctx, t, p, m); err != nil {
+	if err := sl.timed(ctx, "FINALIZE", func() error {
+		if derr := ensureDir(ctx, t, p.Root); derr != nil {
+			return derr
+		}
+		return WriteManifest(ctx, t, p, m)
+	}); err != nil {
 		e.warnf("docker failed-manifest write on %s: %v", t.Host(), err)
 		return err
 	}
