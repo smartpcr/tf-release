@@ -259,14 +259,33 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 	// Only a repeatedly-vanishing/-contended slot spins, which cannot progress, so
 	// a tiny cap keeps us well under 5s.
 	const maxAttempts = 8
+	// Overall wall-clock budget for the whole acquisition. DESIGN §13 requires a
+	// fresh/live-held lock to fail fast ("<5s, no wait"): the uncontended create
+	// and each gate wait return immediately, so this budget is only ever consumed
+	// under pathological live gate contention. Each attempt's gate wait is bounded
+	// by the REMAINING budget (capped at lockGateWaitMS), so the sum of all waits —
+	// and therefore total acquisition time — never exceeds acquireBudget
+	// (evaluator iter-21 item 1).
+	const acquireBudget = 5 * time.Second
+	start := time.Now()
 	for attempt := 0; ; attempt++ {
+		remaining := acquireBudget - time.Since(start)
+		if remaining <= 0 {
+			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+				fmt.Errorf("lock acquisition exceeded %s budget (gate repeatedly contended)", acquireBudget))
+		}
+		waitMS := int(remaining / time.Millisecond)
+		if waitMS > lockGateWaitMS {
+			waitMS = lockGateWaitMS
+		}
+
 		token := newToken()
 		li, _ := json.Marshal(lockInfo{
 			Owner: owner, Op: op, StartedUTC: time.Now().UTC().Format(time.RFC3339), Token: token,
 		})
 		content := string(li)
 
-		created, exit, cerr := createLockExclusive(ctx, t, p, content)
+		created, exit, cerr := createLockExclusive(ctx, t, p, content, waitMS)
 		if cerr != nil {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr)
 		}
@@ -281,6 +300,20 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 			// masquerading as ERR_LOCKED (evaluator item 2).
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK",
 				fmt.Errorf("lock create failed operationally (exit 71: disk/permission/filesystem error)"))
+		}
+		if exit == 49 {
+			// TRANSIENT create-gate contention: a peer mutator briefly held the
+			// shared path-keyed gate (named mutex / directory flock) and our bounded
+			// wait elapsed. This is exactly the condition winMutexGuard/
+			// shDirLockPrologue document as retryable, so back off and re-evaluate
+			// within the budget rather than misclassifying it as ERR_CONNECT
+			// (evaluator iter-21 item 2).
+			if attempt < maxAttempts {
+				casBackoff(ctx, attempt)
+				continue
+			}
+			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+				fmt.Errorf("lock create gate repeatedly contended (exit 49)"))
 		}
 		if exit != 48 {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", fmt.Errorf("lock create failed (unexpected exit %d)", exit))
@@ -333,7 +366,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		// winner ALWAYS returns the stale-owner WARN; every loser observes our FRESH
 		// bytes (casMismatch) and retries into ERR_LOCKED against the live successor.
 		warn := staleWarnMsg(existing, t.Host())
-		outcome, serr := casReplace(ctx, t, p.Lock, raw, content)
+		outcome, serr := casReplace(ctx, t, p.Lock, raw, content, waitMS)
 		if serr != nil {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", serr)
 		}
@@ -421,44 +454,59 @@ func classifyCas(op, path string, r transport.Result) (casOutcome, error) {
 // fresh lock into the freed slot, after which the replace's atomic swap would
 // clobber the newcomer's lock — leaving BOTH the newcomer and the taker believing
 // they own it (evaluator iter-20 item 1). Mutex names cannot contain a path
-// separator (except the leading Global\), so the path is hashed. One mutex ⇔ one
-// lock file.
+// separator (except the leading Global\), so the path is hashed. The path is
+// lower-cased before hashing so case variants of the SAME case-insensitive Windows
+// path resolve to the SAME mutex and cannot bypass serialization (evaluator iter-21
+// item 4). One mutex ⇔ one lock file.
 func winLockMutexName(path string) string {
-	sum := sha1.Sum([]byte(path))
+	sum := sha1.Sum([]byte(strings.ToLower(path)))
 	return `Global\labdeploy-lock-` + hex.EncodeToString(sum[:])
 }
 
+// lockGateWaitMS bounds how long a single acquire/release command may wait for the
+// shared path-keyed gate mutex. It is deliberately short (well under DESIGN §13's
+// fresh-lock "<5s, no wait" contract): the guarded critical section is a single
+// fast local file op, and a crashed holder ABANDONS the mutex (returning
+// immediately), so this bound is only ever approached under pathological live
+// contention — where a timeout is surfaced as transient (exit 49) and retried
+// within the caller's overall 5s budget, never as a hard failure.
+const lockGateWaitMS = 1500
+
 // winMutexGuard wraps a PowerShell critical-section `body` (which sets $rc) in an
 // acquire/finally-release of the path-keyed named mutex, so create/delete/replace
-// all share ONE cross-process gate. A crashed holder abandons the mutex (WaitOne
-// throws AbandonedMutexException); the next acquirer treats that as acquired
-// because the crash-safe atomic file ops guarantee the bytes it observes are never
-// partial. A WaitOne timeout maps to exit 49 (contended) so the caller backs off
-// and retries rather than failing hard.
-func winMutexGuard(path, body string) string {
+// all share ONE cross-process gate. `waitMS` bounds the WaitOne so acquisition
+// stays within the <5s contract (evaluator iter-21 item 1). A crashed holder
+// abandons the mutex (WaitOne throws AbandonedMutexException); the next acquirer
+// treats that as acquired because the crash-safe atomic file ops guarantee the
+// bytes it observes are never partial. A WaitOne timeout maps to exit 49
+// (contended) so the caller backs off and retries rather than failing hard.
+func winMutexGuard(path string, waitMS int, body string) string {
 	return fmt.Sprintf(`$mtx=New-Object System.Threading.Mutex($false,%s)
 $rc=99
 $got=$false
-try{$got=$mtx.WaitOne(20000)}catch [System.Threading.AbandonedMutexException]{$got=$true}
+try{$got=$mtx.WaitOne(%d)}catch [System.Threading.AbandonedMutexException]{$got=$true}
 if(-not $got){$mtx.Dispose();exit 49}
 try{
 %s
 }finally{$mtx.ReleaseMutex();$mtx.Dispose()}
-exit $rc`, psq(winLockMutexName(path)), body)
+exit $rc`, psq(winLockMutexName(path)), waitMS, body)
 }
 
 // shDirLockPrologue opens the lock's PARENT DIRECTORY (a stable inode that, unlike
-// the lock file, is never unlinked) on fd 9 and takes a blocking flock on it,
+// the lock file, is never unlinked) on fd 9 and takes a bounded flock on it,
 // giving a path-keyed cross-process mutex that serializes create/delete/replace
 // exactly like the Windows named mutex. flock on the lock FILE itself would be
 // useless: a delete unlinks that inode, so a newcomer's freshly-created lock is a
 // DIFFERENT inode whose flock the taker never held, which is precisely how the
-// dual-ownership race arose (evaluator iter-20 item 1). `dirExpr` is a shell
-// expression evaluating to the directory (a literal for create, `$(dirname …)`
-// for delete/replace). On failure to open/flock, callers exit 71/49.
-func shDirLockPrologue(dirExpr, path string) string {
+// dual-ownership race arose (evaluator iter-20 item 1). `waitMS` bounds the flock
+// wait (fractional seconds) so acquisition stays within the <5s contract
+// (evaluator iter-21 item 1); a timeout exits 49 (transient), which the caller
+// retries. `dirExpr` is a shell expression evaluating to the directory (a literal
+// for create, `$(dirname …)` for delete/replace). On failure to open, callers
+// exit 71/48.
+func shDirLockPrologue(dirExpr, path string, waitMS int) string {
 	return fmt.Sprintf(`exec 9<%s 2>/dev/null || { [ -e '%s' ] && exit 71 || exit 48; }
-flock -w 20 9 || exit 49`, dirExpr, path)
+flock -w %.3f 9 || exit 49`, dirExpr, path, float64(waitMS)/1000.0)
 }
 
 // casDelete performs an atomic compare-and-delete on a HELD `.lock`: under the
@@ -485,7 +533,7 @@ else{
 $cur=[Convert]::ToBase64String([IO.File]::ReadAllBytes(%s))
 if($cur -eq %s){ try{ [IO.File]::Delete(%s); $rc=0 }catch{ $rc=17 } } else { $rc=10 }
 }`, psq(path), psq(path), psq(expectB64), psq(path))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, body), TimeoutSec: 30})
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, lockGateWaitMS, body), TimeoutSec: 30})
 	} else {
 		script := fmt.Sprintf(`command -v flock >/dev/null 2>&1 || exit 70
 %s
@@ -493,7 +541,7 @@ if($cur -eq %s){ try{ [IO.File]::Delete(%s); $rc=0 }catch{ $rc=17 } } else { $rc
 cur=$(base64 < '%s' | tr -d '\n')
 if [ "$cur" != '%s' ]; then exit 10; fi
 rm -f '%s' || exit 17
-exit 0`, shDirLockPrologue(`"$(dirname '`+path+`')"`, path), path, path, expectB64, path)
+exit 0`, shDirLockPrologue(`"$(dirname '`+path+`')"`, path, lockGateWaitMS), path, path, expectB64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
 	}
 	if err != nil {
@@ -529,7 +577,7 @@ exit 0`, shDirLockPrologue(`"$(dirname '`+path+`')"`, path), path, path, expectB
 // a holder crashes mid-section the mutex is abandoned (WaitOne throws
 // AbandonedMutexException) and the next acquirer proceeds — the crash-safe atomic
 // swap guarantees the file it observes is never partial.
-func casReplace(ctx context.Context, t transport.Transport, path, expect, newContent string) (casOutcome, error) {
+func casReplace(ctx context.Context, t transport.Transport, path, expect, newContent string, waitMS int) (casOutcome, error) {
 	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
 	newB64 := base64.StdEncoding.EncodeToString([]byte(newContent))
 	var r transport.Result
@@ -545,7 +593,7 @@ try{$nb=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$nb); [IO
 catch{Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $rc=17}
 }
 }`, psq(path), psq(path), psq(expectB64), psq(path), psq(newB64), psq(path))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, body), TimeoutSec: 30})
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, waitMS, body), TimeoutSec: 30})
 	} else {
 		script := fmt.Sprintf(`command -v flock >/dev/null 2>&1 || exit 70
 %s
@@ -555,7 +603,7 @@ if [ "$cur" != '%s' ]; then exit 10; fi
 tmp='%s.mx.'$$
 printf '%%s' '%s' | base64 -d > "$tmp" || { rm -f "$tmp"; exit 17; }
 mv -f "$tmp" '%s' || { rm -f "$tmp"; exit 17; }
-exit 0`, shDirLockPrologue(`"$(dirname '`+path+`')"`, path), path, path, expectB64, path, newB64, path)
+exit 0`, shDirLockPrologue(`"$(dirname '`+path+`')"`, path, waitMS), path, path, expectB64, path, newB64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
 	}
 	if err != nil {
@@ -570,8 +618,8 @@ func staleWarnMsg(existing lockInfo, host string) string {
 }
 
 // createLockExclusive runs the atomic create-new on the canonical lock path.
-func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Paths, content string) (bool, int, error) {
-	return createExclusiveAt(ctx, t, p.Root, p.Lock, content)
+func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Paths, content string, waitMS int) (bool, int, error) {
+	return createExclusiveAt(ctx, t, p.Root, p.Lock, content, waitMS)
 }
 
 // createExclusiveAt publishes a fully-formed lock file ATOMICALLY, with
@@ -605,7 +653,7 @@ func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Pa
 // parent-directory flock) that create, delete, AND replace all take, so a create
 // can never publish a fresh lock into a slot a concurrent stale-takeover replace is
 // mid-swapping — closing the dual-ownership race (evaluator iter-20 item 1).
-func createExclusiveAt(ctx context.Context, t transport.Transport, root, path, content string) (bool, int, error) {
+func createExclusiveAt(ctx context.Context, t transport.Transport, root, path, content string, waitMS int) (bool, int, error) {
 	b64 := base64.StdEncoding.EncodeToString([]byte(content))
 	var r transport.Result
 	var err error
@@ -618,9 +666,9 @@ try { $b=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$b); [IO
 catch [System.IO.IOException] { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $h=$_.Exception.HResult -band 0xFFFF; if ($h -eq 80 -or $h -eq 183) { $rc=48 } else { $rc=71 } }
 catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $rc=71 }
 }`, psq(root), psq(path), psq(path), psq(b64), psq(path))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, body), TimeoutSec: 60})
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: winMutexGuard(path, waitMS, body), TimeoutSec: 60})
 	} else {
-		script := fmt.Sprintf(`mkdir -p '%s'
+		script := fmt.Sprintf(`mkdir -p '%s' || exit 71
 command -v flock >/dev/null 2>&1 || exit 70
 %s
 if [ -e '%s' ]; then exit 48; fi
@@ -633,7 +681,7 @@ case "$lnerr" in
   *[Ee]xists*) exit 48 ;;
   *) exit 71 ;;
 esac`,
-			root, shDirLockPrologue(fmt.Sprintf("'%s'", root), path), path, path, b64, path)
+			root, shDirLockPrologue(fmt.Sprintf("'%s'", root), path, waitMS), path, path, b64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {
