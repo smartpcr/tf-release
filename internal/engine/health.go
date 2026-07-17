@@ -90,7 +90,7 @@ try { $c.Connect('localhost', %d); if($c.Connected){exit 0} exit 1 } catch { exi
 		}
 	case "exec":
 		shell := transport.ShellSh
-		script := fmt.Sprintf(`cd '%s' && %s`, workDir, hc.Exec.Command)
+		script := fmt.Sprintf(`cd %s && %s`, shq(workDir), hc.Exec.Command)
 		if t.OS() == spec.OSWindows {
 			shell = transport.ShellPowerShell
 			script = fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(workDir), hc.Exec.Command)

@@ -59,7 +59,7 @@ func runnerCommand(t *spec.TestRun) string {
 // RunTest = fetch+extract test package on target, execute runner, collect
 // results+logs to runner destination_dir, parse, evaluate pass criteria.
 // Collection ALWAYS runs before pass evaluation (E2E-05: collect-then-fail).
-func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, error) {
+func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOutcome, err error) {
 	host := strings.ToLower(tr.Target.Hosts[0])
 	t, err := e.NewTransport(&tr.Target, host)
 	if err != nil {
@@ -80,21 +80,57 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 	if err := ensureLayout(ctx, t, p); err != nil {
 		return nil, coded("ERR_CONNECT", host, "STAGE", err)
 	}
-	cached, err := e.releaseCached(ctx, t, p, tr.Artifact.Checksum)
-	if err != nil {
+	// STAGING WIPE (start): whole-directory wipe on EVERY run, cached or not
+	// (DESIGN §9.1 "wiped at start & end of every op").
+	if err := e.wipeStaging(ctx, t, p); err != nil {
 		return nil, coded("ERR_CONNECT", host, "STAGE", err)
 	}
+	// STAGING WIPE (end): declared FIRST so it runs LAST (LIFO), after the
+	// incomplete-release cleanup below. Surface a cleanup failure as the op error
+	// when the run otherwise succeeded; warn (preserving root cause) otherwise.
+	defer func() {
+		if werr := e.wipeStaging(ctx, t, p); werr != nil {
+			if err == nil {
+				err = coded("ERR_CONNECT", host, "STAGE", fmt.Errorf("staging cleanup: %w", werr))
+				outcome = nil
+			} else {
+				e.warnf("staging cleanup failed on %s after prior error: %v", host, werr)
+			}
+		}
+	}()
+	// INCOMPLETE-RELEASE CLEANUP: declared SECOND so it runs FIRST, while `err`
+	// still holds the genuine run result. Only a release THIS run created is
+	// removed, and only on a pre-execution failure (DESIGN §10.2). Cleanup
+	// failures are joined onto the op error.
+	createdRelease := false
+	defer func() {
+		if err != nil && createdRelease {
+			err = e.cleanupIncompleteRelease(ctx, t, p, host, err)
+		}
+	}()
+	cached, cerr := e.releaseCached(ctx, t, p, tr.Artifact.Version, tr.Artifact.Checksum)
+	if cerr != nil {
+		return nil, coded("ERR_CONNECT", host, "STAGE", cerr)
+	}
 	if !cached {
-		if err := e.fetchToStaging(ctx, t, dep, p); err != nil {
-			return nil, err
+		if ferr := e.fetchToStaging(ctx, t, dep, p); ferr != nil {
+			return nil, ferr // fetch writes only to staging; release tree untouched
 		}
-		if err := e.extract(ctx, t, p); err != nil {
-			return nil, err
+		// extract creates the release dir — from here it is "ours".
+		createdRelease = true
+		if xerr := e.extract(ctx, t, p); xerr != nil {
+			return nil, xerr
 		}
-		if err := e.writeReleaseMarker(ctx, t, p, dep); err != nil {
-			return nil, coded("ERR_CONNECT", host, "STAGE", err)
+		if merr := e.writeReleaseMarker(ctx, t, p, dep); merr != nil {
+			return nil, coded("ERR_CONNECT", host, "STAGE", merr)
 		}
 	}
+	// Staging is complete: the release is now fully extracted and marked. Clear
+	// the cleanup guard so a LATER failure (test execution, result collection, or
+	// result parsing) does NOT delete a good release or its collected `_results`
+	// — the incomplete-release cleanup is strictly a pre-execution/staging-only
+	// failure remedy (DESIGN §10.2).
+	createdRelease = false
 
 	env := layout.MergeEnv(layout.BuiltinEnv(tr.Metadata.Name, tr.Artifact.Version, p, 0), tr.Runner.Env)
 	cmdline := runnerCommand(tr)
@@ -115,7 +151,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 		script := fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(workDir), cmdline)
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, Env: env, TimeoutSec: timeout})
 	} else {
-		script := fmt.Sprintf("cd '%s' && %s", workDir, cmdline)
+		script := fmt.Sprintf("cd %s && %s", shq(workDir), cmdline)
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, Env: env, TimeoutSec: timeout})
 	}
 	duration := int(time.Since(startedAt).Seconds())
