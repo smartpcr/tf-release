@@ -233,8 +233,17 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 	p layout.Paths, pat pattern.Pattern, prev, prevChecksum string, started time.Time, orig error) error {
 	host := t.Host()
 	if !s.Strategy.EffectiveRollback() {
-		e.finalizeFailed(ctx, t, s, p, prev, started, "failed")
-		return fmt.Errorf("%w; rollback_on_failure=false — target left as-is for inspection", orig)
+		// §10.2 last row: record last_operation=failed so Read reports drift. A
+		// failed-manifest write error must not be swallowed — it is folded into the
+		// surfaced error so the caller learns the failed state was not persisted
+		// (evaluator item 4).
+		ferr := e.finalizeFailed(ctx, t, s, p, prev, started, "failed")
+		out := fmt.Errorf("%w; rollback_on_failure=false — target left as-is for inspection", orig)
+		if ferr != nil {
+			return coded("ERR_CONNECT", host, "FINALIZE",
+				fmt.Errorf("%v; failed-manifest write error: %v", out, ferr))
+		}
+		return out
 	}
 	rbStart := time.Now()
 	if prev == "" {

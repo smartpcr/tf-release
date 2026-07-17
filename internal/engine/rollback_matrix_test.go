@@ -172,6 +172,7 @@ func TestRollbackMatrixUpdate(t *testing.T) {
 		}
 	}
 	rows := []matrixRow{
+		{name: "validate", newTransErr: true, check: prevIntact},
 		{name: "connect", inject: func(f *fakeHost) { f.fail["connect"] = true }, check: prevIntact},
 		{name: "preflight", inject: func(f *fakeHost) { f.fail["preflight"] = true }, check: prevIntact},
 		{name: "lock", inject: func(f *fakeHost) { f.fail["lock"] = true }, check: prevIntact},
@@ -206,7 +207,16 @@ func TestRollbackMatrixUpdate(t *testing.T) {
 			d2.Artifact.Version = "2.0.0"
 			sum := sha256.Sum256([]byte("v2-" + r.name))
 			d2.Artifact.Checksum = "sha256:" + hex.EncodeToString(sum[:])
-			r.inject(f)
+			if r.inject != nil {
+				r.inject(f)
+			}
+			if r.newTransErr {
+				// VALIDATE row: fail NewTransport on the UPDATE only (after v1 is
+				// already deployed) so the prior version stays intact.
+				eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+					return nil, fmt.Errorf("simulated NewTransport (VALIDATE) failure")
+				}
+			}
 			f.log = nil
 			_, err := eng.Deploy(context.Background(), d2)
 			r.check(t, f, err)

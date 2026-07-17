@@ -228,8 +228,7 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 	if err := slCoord.timed(ctx, "CONFIGURE", func() error {
 		return cc.cg.CreateRole(ctx, cc.coord(), s.Pattern.ServiceName, s.Pattern.RoleName, s.Pattern.StaticAddress)
 	}); err != nil {
-		e.clusterFinalize(ctx, cc, "", started, "failed")
-		return nil, err
+		return nil, foldFinalize(err, e.clusterFinalize(ctx, cc, "", started, "failed"))
 	}
 	// C3: preferred owners (ownership config = CONFIGURE step, DESIGN §8.5).
 	if s.Pattern.PreferredOwner != "" {
@@ -237,29 +236,34 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 		if err := slCoord.timed(ctx, "CONFIGURE", func() error {
 			return cc.cg.SetPreferredOwners(ctx, cc.coord(), s.Pattern.RoleName, ordered)
 		}); err != nil {
-			e.clusterFinalize(ctx, cc, "", started, "failed")
-			return nil, err
+			return nil, foldFinalize(err, e.clusterFinalize(ctx, cc, "", started, "failed"))
 		}
 	}
 	// C4: bring online.
 	if err := slCoord.timed(ctx, "START", func() error {
 		return cc.cg.StartGroup(ctx, cc.coord(), s.Pattern.RoleName, 120)
 	}); err != nil {
-		e.clusterFinalize(ctx, cc, "", started, "failed")
-		return nil, err
+		return nil, foldFinalize(err, e.clusterFinalize(ctx, cc, "", started, "failed"))
 	}
 	// C5: settle + health on the owner node. HEALTH is attributed to the ACTUAL
 	// owner host (may differ from the coordinator) so the record's host matches
-	// where the check ran (evaluator item 3).
+	// where the check ran (evaluator item 3). A failure to resolve the owner is
+	// itself surfaced rather than defaulting to the coordinator (item 2).
 	time.Sleep(time.Duration(s.Strategy.Cluster.EffectiveSettle()) * time.Second)
-	ownerHost := e.clusterOwnerHost(ctx, cc)
+	ownerHost, ownerErr := e.clusterOwnerHost(ctx, cc)
+	if ownerErr != nil {
+		return nil, foldFinalize(ownerErr, e.clusterFinalize(ctx, cc, "", started, "failed"))
+	}
 	if err := newStepLogger(s, ownerHost).timed(ctx, "HEALTH", func() error { return e.clusterHealthOn(ctx, cc, ownerHost) }); err != nil {
 		_ = cc.cg.StopGroup(ctx, cc.coord(), s.Pattern.RoleName)
-		e.clusterFinalize(ctx, cc, "", started, "failed")
-		return nil, fmt.Errorf("%w; role stopped after failed create (CLU-01 failure path)", err)
+		ferr := e.clusterFinalize(ctx, cc, "", started, "failed")
+		return nil, foldFinalize(fmt.Errorf("%w; role stopped after failed create (CLU-01 failure path)", err), ferr)
 	}
-	// C6: manifests + prune.
-	e.clusterFinalize(ctx, cc, "", started, "success")
+	// C6: manifests + prune. A finalize (manifest-write) failure means the deploy
+	// is not durably recorded, so fail closed instead of returning success (item 1).
+	if ferr := e.clusterFinalize(ctx, cc, "", started, "success"); ferr != nil {
+		return nil, coded("ERR_CONNECT", cc.hosts[0], "FINALIZE", ferr)
+	}
 	st, _ := cc.cg.Status(ctx, cc.coord(), releaseCtx(s, cc.paths(cc.hosts[0], s.Artifact.Version)))
 	m, _ := ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
 	out := statusFrom(m, "", st)
@@ -363,8 +367,12 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 			e.warnf("set preferred owners failed: %v", err)
 		}
 	}
-	// U8: finalize.
-	e.clusterFinalize(ctx, cc, prevVersion, started, "success")
+	// U8: finalize. A finalize (manifest-write) failure means the successful
+	// update was not durably recorded, so fail closed instead of reporting
+	// success (item 1).
+	if ferr := e.clusterFinalize(ctx, cc, prevVersion, started, "success"); ferr != nil {
+		return nil, coded("ERR_CONNECT", cc.hosts[0], "FINALIZE", ferr)
+	}
 	st, _ := cc.cg.Status(ctx, cc.coord(), releaseCtx(s, cc.paths(cc.hosts[0], s.Artifact.Version)))
 	m, _ := ReadManifest(ctx, cc.coord(), cc.paths(cc.hosts[0], s.Artifact.Version))
 	out := statusFrom(m, "", st)
@@ -378,12 +386,12 @@ func (e *Engine) clusterRollback(ctx context.Context, cc *clusterCtx, oldOwner s
 	passives []string, prevVersion string, started time.Time, orig error) error {
 	s := cc.s
 	if !s.Strategy.EffectiveRollback() {
-		e.clusterFinalize(ctx, cc, prevVersion, started, "failed")
-		return fmt.Errorf("%w; rollback_on_failure=false — cluster left as-is", orig)
+		ferr := e.clusterFinalize(ctx, cc, prevVersion, started, "failed")
+		return foldFinalize(fmt.Errorf("%w; rollback_on_failure=false — cluster left as-is", orig), ferr)
 	}
 	if prevVersion == "" {
-		e.clusterFinalize(ctx, cc, prevVersion, started, "failed")
-		return fmt.Errorf("%w; no previous version recorded — cannot roll back", orig)
+		ferr := e.clusterFinalize(ctx, cc, prevVersion, started, "failed")
+		return foldFinalize(fmt.Errorf("%w; no previous version recorded — cannot roll back", orig), ferr)
 	}
 	tflog.Warn(ctx, "cluster deploy failed; rolling back", map[string]interface{}{
 		"role": s.Pattern.RoleName, "to": prevVersion, "cause": orig.Error()})
@@ -481,20 +489,37 @@ func (e *Engine) collectClusterLogs(ctx context.Context, cc *clusterCtx, started
 	}
 }
 
-// clusterOwnerHost resolves the host currently owning the role via the
-// coordinator RoleBinding read, falling back to the coordinator when the owner
-// cannot be determined. Used to attribute owner-scoped step records to the host
-// that actually runs them (evaluator item 3).
-func (e *Engine) clusterOwnerHost(ctx context.Context, cc *clusterCtx) string {
-	_, _, owner, _, err := cc.cg.RoleBinding(ctx, cc.coord(), cc.s.Pattern.RoleName)
-	if err != nil {
-		return cc.hosts[0]
+// clusterOwnerHost resolves the host currently owning the role via a logged
+// coordinator RoleBinding read (DESIGN §8.5 requires every remote step to be
+// logged). It returns an error when the lookup fails or the reported owner is
+// not among the spec hosts, rather than silently defaulting to the coordinator
+// and running HEALTH against the wrong node (evaluator items 2 + 3).
+func (e *Engine) clusterOwnerHost(ctx context.Context, cc *clusterCtx) (string, error) {
+	var owner string
+	if err := newStepLogger(cc.s, cc.hosts[0]).timed(ctx, "VALIDATE", func() error {
+		var berr error
+		_, _, owner, _, berr = cc.cg.RoleBinding(ctx, cc.coord(), cc.s.Pattern.RoleName)
+		return berr
+	}); err != nil {
+		return "", coded("ERR_PREFLIGHT", cc.hosts[0], "VALIDATE",
+			fmt.Errorf("resolve role owner: %w", err))
 	}
 	h := matchHost(cc.hosts, strings.ToLower(owner))
 	if h == "" {
-		return cc.hosts[0]
+		return "", coded("ERR_PREFLIGHT", cc.hosts[0], "VALIDATE",
+			fmt.Errorf("role owner %q not among spec hosts %v", owner, cc.hosts))
 	}
-	return h
+	return h, nil
+}
+
+// foldFinalize combines the primary operation error with a failed-manifest
+// (§10.6) persistence error, if any, so a swallowed WriteManifest failure never
+// lets a failure path claim the failed state was durably recorded.
+func foldFinalize(primary, finalizeErr error) error {
+	if finalizeErr == nil {
+		return primary
+	}
+	return fmt.Errorf("%w; failed-manifest write error: %v", primary, finalizeErr)
 }
 
 func (e *Engine) clusterHealthOn(ctx context.Context, cc *clusterCtx, host string) error {

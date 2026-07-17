@@ -118,23 +118,31 @@ func TestStepLogFreshSingleHostOrder(t *testing.T) {
 	steps := captureSteps(t, &buf)
 	names := stepNames(steps)
 
-	// Fresh single-host deploy executes every fixed step exactly once. The
-	// staging steps follow the pinned fixed-step order (implementation-plan.md:224
-	// / DESIGN §8.5): FETCH → CHECKSUM → STAGE → EXTRACT → RENDER. The switchover
-	// steps follow the normative state-machine execution order
-	// (STOP → SWITCH → CONFIGURE → START, DESIGN §9.2).
+	// Fresh single-host deploy executes every fixed step EXACTLY once, in this
+	// exact emitted order. The staging steps follow the pinned fixed-step order
+	// (implementation-plan.md:224 / DESIGN §8.5): FETCH → CHECKSUM → STAGE →
+	// EXTRACT → RENDER. The switchover steps follow the normative state-machine
+	// execution order (STOP → SWITCH → CONFIGURE → START, DESIGN §9.2 — see the
+	// open question re: §8.5's CONFIGURE-before-STOP name-list order).
 	want := []string{
 		"VALIDATE", "CONNECT", "PREFLIGHT", "LOCK",
 		"FETCH", "CHECKSUM", "STAGE", "EXTRACT", "RENDER",
 		"STOP", "SWITCH", "CONFIGURE", "START", "HEALTH",
 		"FINALIZE", "PRUNE", "UNLOCK",
 	}
-	assertSubsequence(t, names, want)
-
-	// Every fixed step must be present.
+	// Exact sequence: no extra, missing, reordered, or duplicated steps.
+	if len(names) != len(want) {
+		t.Fatalf("expected exactly %d step records, got %d\n want=%v\n got =%v", len(want), len(names), want, names)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("step order mismatch at index %d: want %q got %q\n want=%v\n got =%v", i, want[i], names[i], want, names)
+		}
+	}
+	// Every fixed step occurs EXACTLY once (no duplicates).
 	for _, w := range want {
-		if countStep(steps, w) == 0 {
-			t.Fatalf("fixed step %q was never logged; got=%v", w, names)
+		if c := countStep(steps, w); c != 1 {
+			t.Fatalf("fixed step %q must be logged exactly once, got %d; names=%v", w, c, names)
 		}
 	}
 
