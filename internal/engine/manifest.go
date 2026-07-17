@@ -220,38 +220,50 @@ func newToken() string {
 // There is no file-system compare-and-swap keyed on content, so "verify then act
 // on a pathname" is fundamentally unfixable.
 //
-// This design removes the gate. Every mutation of a HELD `.lock` (stale takeover
-// and ownership-safe release) runs as a SINGLE remote command that holds an
-// EXCLUSIVE OS file handle for the command's entire lifetime and performs the
-// compare-and-swap / compare-and-delete atomically before releasing the handle.
-// The handle is a true process-lifetime primitive: the OS drops it when the
-// command process exits — normally OR on crash/kill — so nothing can be stranded
-// and no separate recovery path (with its unavoidable TOCTOU) is ever needed.
-// Windows uses `[IO.File]::Open(..., FileShare.None/Delete)`; POSIX uses
-// `flock -n` on the lock fd. Concurrent mutators serialize on that handle, so
-// exactly one compare-and-swap can win — the canonical `.lock` is never emptied
-// mid-takeover and two operations can never both believe they own it.
+// This design removes the gate. Ownership-safe release runs as a SINGLE remote
+// command that holds an EXCLUSIVE OS file handle for the command's entire
+// lifetime and performs a compare-and-delete atomically before releasing the
+// handle. Stale takeover never mutates `.lock` in place: it is an atomic
+// compare-and-delete of the exact stale bytes followed by a fresh atomic create
+// (temp + publish), so an interruption leaves the slot intact-stale or absent,
+// never mixed/partial. The handle is a true process-lifetime primitive: the OS
+// drops it when the command process exits — normally OR on crash/kill — so
+// nothing can be stranded and no separate recovery path (with its unavoidable
+// TOCTOU) is ever needed. Windows uses `[IO.File]::Open(..., FileShare.Delete)`
+// for delete and an atomic `Move` for create; POSIX uses `flock -n` on the lock
+// fd for delete and an atomic hard-link `ln` for create. Concurrent mutators
+// serialize on the handle / atomic publish, so exactly one can win — the
+// canonical `.lock` is never emptied mid-takeover and two operations can never
+// both believe they own it.
 
 // AcquireLock takes the target lock with atomic create-new semantics
-// (DESIGN §13). exit 48 ⇒ held. A held lock is inspected: unparseable metadata
-// or age < timeout ⇒ ERR_LOCKED (fail fast, no wait); a PROVEN stale lock
-// (age >= timeout) is taken over with a SINGLE atomic compare-and-swap that
-// overwrites `.lock` in place only while it still holds the exact stale bytes we
-// judged, so the canonical path is NEVER momentarily absent and two operations
-// can never both believe they hold it. On success it returns a *Lock handle for
+// (DESIGN §13). exit 48 ⇒ held. A held lock is inspected: unparseable/empty
+// metadata or age < timeout ⇒ ERR_LOCKED (fail fast, no wait); a PROVEN stale
+// lock (age >= timeout) is taken over WITHOUT any in-place mutation — it is
+// removed with a single atomic compare-and-DELETE keyed to the exact stale bytes
+// we judged, and the freed slot is then re-created with a fresh atomic create.
+// Each step is individually atomic and crash-safe, so the canonical path is only
+// ever the intact stale lock, absent, or our fresh lock — never mixed/partial and
+// never a stealable empty file. On success it returns a *Lock handle for
 // ownership-safe release.
 //
-// The loop retries ONLY the transient, non-contention states — the holder
-// released between our create and our read (lock vanished) or another contender
-// won the compare-and-swap for the SAME stale bytes (our CAS reported a mismatch)
+// The loop retries ONLY transient states — the holder released between our create
+// and our read (lock vanished), a proven-stale lock we just deleted (re-create on
+// the next turn), or a compare-and-delete that reported live contention/mismatch
 // — and re-evaluates from scratch. A genuinely LIVE held lock is judged not-stale
 // on the very first pass and returns ERR_LOCKED immediately: no spinning, a
 // handful of commands at most (DESIGN §13 "<5s, no wait").
 func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, owner, op string, timeoutSec int) (lk *Lock, staleWarn string, err error) {
-	// Small bound: each retry either wins the create-new, wins the CAS, or reads a
-	// now-FRESH lock and returns ERR_LOCKED. Only a repeatedly-vanishing/-contended
-	// slot spins, which cannot progress, so a tiny cap keeps us well under 5s.
+	// Small bound: each retry either wins the create-new, deletes a proven-stale
+	// lock (then re-creates), or reads a now-FRESH lock and returns ERR_LOCKED.
+	// Only a repeatedly-vanishing/-contended slot spins, which cannot progress, so
+	// a tiny cap keeps us well under 5s.
 	const maxAttempts = 8
+	// pendingWarn carries the stale-takeover WARN across the delete→recreate turn:
+	// the compare-and-delete happens on one iteration and the atomic re-create that
+	// finally installs our lock happens on the next, so the WARN must survive the
+	// loop boundary to be returned with the handle.
+	var pendingWarn string
 	for attempt := 0; ; attempt++ {
 		token := newToken()
 		li, _ := json.Marshal(lockInfo{
@@ -264,19 +276,20 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr)
 		}
 		if created {
-			return &Lock{t: t, paths: p, content: content, token: token}, "", nil
+			return &Lock{t: t, paths: p, content: content, token: token}, pendingWarn, nil
 		}
 		if exit != 48 {
 			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock create failed (exit %d)", exit))
 		}
 
 		// Held: inspect age. A lock may be overridden ONLY when its metadata
-		// parses AND its proven age is >= timeout. Unparseable JSON or an invalid
-		// started_utc is NOT proof of staleness, so we refuse (ERR_LOCKED) rather
-		// than clobber a lock that may still be live (DESIGN §13). The ONE
-		// exception is an EMPTY/whitespace-only file: that is unambiguous residue
-		// from a writer killed mid-create/replace (crash residue, no live holder),
-		// which we recover via a content-keyed compare-and-swap (evaluator item 3).
+		// parses AND its proven age is >= timeout. Unparseable JSON, an invalid
+		// started_utc, OR an empty/whitespace-only file is NOT proof of staleness,
+		// so we refuse (ERR_LOCKED) rather than clobber a lock that may still be
+		// live (DESIGN §13). Because create and takeover are BOTH atomic (temp +
+		// publish / compare-and-delete), a `.lock` is never observed empty or
+		// partial, so there is no "crash residue" to recover — treating an empty
+		// file as recoverable is exactly what previously allowed dual ownership.
 		raw, ok, rerr := readSmallFile(ctx, t, p.Lock)
 		if rerr != nil {
 			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock held (unreadable): %v", rerr))
@@ -290,84 +303,66 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock contended (repeatedly vanished)"))
 		}
 
-		emptyResidue := strings.TrimSpace(raw) == ""
-		if !emptyResidue {
-			var existing lockInfo
-			if uerr := json.Unmarshal([]byte(raw), &existing); uerr != nil {
-				return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-					fmt.Errorf("lock held with unparseable metadata (refusing to override): %v", uerr))
-			}
-			started, perr := time.Parse(time.RFC3339, existing.StartedUTC)
-			if perr != nil {
-				return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-					fmt.Errorf("lock held by %s with unparseable started_utc %q (refusing to override): %v",
-						existing.Owner, existing.StartedUTC, perr))
-			}
-			if time.Since(started) < time.Duration(timeoutSec)*time.Second {
-				return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-					fmt.Errorf("held by %s since %s (op=%s)", existing.Owner, existing.StartedUTC, existing.Op))
-			}
-
-			// Proven stale (age >= timeout): take it over with a SINGLE atomic
-			// compare-and-swap. casSwap holds an exclusive OS handle for the whole
-			// command and overwrites `.lock` in place ONLY while it still holds the
-			// exact stale bytes we just read.
-			outcome, serr := casSwap(ctx, t, p.Lock, raw, content)
-			if serr != nil {
-				return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", serr)
-			}
-			switch outcome {
-			case casDone:
-				return &Lock{t: t, paths: p, content: content, token: token},
-					staleWarnMsg(existing, t.Host()), nil
-			case casContended:
-				// A peer holds the exclusive handle right now (transient). Back off
-				// and re-evaluate rather than misreporting it as a mismatch/absence.
-				if attempt < maxAttempts {
-					casBackoff(ctx, attempt)
-					continue
-				}
-				return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-					fmt.Errorf("stale lock from %s: takeover repeatedly contended", existing.Owner))
-			default: // casMismatch / casAbsent: slot changed under us — re-evaluate.
-				if attempt < maxAttempts {
-					continue
-				}
-				return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-					fmt.Errorf("stale lock from %s: takeover repeatedly contended", existing.Owner))
-			}
+		var existing lockInfo
+		if uerr := json.Unmarshal([]byte(raw), &existing); uerr != nil {
+			// Covers EMPTY/whitespace too (json.Unmarshal fails on ""). Refuse.
+			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+				fmt.Errorf("lock held with unparseable metadata (refusing to override): %v", uerr))
+		}
+		started, perr := time.Parse(time.RFC3339, existing.StartedUTC)
+		if perr != nil {
+			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+				fmt.Errorf("lock held by %s with unparseable started_utc %q (refusing to override): %v",
+					existing.Owner, existing.StartedUTC, perr))
+		}
+		if time.Since(started) < time.Duration(timeoutSec)*time.Second {
+			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+				fmt.Errorf("held by %s since %s (op=%s)", existing.Owner, existing.StartedUTC, existing.Op))
 		}
 
-		// Empty crash residue: recover it via a content-keyed compare-and-swap that
-		// only overwrites while the file is STILL empty (expect == raw). If a real
-		// writer fills it in the gap, our CAS reports a mismatch and we re-evaluate.
-		outcome, serr := casSwap(ctx, t, p.Lock, raw, content)
+		// Proven stale (age >= timeout): take it over WITHOUT mutating in place.
+		// Atomically compare-and-DELETE the exact stale bytes, then loop back to
+		// re-create the slot with a fresh atomic create. An interruption between
+		// the two steps leaves the slot either the intact stale lock (delete
+		// killed) or simply absent (delete done, re-create pending) — never a
+		// mixed/partial file that could permanently wedge acquisition.
+		outcome, serr := casDelete(ctx, t, p.Lock, raw)
 		if serr != nil {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", serr)
 		}
 		switch outcome {
 		case casDone:
-			return &Lock{t: t, paths: p, content: content, token: token},
-				fmt.Sprintf("recovered empty/partial lock (crash residue) on host %s", t.Host()), nil
+			// The stale lock is gone; the next iteration re-creates the slot.
+			// Whoever wins that atomic create owns it — if a third party beats
+			// us, our create returns 48, we read the now-FRESH lock and correctly
+			// report ERR_LOCKED. Carry the WARN for the handle we may install.
+			pendingWarn = staleWarnMsg(existing, t.Host())
+			if attempt < maxAttempts {
+				continue
+			}
+			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+				fmt.Errorf("stale lock from %s: takeover repeatedly contended", existing.Owner))
 		case casContended:
+			// A peer holds the exclusive handle right now (transient). Back off
+			// and re-evaluate rather than misreporting it as a mismatch/absence.
 			if attempt < maxAttempts {
 				casBackoff(ctx, attempt)
 				continue
 			}
 			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-				fmt.Errorf("empty lock residue: recovery repeatedly contended"))
-		default: // mismatch/absent: a real writer filled or removed it — re-evaluate.
+				fmt.Errorf("stale lock from %s: takeover repeatedly contended", existing.Owner))
+		default: // casMismatch / casAbsent: a peer already took over or removed it.
 			if attempt < maxAttempts {
 				continue
 			}
 			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-				fmt.Errorf("empty lock residue: recovery repeatedly contended"))
+				fmt.Errorf("stale lock from %s: takeover repeatedly contended", existing.Owner))
 		}
 	}
 }
 
 // casBackoff sleeps a short, attempt-scaled interval before retrying a CONTENDED
-// compare-and-swap/-delete, honoring context cancellation. Contention means a peer
+// compare-and-delete, honoring context cancellation. Contention means a peer
 // briefly holds the exclusive handle; a few-ms wait lets it finish without a spin.
 func casBackoff(ctx context.Context, attempt int) {
 	d := time.Duration(attempt+1) * 5 * time.Millisecond
@@ -377,7 +372,7 @@ func casBackoff(ctx context.Context, attempt int) {
 	}
 }
 
-// casOutcome is the distinguished result of a compare-and-swap / -delete. The
+// casOutcome is the distinguished result of a compare-and-delete. The
 // point (evaluator item 1) is that a HELD-lock mutation must NOT collapse every
 // failure into "absent". Absence, live contention on the exclusive handle, and a
 // content mismatch are three DIFFERENT conditions with different correct
@@ -391,15 +386,14 @@ const (
 	casContended                   // exit 49: a peer holds the exclusive handle NOW (transient, retry)
 )
 
-// Shared CAS exit codes for casSwap/casDelete (both platforms). Anything NOT in
+// Shared CAS exit codes for casDelete (both platforms). Anything NOT in
 // {0,10,48,49} is an operational failure (permission denied, missing `flock`,
-// read/write/rename fault) and is mapped to a Go error by classifyCas — never
+// read/remove fault) and is mapped to a Go error by classifyCas — never
 // silently treated as absence or contention.
 //
 //	 0  done            10  content mismatch   48  absent
 //	49  exclusion held  17  removal failed     70  flock missing
-//	71  open failed     72  read failed        73  temp write failed
-//	74  rename failed    99  unexpected
+//	71  open failed     99  unexpected
 //
 // classifyCas turns a transport Result into a (casOutcome, error). The err path
 // returns casDone (the zero value) as a dummy — callers MUST check err != nil
@@ -419,62 +413,11 @@ func classifyCas(op, path string, r transport.Result) (casOutcome, error) {
 	}
 }
 
-// casSwap performs an atomic, crash-safe compare-and-swap on a HELD `.lock`: in a
-// SINGLE remote command it takes an EXCLUSIVE OS handle and, only if the current
-// bytes equal `expect`, replaces them with `content` before releasing the handle.
-// Concurrent takeovers serialize on the handle so exactly one can win. Two
-// evaluator-driven properties:
-//   - Distinct outcomes (item 1): absence (48), live handle contention (49), and
-//     content mismatch (10) are separate; permission/`flock`/IO faults become a
-//     Go error rather than a misreported "absent".
-//   - Crash-safe replacement (item 3): POSIX writes a private `$tmp` then `mv -f`
-//     (rename(2) is atomic — a killed writer leaves the OLD `.lock` intact, never
-//     an empty/partial one). Windows writes the full buffer at position 0 and
-//     only THEN truncates to the new length, so an interrupted write can never
-//     shorten the file to a partial prefix.
-func casSwap(ctx context.Context, t transport.Transport, path, expect, content string) (casOutcome, error) {
-	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
-	newB64 := base64.StdEncoding.EncodeToString([]byte(content))
-	var r transport.Result
-	var err error
-	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`try{$fs=[IO.File]::Open(%s,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}
-catch [System.IO.FileNotFoundException]{exit 48}
-catch [System.IO.DirectoryNotFoundException]{exit 48}
-catch [System.IO.IOException]{exit 49}
-catch{exit 71}
-$rc=99
-try{
-$len=[int]$fs.Length; $b=New-Object byte[] $len; [void]$fs.Read($b,0,$len)
-$cur=[Convert]::ToBase64String($b)
-if($cur -eq %s){ $nb=[Convert]::FromBase64String(%s); $fs.Position=0; $fs.Write($nb,0,$nb.Length); $fs.SetLength($nb.Length); $rc=0 } else { $rc=10 }
-} finally { $fs.Close() }
-exit $rc`, psq(path), psq(expectB64), psq(newB64))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
-	} else {
-		script := fmt.Sprintf(`[ -e '%s' ] || exit 48
-command -v flock >/dev/null 2>&1 || exit 70
-exec 9<'%s' 2>/dev/null || { [ -e '%s' ] && exit 71 || exit 48; }
-flock -n 9 || exit 49
-cur=$(base64 < '%s' | tr -d '\n')
-if [ "$cur" != '%s' ]; then exit 10; fi
-tmp='%s.swap.'$$
-printf '%%s' '%s' | base64 -d > "$tmp" || exit 73
-mv -f "$tmp" '%s' || { rm -f "$tmp"; exit 74; }
-exit 0`, path, path, path, path, expectB64, path, newB64, path)
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
-	}
-	if err != nil {
-		return casDone, err
-	}
-	return classifyCas("compare-and-swap", path, r)
-}
-
 // casDelete performs an atomic compare-and-delete on a HELD `.lock`: in a SINGLE
 // remote command it opens the file with an EXCLUSIVE OS handle and removes it
 // ONLY if the current bytes equal `expect` (this handle's owned content). A
 // successor that legitimately took over after our timeout has DIFFERENT bytes, so
-// its lock is never removed. Outcomes mirror casSwap: casDone (deleted),
+// its lock is never removed. The outcomes: casDone (deleted),
 // casMismatch (not ours — safe no-op), casAbsent (already gone), casContended (a
 // peer holds the handle right now — the caller RETRIES so it never returns
 // success while OUR lock is still present, evaluator item 2); any other exit
@@ -526,21 +469,42 @@ func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Pa
 	return createExclusiveAt(ctx, t, p.Root, p.Lock, content)
 }
 
-// createExclusiveAt runs the atomic create-new on the canonical lock path.
-// Returns (created, exitCode, transportErr): created=true on exit 0;
-// exitCode==48 signals the file already existed. DESIGN §13: PowerShell
-// `[IO.File]::Open(CreateNew)`, POSIX `set -C`.
+// createExclusiveAt publishes a fully-formed lock file ATOMICALLY, with
+// create-new (fail-if-exists) semantics and NO empty/partial window (DESIGN §13).
+// Returns (created, exitCode, transportErr): created=true on exit 0; exitCode==48
+// signals the file already existed.
+//
+// The old approach (an exclusive create-new redirect / open-then-Write) created the file
+// FIRST and wrote its bytes SECOND, exposing a transient EMPTY file that a
+// concurrent acquirer could observe (and previously "recover"), and leaving empty
+// residue if the writer was killed between the two steps. Instead we write the
+// content to a private temp in the same directory and then PUBLISH it with a
+// single atomic step that fails if the target exists:
+//   - POSIX: `ln "$tmp" path` — hard-link is atomic and returns EEXIST if the
+//     target is present; the target appears fully-formed or not at all.
+//   - Windows: `[IO.File]::Move($tmp, path)` — Move does not overwrite, throwing
+//     IOException if the target exists; the target appears fully-formed or not.
+//
+// A crashed creator leaves at most an orphan temp (never an empty `.lock`), so
+// there is no dual-ownership window and nothing to "recover".
 func createExclusiveAt(ctx context.Context, t transport.Transport, root, path, content string) (bool, int, error) {
 	b64 := base64.StdEncoding.EncodeToString([]byte(content))
 	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
 		script := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
-try { $fs=[IO.File]::Open(%s,'CreateNew'); $b=[Convert]::FromBase64String(%s); $fs.Write($b,0,$b.Length); $fs.Close(); exit 0 }
-catch [System.IO.IOException] { exit 48 }`, psq(root), psq(path), psq(b64))
+$tmp=%s + '.tmp.' + [Guid]::NewGuid().ToString('N')
+try { $b=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$b); [IO.File]::Move($tmp,%s); exit 0 }
+catch [System.IO.IOException] { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; exit 48 }
+catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; exit 71 }`,
+			psq(root), psq(path), psq(b64), psq(path))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
 	} else {
-		script := fmt.Sprintf(`mkdir -p '%s'; (set -C; printf '%%s' '%s' | base64 -d > '%s') 2>/dev/null || exit 48`, root, b64, path)
+		script := fmt.Sprintf(`mkdir -p '%s'
+tmp='%s.tmp.'$$
+printf '%%s' '%s' | base64 -d > "$tmp" || { rm -f "$tmp"; exit 71; }
+if ln "$tmp" '%s' 2>/dev/null; then rm -f "$tmp"; exit 0; else rm -f "$tmp"; exit 48; fi`,
+			root, path, b64, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {

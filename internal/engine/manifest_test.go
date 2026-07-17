@@ -279,11 +279,11 @@ func TestAcquireLockConcurrentTakeover(t *testing.T) {
 				aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
 				f.set(p.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+aged+`","token":"stale"}`)
 
-				// Rendezvous both contenders on the atomic compare-and-swap so the
+				// Rendezvous both contenders on the atomic compare-and-delete so the
 				// exclusive-handle CAS arbitrates the takeover under a real race.
 				bar := newBarrier(2)
 				f.hook = func(op, s string) {
-					if op == "casswap" {
+					if op == "casdelete" {
 						bar.wait()
 					}
 				}
@@ -418,7 +418,7 @@ func TestThreePartyTakeoverExactlyOneOwner(t *testing.T) {
 				const contenders = 3
 				bar := newBarrier(contenders)
 				f.hook = func(op, s string) {
-					if op == "casswap" {
+					if op == "casdelete" {
 						bar.wait()
 					}
 				}
@@ -534,11 +534,11 @@ func TestReleaseVsInstalledSuccessorPlusThird(t *testing.T) {
 }
 
 // TestTakeoverErrorPathsCleanUp is the injected-transport-failure regression for
-// the stale-takeover path: a failure of the single compare-and-swap that installs
-// the new owner must (a) surface a coded error and (b) leave the canonical `.lock`
+// the stale-takeover path: a failure of the compare-and-delete that removes the
+// stale owner must (a) surface a coded error and (b) leave the canonical `.lock`
 // exactly as it was — still holding the stale bytes, never emptied — with no
-// residue. Because takeover is ONE exclusive-handle command (no gate, no temp),
-// there is nothing to strand: a failed CAS mutates nothing.
+// residue. Because takeover is delete-then-create (each step atomic, no gate, no
+// in-place mutation), a failed delete removes nothing: there is nothing to strand.
 func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
@@ -549,12 +549,12 @@ func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 			staleContent := `{"owner":"dead","op":"deploy","started_utc":"` + aged + `","token":"stale"}`
 			f.set(p.Lock, staleContent)
 
-			// Fail the compare-and-swap exactly once with a transport error.
+			// Fail the compare-and-delete exactly once with a transport error.
 			var tripped bool
 			f.failOn = func(op, s string) (transport.Result, error, bool) {
-				if op == "casswap" && !tripped {
+				if op == "casdelete" && !tripped {
 					tripped = true
-					return transport.Result{}, fmt.Errorf("injected casswap failure"), true
+					return transport.Result{}, fmt.Errorf("injected casdelete failure"), true
 				}
 				return transport.Result{}, nil, false
 			}
@@ -568,7 +568,7 @@ func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 				t.Fatalf("expected coded ERR_CONNECT/ERR_LOCKED, got %v", err)
 			}
 			// No residue, and the canonical lock is untouched (never absent, still
-			// the stale bytes — the failed CAS mutated nothing).
+			// the stale bytes — the failed compare-and-delete removed nothing).
 			f.mu.Lock()
 			for k := range f.files {
 				if strings.Contains(k, ".mx") || strings.Contains(k, ".tmp.") {
@@ -587,10 +587,10 @@ func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 
 // TestTakeoverCleanupSurvivesCancellation is the canceled-mid-takeover
 // regression: if the operation context is canceled exactly when the
-// compare-and-swap runs, the takeover must fail AND the canonical `.lock` must be
+// compare-and-delete runs, the takeover must fail AND the canonical `.lock` must be
 // left untouched (still the stale bytes, never emptied) with no residue. There is
-// no serialization gate to strand — the single exclusive-handle command either
-// swaps atomically or does nothing.
+// no serialization gate to strand — the compare-and-delete either removes the
+// stale bytes atomically or does nothing.
 func TestTakeoverCleanupSurvivesCancellation(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
@@ -602,10 +602,10 @@ func TestTakeoverCleanupSurvivesCancellation(t *testing.T) {
 			f.set(p.Lock, staleContent)
 
 			ctx, cancel := context.WithCancel(context.Background())
-			// Cancel exactly when the compare-and-swap is about to run; the
+			// Cancel exactly when the compare-and-delete is about to run; the
 			// decision read that precedes it must complete normally.
 			f.hook = func(op, s string) {
-				if op == "casswap" {
+				if op == "casdelete" {
 					cancel()
 				}
 			}
@@ -677,7 +677,7 @@ func TestCasDeleteReportsFailure(t *testing.T) {
 }
 
 // TestCasDistinguishesFailureModes is the regression for evaluator item 1: the
-// CAS primitives must NOT collapse every failure into "absent/contention".
+// compare-and-delete must NOT collapse every failure into "absent/contention".
 // A permission/operational failure (exit 71) surfaces as an error; a genuine
 // absence (48) is casAbsent; a transient exclusion contention (49) is
 // casContended — each distinct, on both platforms.
@@ -689,25 +689,16 @@ func TestCasDistinguishesFailureModes(t *testing.T) {
 
 			// Operational failure (permission / missing flock) ⇒ error, NOT a
 			// silent absence/contention no-op.
-			for _, primitive := range []string{"casswap", "casdelete"} {
-				f := newLockFake(osk)
-				f.set(pp.Lock, "data")
-				prim := primitive
-				f.failOn = func(op, s string) (transport.Result, error, bool) {
-					if op == prim {
-						return transport.Result{ExitCode: 71, Stderr: "permission denied"}, nil, true
-					}
-					return transport.Result{}, nil, false
+			f0 := newLockFake(osk)
+			f0.set(pp.Lock, "data")
+			f0.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "casdelete" {
+					return transport.Result{ExitCode: 71, Stderr: "permission denied"}, nil, true
 				}
-				var err error
-				if primitive == "casswap" {
-					_, err = casSwap(context.Background(), f, pp.Lock, "data", "new")
-				} else {
-					_, err = casDelete(context.Background(), f, pp.Lock, "data")
-				}
-				if err == nil {
-					t.Fatalf("%s: operational failure (exit 71) must surface as an error", primitive)
-				}
+				return transport.Result{}, nil, false
+			}
+			if _, err := casDelete(context.Background(), f0, pp.Lock, "data"); err == nil {
+				t.Fatal("operational failure (exit 71) must surface as an error")
 			}
 
 			// Absence (exit 48) ⇒ casAbsent, no error.
@@ -783,56 +774,56 @@ func TestReleaseLockRetriesContention(t *testing.T) {
 	}
 }
 
-// TestAcquireLockRecoversEmptyLock is the regression for evaluator item 3: a
-// `.lock` left EMPTY by a writer killed mid-create/replace (crash residue, no live
-// holder) must be RECOVERABLE — AcquireLock takes it over via the content-keyed
-// compare-and-swap and returns a handle with a recovery WARN, rather than being
-// permanently wedged as "unparseable". A NON-empty corrupt file is still refused
-// (covered by TestAcquireLockUnparseableRefused).
-func TestAcquireLockRecoversEmptyLock(t *testing.T) {
+// TestAcquireLockRefusesEmptyLock is the regression for evaluator items 1 & 2:
+// the empty-file "recovery" that could grant DUAL OWNERSHIP is GONE. Because
+// create and takeover are now both atomic (a `.lock` is never observed
+// empty/partial), an empty file is NOT treated as recoverable crash residue — it
+// is refused (ERR_LOCKED) like any other unparseable content, so a second
+// acquisition can never steal a slot a live creator momentarily left empty.
+func TestAcquireLockRefusesEmptyLock(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
 		t.Run(string(osk), func(t *testing.T) {
 			pp := lockFakePaths(osk)
 			f := newLockFake(osk)
-			f.set(pp.Lock, "") // empty crash residue
+			f.set(pp.Lock, "") // empty file (e.g. a live creator's transient state)
 
-			lk, warn, err := AcquireLock(context.Background(), f, pp, "rescuer", "deploy", 900)
-			if err != nil || lk == nil {
-				t.Fatalf("empty crash-residue lock must be recovered, got lk=%v err=%v", lk, err)
+			lk, _, err := AcquireLock(context.Background(), f, pp, "intruder", "deploy", 900)
+			if err == nil || lk != nil {
+				t.Fatalf("an empty lock must be REFUSED, not recovered/stolen; got lk=%v err=%v", lk, err)
 			}
-			if !strings.Contains(warn, "recovered") {
-				t.Fatalf("expected a recovery WARN, got %q", warn)
-			}
-			if !strings.Contains(f.get(pp.Lock), `"owner":"rescuer"`) {
-				t.Fatalf("recovered lock not owned by us: %q", f.get(pp.Lock))
+			if f.get(pp.Lock) != "" {
+				t.Fatalf("a refused empty lock must be left untouched, got %q", f.get(pp.Lock))
 			}
 		})
 	}
 }
 
-// TestAcquireLockRecoversInterruptedReplacement is the deterministic
-// interruption-during-replacement regression for evaluator item 3. A stale
-// takeover whose casSwap is KILLED (transport error) leaves the canonical `.lock`
-// untouched (crash-safe replacement never truncates in place — POSIX renames a
-// temp, Windows writes-then-truncates), so a SUBSEQUENT AcquireLock still sees the
-// intact stale bytes and takes over cleanly.
-func TestAcquireLockRecoversInterruptedReplacement(t *testing.T) {
+// TestStaleTakeoverIsDeleteThenCreate proves the new takeover shape (evaluator
+// items 2 & 4): a proven-stale lock is removed by an atomic compare-and-delete and
+// then re-created atomically, with the stale-owner WARN preserved. Crucially, an
+// interruption between the two steps NEVER leaves a mixed/partial file: if the
+// compare-and-delete itself is killed, the canonical lock stays the INTACT stale
+// bytes (no in-place mutation exists to corrupt), and a subsequent acquire still
+// takes over cleanly.
+func TestStaleTakeoverIsDeleteThenCreate(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
 		t.Run(string(osk), func(t *testing.T) {
 			pp := lockFakePaths(osk)
 			aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
 			stale := `{"owner":"dead","op":"deploy","started_utc":"` + aged + `","token":"stale"}`
+
+			// (a) Interrupted delete: the compare-and-delete is killed once. The
+			// canonical lock is left INTACT (never partial/empty), and a retry
+			// takes over cleanly with the stale WARN.
 			f := newLockFake(osk)
 			f.set(pp.Lock, stale)
-
-			// First takeover is interrupted: casSwap fails once (killed command).
 			var killed bool
 			f.failOn = func(op, s string) (transport.Result, error, bool) {
-				if op == "casswap" && !killed {
+				if op == "casdelete" && !killed {
 					killed = true
-					return transport.Result{}, fmt.Errorf("killed mid-replace"), true
+					return transport.Result{}, fmt.Errorf("killed mid-delete"), true
 				}
 				return transport.Result{}, nil, false
 			}
@@ -840,17 +831,98 @@ func TestAcquireLockRecoversInterruptedReplacement(t *testing.T) {
 			if err == nil || lk != nil {
 				t.Fatalf("interrupted takeover must fail, got lk=%v err=%v", lk, err)
 			}
-			// Crash-safe: the canonical lock is NOT truncated/partial — still intact.
 			if got := f.get(pp.Lock); got != stale {
-				t.Fatalf("interrupted replacement left partial/empty lock: %q", got)
+				t.Fatalf("interrupted delete left a corrupted/partial lock: %q", got)
 			}
-			// A subsequent acquire (no injection) takes over cleanly.
-			lk2, warn, err2 := AcquireLock(context.Background(), f, pp, "successor", "deploy", 900)
+
+			// (b) Clean takeover: delete-then-create succeeds, WARN names the
+			// stale owner, and the new lock is ours.
+			f2 := newLockFake(osk)
+			f2.set(pp.Lock, stale)
+			lk2, warn, err2 := AcquireLock(context.Background(), f2, pp, "successor", "deploy", 900)
 			if err2 != nil || lk2 == nil {
-				t.Fatalf("retry after interrupted replacement must succeed, got lk=%v err=%v", lk2, err2)
+				t.Fatalf("clean stale takeover must succeed, got lk=%v err=%v", lk2, err2)
 			}
-			if !strings.Contains(warn, "stale") {
-				t.Fatalf("expected stale-takeover WARN on retry, got %q", warn)
+			if !strings.Contains(warn, "stale") || !strings.Contains(warn, "dead") {
+				t.Fatalf("stale-takeover WARN missing owner, got %q", warn)
+			}
+			if !strings.Contains(f2.get(pp.Lock), `"owner":"successor"`) {
+				t.Fatalf("stale lock not replaced by us: %q", f2.get(pp.Lock))
+			}
+		})
+	}
+}
+
+// TestConcurrentCreateNeverExposesEmptyResidue is the deterministic concurrent
+// test for evaluator item 3. Two acquirers race for a FREE slot; a hook pauses the
+// first one's create just before it publishes, and only releases it after the
+// second acquirer has run a full attempt. Because create publishes atomically
+// (temp then Move/ln — the file is never empty at the canonical path) and the
+// empty-residue recovery branch is gone, the second acquirer can NEVER observe or
+// "recover" an empty file: exactly one acquirer wins and the stored lock is always
+// a complete, owner-bearing JSON — never the empty string.
+func TestConcurrentCreateNeverExposesEmptyResidue(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			pp := lockFakePaths(osk)
+			f := newLockFake(osk)
+
+			// Rendezvous: hold the FIRST create at the moment it is classified,
+			// let a second acquirer complete an attempt, then release. A one-shot
+			// token channel ensures ONLY the first create pauses (later creates,
+			// including the second acquirer's, pass straight through — no deadlock).
+			firstCreate := make(chan struct{}, 1)
+			firstCreate <- struct{}{}
+			secondDone := make(chan struct{})
+			f.hook = func(op, script string) {
+				if op != "create" {
+					return
+				}
+				select {
+				case <-firstCreate: // I am the first create — block until B is done.
+					<-secondDone
+				default: // a later create — proceed immediately.
+				}
+			}
+
+			var wg sync.WaitGroup
+			wins := make(chan bool, 2)
+			// Acquirer A (its create is the one that gets paused).
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				lk, _, err := AcquireLock(context.Background(), f, pp, "A", "deploy", 900)
+				wins <- (err == nil && lk != nil)
+			}()
+			// Acquirer B runs while A is paused; it must never see an empty file.
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				time.Sleep(20 * time.Millisecond) // let A enter its paused create
+				lk, _, err := AcquireLock(context.Background(), f, pp, "B", "deploy", 900)
+				wins <- (err == nil && lk != nil)
+				close(secondDone)
+			}()
+			wg.Wait()
+			close(wins)
+
+			won := 0
+			for w := range wins {
+				if w {
+					won++
+				}
+			}
+			if won != 1 {
+				t.Fatalf("exactly one acquirer must win a single free slot, got %d", won)
+			}
+			// The stored lock is a complete JSON owned by whoever won — never empty.
+			got := f.get(pp.Lock)
+			if strings.TrimSpace(got) == "" {
+				t.Fatalf("the canonical lock was observed EMPTY — atomic create violated: %q", got)
+			}
+			if !strings.Contains(got, `"owner":"A"`) && !strings.Contains(got, `"owner":"B"`) {
+				t.Fatalf("stored lock is not a complete owner-bearing JSON: %q", got)
 			}
 		})
 	}
@@ -1013,8 +1085,8 @@ func equalStrs(a, b []string) bool {
 }
 
 // TestLockLifecycleLinux is the regression for evaluator item 4: exercise the
-// POSIX `set -C` create-new, exit-48 contention, stale replacement, and
-// ownership-safe release scripts against a Linux fake transport.
+// POSIX atomic create-new (temp + hardlink), exit-48 contention, stale
+// replacement, and ownership-safe release scripts against a Linux fake transport.
 func TestLockLifecycleLinux(t *testing.T) {
 	p := lockFakePaths(spec.OSLinux)
 	f := newLockFake(spec.OSLinux)
@@ -1026,7 +1098,7 @@ func TestLockLifecycleLinux(t *testing.T) {
 		t.Fatalf("linux fresh acquire: lk=%v warn=%q err=%v", lk, warn, err)
 	}
 	if !f.has(p.Lock) {
-		t.Fatal("linux: lock file not created via set -C")
+		t.Fatal("linux: lock file not created via atomic hardlink publish")
 	}
 
 	// (b) exit-48 contention: a second acquire while held (fresh) ⇒ ERR_LOCKED.
@@ -1082,9 +1154,9 @@ type lockFake struct {
 	osk   spec.OSKind
 	files map[string]string
 	// hook, if set, is called with the classified op ("read"/"create"/"write"/
-	// "casswap"/"casdelete"/"delete") and the raw script BEFORE f.mu is taken, so
+	// "casdelete"/"delete") and the raw script BEFORE f.mu is taken, so
 	// a test can block a goroutine at a chosen primitive (e.g. rendezvous both
-	// takeover contenders on the compare-and-swap) WITHOUT holding the fake's
+	// takeover contenders on the compare-and-delete) WITHOUT holding the fake's
 	// mutex across the pause — the mutex is released between Execs, so command
 	// interleaving is genuinely modeled.
 	hook func(op, script string)
@@ -1133,19 +1205,19 @@ var _ transport.Transport = (*lockFake)(nil)
 var (
 	lfReadWin   = regexp.MustCompile(`ReadAllBytes\('([^']+)'\)`)
 	lfReadSh    = regexp.MustCompile(`base64 < '([^']+)'`)
-	lfOpenWin   = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)','CreateNew'\)`)
+	lfOpenWin   = regexp.MustCompile(`\[IO\.File\]::Move\(\$tmp,'([^']+)'\)`)
+	lfCreateSh  = regexp.MustCompile(`ln "\$tmp" '([^']+)'`)
 	lfWriteAllW = regexp.MustCompile(`WriteAllBytes\('([^']+)',`)
 	lfNewB64Win = regexp.MustCompile(`FromBase64String\('([^']*)'\)`)
 	lfWriteSh   = regexp.MustCompile(`base64 -d > '([^']+)'`)
 	lfNewB64Sh  = regexp.MustCompile(`printf '%s' '([^']*)'`)
 	lfDelWin    = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
 	lfDelSh     = regexp.MustCompile(`rm -f '([^']+)'`)
-	// CAS primitives (single exclusive-handle compare-and-swap / -delete).
+	// CAS primitive (single exclusive-handle compare-and-delete).
 	lfCasOpenWin = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open`)
 	lfCurEqWin   = regexp.MustCompile(`\$cur -eq '([^']*)'`)
 	lfCasPathSh  = regexp.MustCompile(`exec 9<'([^']+)'`)
 	lfCurNeSh    = regexp.MustCompile(`\[ "\$cur" != '([^']*)' \]`)
-	lfCasNewSh   = regexp.MustCompile(`printf '%s' '([^']*)' \| base64 -d`)
 )
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -1158,20 +1230,17 @@ func firstGroup(re *regexp.Regexp, s string) (string, bool) {
 }
 
 // classify maps a lock script to exactly one primitive. Order matters: the CAS
-// primitives (which reuse base64 read/write fragments and, on POSIX, `rm -f`)
-// MUST be recognized BEFORE the plain read/write/delete cases, and the exclusive
-// create-new gate (`CreateNew`/`set -C`) before a plain temp write.
+// compare-and-delete (which reuses base64 read fragments and, on POSIX, `rm -f`)
+// MUST be recognized BEFORE the plain read/delete cases, and the atomic
+// create-publish (`Move($tmp,...)`/`ln "$tmp"`) before a plain temp write.
 func (f *lockFake) classify(s string) string {
 	switch {
-	case strings.Contains(s, "[IO.FileShare]::None") ||
-		(strings.Contains(s, "flock -n 9") && strings.Contains(s, `mv -f "$tmp"`)):
-		return "casswap"
 	case strings.Contains(s, "[IO.File]::Delete(") ||
 		(strings.Contains(s, "flock -n 9") && strings.Contains(s, "rm -f '")):
 		return "casdelete"
 	case strings.Contains(s, "ReadAllBytes(") || strings.Contains(s, "base64 < '"):
 		return "read"
-	case strings.Contains(s, "'CreateNew'") || strings.Contains(s, "set -C"):
+	case strings.Contains(s, "[IO.File]::Move($tmp,") || strings.Contains(s, `ln "$tmp"`):
 		return "create"
 	case strings.Contains(s, "WriteAllBytes(") || strings.Contains(s, "base64 -d > '"):
 		return "write"
@@ -1183,12 +1252,13 @@ func (f *lockFake) classify(s string) string {
 
 // Exec models each lock primitive as a SINGLE atomic operation while RELEASING
 // the fake's mutex between calls, so concurrent goroutines genuinely interleave
-// at command boundaries (the interleaving the evaluator asked us to model). Every
-// mutation of a HELD lock is one exclusive-handle compare-and-swap (casswap) or
-// compare-and-delete (casdelete): the check and the mutation are indivisible, so
-// two contenders can never both win and the canonical `.lock` is never emptied
-// mid-takeover — no serialization gate exists to strand. It HONORS context
-// cancellation (a canceled ctx fails the op) so tests can prove cleanup uses a
+// at command boundaries (the interleaving the evaluator asked us to model).
+// Create PUBLISHES a fully-formed file atomically (temp then Move/ln), so a
+// concurrent acquirer NEVER observes an empty/partial `.lock`; a HELD lock is
+// removed by one exclusive-handle compare-and-delete (casdelete). Takeover is
+// delete-then-recreate, each step atomic, so two contenders can never both win
+// and there is no in-place mutation to corrupt. It HONORS context cancellation
+// (a canceled ctx fails the op) so tests can prove cleanup uses a
 // cancellation-detached context (evaluator items 1 & 4).
 func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
@@ -1224,20 +1294,20 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		return transport.Result{ExitCode: 0, Stdout: b64(content)}, nil
 
-	case "create": // exclusive create-new (canonical lock OR serialization gate)
+	case "create": // atomic create-with-content (temp then Move/ln publish)
 		var path, newB64 string
 		if win {
 			path, _ = firstGroup(lfOpenWin, s)
 			newB64, _ = firstGroup(lfNewB64Win, s)
 		} else {
-			path, _ = firstGroup(lfWriteSh, s)
+			path, _ = firstGroup(lfCreateSh, s)
 			newB64, _ = firstGroup(lfNewB64Sh, s)
 		}
 		if _, held := f.files[path]; held {
 			return transport.Result{ExitCode: 48}, nil
 		}
 		raw, _ := base64.StdEncoding.DecodeString(newB64)
-		f.files[path] = string(raw)
+		f.files[path] = string(raw) // atomic publish: the file appears fully-formed
 		return transport.Result{ExitCode: 0}, nil
 
 	case "write": // non-exclusive write (writeSmallFile / WriteManifest)
@@ -1251,28 +1321,6 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		raw, _ := base64.StdEncoding.DecodeString(newB64)
 		f.files[path] = string(raw)
-		return transport.Result{ExitCode: 0}, nil
-
-	case "casswap": // single exclusive-handle compare-and-swap of a HELD lock
-		var path, expB64, newB64 string
-		if win {
-			path, _ = firstGroup(lfCasOpenWin, s)
-			expB64, _ = firstGroup(lfCurEqWin, s)
-			newB64, _ = firstGroup(lfNewB64Win, s)
-		} else {
-			path, _ = firstGroup(lfCasPathSh, s)
-			expB64, _ = firstGroup(lfCurNeSh, s)
-			newB64, _ = firstGroup(lfCasNewSh, s)
-		}
-		cur, ok := f.files[path]
-		if !ok {
-			return transport.Result{ExitCode: 48}, nil // absent or peer-locked
-		}
-		if b64(cur) != expB64 {
-			return transport.Result{ExitCode: 10}, nil // content changed: not our stale bytes
-		}
-		raw, _ := base64.StdEncoding.DecodeString(newB64)
-		f.files[path] = string(raw) // in-place overwrite: never momentarily absent
 		return transport.Result{ExitCode: 0}, nil
 
 	case "casdelete": // single exclusive-handle compare-and-delete of a HELD lock

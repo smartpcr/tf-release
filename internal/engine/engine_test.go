@@ -48,19 +48,18 @@ func (f *fakeHost) Host() string                      { return f.host }
 
 var reRead = regexp.MustCompile(`ReadAllBytes\('([^']+)'\)`)
 var reWrite = regexp.MustCompile(`WriteAllBytes\('([^']+)',\[Convert\]::FromBase64String\('([^']*)'\)\)`)
-var reLock = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)','CreateNew'\)`)
+var reLock = regexp.MustCompile(`\[IO\.File\]::Move\(\$tmp,'([^']+)'\)`)
 var reRmRecurse = regexp.MustCompile(`Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '([^']+)'`)
 var reRmOne = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
 var reMklink = regexp.MustCompile(`mklink /J "([^"]+)" "([^"]+)"`)
 var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 
-// reCasOpen captures the exclusive-handle open shared by casSwap (FileShare::None)
-// and casDelete (FileShare::Delete). The single command holds the OS handle for
-// its whole lifetime and atomically compares-then-swaps/deletes, so no persistent
-// gate is needed and nothing can be stranded on crash.
-var reCasOpen = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open,\[IO\.FileAccess\]::ReadWrite,\[IO\.FileShare\]::(None|Delete)\)`)
+// reCasOpen captures the exclusive-handle open used by casDelete (FileShare::Delete).
+// The single command holds the OS handle for its whole lifetime and atomically
+// compares-then-deletes, so no persistent gate is needed and nothing can be
+// stranded on crash.
+var reCasOpen = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open,\[IO\.FileAccess\]::ReadWrite,\[IO\.FileShare\]::Delete\)`)
 var reCurEq = regexp.MustCompile(`\$cur -eq '([^']*)'`)
-var reNewB64 = regexp.MustCompile(`FromBase64String\('([^']*)'\)`)
 
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
@@ -69,9 +68,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
-	case reCasOpen.MatchString(s): // casSwap / casDelete exclusive-handle CAS
+	case reCasOpen.MatchString(s): // casDelete exclusive-handle compare-and-delete
 		m := reCasOpen.FindStringSubmatch(s)
-		path, share := m[1], m[2]
+		path := m[1]
 		cur, exists := f.files[path]
 		if !exists {
 			return transport.Result{ExitCode: 48}, nil // absent or peer-locked
@@ -80,22 +79,13 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		if em == nil || base64.StdEncoding.EncodeToString(cur) != em[1] {
 			return transport.Result{ExitCode: 10}, nil // content changed: not ours
 		}
-		if share == "None" { // casSwap: overwrite in place
-			nm := reNewB64.FindStringSubmatch(s)
-			if nm == nil {
-				return transport.Result{ExitCode: 99}, nil
-			}
-			nb, _ := base64.StdEncoding.DecodeString(nm[1])
-			f.files[path] = nb
-			return ok(""), nil
-		}
 		delete(f.files, path) // casDelete: compare-and-delete
 		return ok(""), nil
 
-	case reLock.MatchString(s): // AcquireLock create-new (exclusive gate)
+	case reLock.MatchString(s): // AcquireLock atomic create (temp then Move publish)
 		p := reLock.FindStringSubmatch(s)[1]
 		if _, held := f.files[p]; held {
-			return transport.Result{ExitCode: 48}, nil // exclusive create-new gate
+			return transport.Result{ExitCode: 48}, nil // create-with-content: fail if exists
 		}
 		// content arrives via FromBase64String('<b64>')
 		if m := regexp.MustCompile(`FromBase64String\('([^']*)'\)`).FindStringSubmatch(s); m != nil {
