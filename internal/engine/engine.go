@@ -3,6 +3,8 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -335,10 +337,11 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 	if err := e.wipeStaging(ctx, t, p); err != nil {
 		return coded("ERR_CONNECT", host, "STAGE", err)
 	}
-	// STAGING WIPE (end): runs on every exit path. A cleanup failure is surfaced
-	// as the op error when the op otherwise succeeded (never leave a dirty
-	// staging silently); when the op already failed we warn so the root cause
-	// is preserved.
+	// STAGING WIPE (end): declared FIRST so it runs LAST (LIFO) — after the
+	// incomplete-release cleanup below has settled `err`. A cleanup failure is
+	// surfaced as the op error when the op otherwise succeeded (never leave a
+	// dirty staging silently); when the op already failed we warn so the root
+	// cause is preserved.
 	defer func() {
 		if werr := e.wipeStaging(ctx, t, p); werr != nil {
 			if err == nil {
@@ -348,36 +351,47 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 			}
 		}
 	}()
-	cached, err := e.releaseCached(ctx, t, p, s.Artifact.Checksum)
-	if err != nil {
-		return coded("ERR_CONNECT", host, "STAGE", err)
+	// INCOMPLETE-RELEASE CLEANUP: declared SECOND so it runs FIRST (before the
+	// staging wipe), while `err` still reflects the genuine operation result.
+	// Any pre-switch failure (fetch/extract/deps/marker/render/post_install)
+	// after THIS op created the release removes the partial release so only a
+	// staging-only failure state remains (DESIGN §10.2). A cached release we did
+	// NOT create survives a render/post_install error. Cleanup failures are
+	// joined onto the op error so they cannot masquerade as a clean failure.
+	createdRelease := false
+	defer func() {
+		if err != nil && createdRelease {
+			err = e.cleanupIncompleteRelease(ctx, t, p, host, err)
+		}
+	}()
+	cached, cerr := e.releaseCached(ctx, t, p, s.Artifact.Version, s.Artifact.Checksum)
+	if cerr != nil {
+		return coded("ERR_CONNECT", host, "STAGE", cerr)
 	}
 	if !cached {
-		if err := e.fetchToStaging(ctx, t, s, p); err != nil {
-			return err // fetch writes only to staging; release tree untouched
+		if ferr := e.fetchToStaging(ctx, t, s, p); ferr != nil {
+			return ferr // fetch writes only to staging; release tree untouched
 		}
-		// From here the release dir is (partially) created; any failure must
-		// leave a staging-only failure state (DESIGN §10.2), so remove the
-		// incomplete release before returning.
-		if err := e.extract(ctx, t, p); err != nil {
-			_ = e.removePath(ctx, t, p.Release)
-			return err
+		// extract creates the release dir — from here the release is "ours" and
+		// every failure below trips the incomplete-release cleanup defer.
+		createdRelease = true
+		if xerr := e.extract(ctx, t, p); xerr != nil {
+			return xerr
 		}
 		if n, ok := pat.(*pattern.NodeWebApp); ok {
-			if err := n.InstallDeps(ctx, t, rc); err != nil {
-				_ = e.removePath(ctx, t, p.Release)
-				return err
+			if derr := n.InstallDeps(ctx, t, rc); derr != nil {
+				return derr
 			}
 		}
-		if err := e.writeReleaseMarker(ctx, t, p, s); err != nil {
-			_ = e.removePath(ctx, t, p.Release)
-			return coded("ERR_CONNECT", host, "STAGE", err)
+		if merr := e.writeReleaseMarker(ctx, t, p, s); merr != nil {
+			return coded("ERR_CONNECT", host, "STAGE", merr)
 		}
 	} else {
 		tflog.Info(ctx, "release cached; skipping fetch/extract",
 			map[string]interface{}{"host": host, "version": s.Artifact.Version})
 	}
-	// RENDER: files land in the release dir every apply (DESIGN §6.4).
+	// RENDER: files land in the release dir every apply (DESIGN §6.4). A failure
+	// here on a freshly-created release trips the incomplete-release cleanup.
 	for _, f := range s.Files {
 		var dest string
 		if t.OS() == spec.OSWindows {
@@ -385,11 +399,12 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 		} else {
 			dest = p.Release + "/" + strings.TrimLeft(f.Path, "/")
 		}
-		if err := writeSmallFile(ctx, t, dest, f.Content); err != nil {
-			return coded("ERR_EXTRACT", host, "RENDER", err)
+		if werr := writeSmallFile(ctx, t, dest, f.Content); werr != nil {
+			return coded("ERR_EXTRACT", host, "RENDER", werr)
 		}
 	}
-	// post_install hook runs in release dir before switchover (DESIGN §6.4).
+	// post_install hook runs in release dir after extract, before switchover;
+	// non-zero exit ⇒ ERR_SERVICE_INSTALL (DESIGN §6.4).
 	if hook := s.Pattern.PostInstall; hook != "" {
 		var r transport.Result
 		var xerr error
@@ -404,11 +419,23 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 			return wrapTransportErr(xerr, host, "STAGE")
 		}
 		if r.ExitCode != 0 {
-			return coded("ERR_EXTRACT", host, "STAGE",
+			return coded("ERR_SERVICE_INSTALL", host, "STAGE",
 				fmt.Errorf("post_install exit=%d: %s", r.ExitCode, strings.TrimSpace(r.Stderr+r.Stdout)))
 		}
 	}
 	return nil
+}
+
+// cleanupIncompleteRelease removes a release dir that THIS op created after a
+// pre-switch failure (DESIGN §10.2 staging-only failure state) and JOINS any
+// removal error onto the operation error, so a failed cleanup cannot masquerade
+// as a clean staging-only failure.
+func (e *Engine) cleanupIncompleteRelease(ctx context.Context, t transport.Transport, p layout.Paths, host string, opErr error) error {
+	if rerr := e.removePath(ctx, t, p.Release); rerr != nil {
+		return errors.Join(opErr, coded("ERR_CONNECT", host, "STAGE",
+			fmt.Errorf("incomplete-release cleanup: %w", rerr)))
+	}
+	return opErr
 }
 
 // switchOn = STOP + SWITCH + CONFIGURE + START for one host (DESIGN §10.1 7–10).
@@ -523,13 +550,29 @@ func ensureDir(ctx context.Context, t transport.Transport, dir string) error {
 
 const releaseMarker = ".labdeploy-release.json"
 
-func (e *Engine) releaseCached(ctx context.Context, t transport.Transport, p layout.Paths, wantChecksum string) (bool, error) {
+// releaseCached reports whether the on-host release marker proves the wanted
+// version is already fully extracted. It parses `.labdeploy-release.json` and
+// requires ALL of {version, sha256, extracted_at} to be present and for version
+// + sha256 to match the request; a missing, malformed, or partially-written
+// marker is treated as "not cached" so the release is re-fetched/extracted.
+func (e *Engine) releaseCached(ctx context.Context, t transport.Transport, p layout.Paths, wantVersion, wantChecksum string) (bool, error) {
 	marker := p.Release + sepFor(t.OS()) + releaseMarker
 	raw, ok, err := readSmallFile(ctx, t, marker)
 	if err != nil || !ok {
 		return false, err
 	}
-	return strings.Contains(raw, `"sha256": "`+wantChecksum+`"`), nil
+	var m struct {
+		Version     string `json:"version"`
+		SHA256      string `json:"sha256"`
+		ExtractedAt string `json:"extracted_at"`
+	}
+	if jerr := json.Unmarshal([]byte(raw), &m); jerr != nil {
+		return false, nil // malformed marker ⇒ re-stage rather than trust it
+	}
+	if m.Version == "" || m.SHA256 == "" || m.ExtractedAt == "" {
+		return false, nil // incomplete marker ⇒ re-stage
+	}
+	return m.Version == wantVersion && m.SHA256 == wantChecksum, nil
 }
 
 func (e *Engine) writeReleaseMarker(ctx context.Context, t transport.Transport, p layout.Paths, s *spec.Deployment) error {

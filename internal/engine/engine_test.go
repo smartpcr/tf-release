@@ -147,6 +147,13 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("HEALTH")
 		return ok(""), nil
 
+	case strings.Contains(s, "LDPOSTINSTALL"): // post_install hook
+		if f.fail["postinstall"] {
+			return transport.Result{ExitCode: 9, Stderr: "hook failed"}, nil
+		}
+		f.mark("POSTINSTALL")
+		return ok(""), nil
+
 	case strings.Contains(s, "not_installed"): // Status probe
 		if f.svc == "" {
 			return ok("not_installed"), nil
@@ -168,7 +175,7 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case reRmRecurse.MatchString(s):
 		p := reRmRecurse.FindStringSubmatch(s)[1]
-		if f.fail["rm"] {
+		if f.fail["rm"] || (f.fail["rmRelease"] && strings.Contains(p, "releases")) {
 			return transport.Result{ExitCode: 1, Stderr: "remove failed"}, nil
 		}
 		for k := range f.files {
@@ -271,6 +278,16 @@ strategy: { keep_releases: 2, rollback_on_failure: true }
 	if err != nil {
 		t.Fatalf("spec: %v", err)
 	}
+	return d
+}
+
+// winSvcSpecPostInstall is winSvcSpec plus a post_install hook (sentinel
+// LDPOSTINSTALL the fake transport recognizes) to exercise the post_install
+// failure path (DESIGN §6.4 ⇒ ERR_SERVICE_INSTALL).
+func winSvcSpecPostInstall(t *testing.T, url, checksum string) *spec.Deployment {
+	t.Helper()
+	d := winSvcSpec(t, url, checksum)
+	d.Pattern.PostInstall = "LDPOSTINSTALL"
 	return d
 }
 
@@ -750,6 +767,110 @@ func TestLinuxOrchestrationQuotesHostileRoot(t *testing.T) {
 	}
 	if !sawRoot {
 		t.Fatal("no emitted script interpolated the install_root; test ineffective")
+	}
+}
+
+// TestPostInstallFailureMapsServiceInstallAndCleansRelease covers evaluator
+// items 1 & 3: a post_install non-zero exit is mapped to ERR_SERVICE_INSTALL
+// (DESIGN §6.4), and because THIS op created the release, the partial release
+// dir is removed (DESIGN §10.2 staging-only failure state).
+func TestPostInstallFailureMapsServiceInstallAndCleansRelease(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["postinstall"] = true
+	eng := engineWith(f)
+
+	_, err := eng.Deploy(context.Background(), winSvcSpecPostInstall(t, url, sum))
+	if err == nil {
+		t.Fatal("expected post_install failure")
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_SERVICE_INSTALL" {
+		t.Fatalf("want ERR_SERVICE_INSTALL, got %v", err)
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\releases\1.0.0`) {
+		t.Fatalf("newly-created release must be removed on post_install failure; log=%v", f.log)
+	}
+}
+
+// TestCachedReleaseSurvivesPostInstallFailure covers evaluator item 1's gate:
+// a post_install failure on a CACHED release (not created by this op) must NOT
+// delete the pre-existing good release.
+func TestCachedReleaseSurvivesPostInstallFailure(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["postinstall"] = true
+	// Seed a valid marker so releaseCached() is true ⇒ createdRelease stays false.
+	marker := `C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`
+	f.files[marker] = []byte(fmt.Sprintf("{\n  \"version\": \"1.0.0\",\n  \"sha256\": %q,\n  \"extracted_at\": \"2024-01-01T00:00:00Z\"\n}\n", sum))
+	eng := engineWith(f)
+
+	_, err := eng.Deploy(context.Background(), winSvcSpecPostInstall(t, url, sum))
+	if err == nil {
+		t.Fatal("expected post_install failure")
+	}
+	if strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\releases\1.0.0`) {
+		t.Fatalf("cached release must NOT be removed on post_install failure; log=%v", f.log)
+	}
+	if _, present := f.files[marker]; !present {
+		t.Fatal("cached release marker must survive a post_install failure")
+	}
+}
+
+// TestIncompleteReleaseCleanupFailureSurfaced covers evaluator item 2: when the
+// incomplete-release removal itself fails, that error is JOINED onto the op
+// error rather than silently discarded.
+func TestIncompleteReleaseCleanupFailureSurfaced(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["postinstall"] = true // pre-switch failure on a freshly-created release
+	f.fail["rmRelease"] = true    // ...and the release cleanup removal fails
+	eng := engineWith(f)
+
+	_, err := eng.Deploy(context.Background(), winSvcSpecPostInstall(t, url, sum))
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if !strings.Contains(err.Error(), "incomplete-release cleanup") {
+		t.Fatalf("cleanup failure must be surfaced (joined) onto op error; got: %v", err)
+	}
+	// Original cause must still be present (errors.Join keeps both).
+	if !strings.Contains(err.Error(), "post_install") {
+		t.Fatalf("original post_install cause must be preserved; got: %v", err)
+	}
+}
+
+// TestMalformedMarkerReFetches covers evaluator item 4: a marker that is not
+// valid/complete JSON must NOT be trusted as a cache hit — the release is
+// re-fetched and re-extracted.
+func TestMalformedMarkerReFetches(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("zip"))
+	defer done()
+
+	// (a) Non-JSON text that merely contains the checksum fragment.
+	f := newFakeHost("lab-01")
+	marker := `C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`
+	f.files[marker] = []byte(`garbage "sha256": "` + sum + `" not json`)
+	eng := engineWith(f)
+	if _, err := eng.Deploy(context.Background(), winSvcSpec(t, url, sum)); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), "EXTRACT") {
+		t.Fatalf("malformed marker must force re-extract; log=%v", f.log)
+	}
+
+	// (b) Valid JSON but missing extracted_at ⇒ incomplete ⇒ re-stage.
+	f2 := newFakeHost("lab-01")
+	f2.files[marker] = []byte(fmt.Sprintf("{\n  \"version\": \"1.0.0\",\n  \"sha256\": %q\n}\n", sum))
+	eng2 := engineWith(f2)
+	if _, err := eng2.Deploy(context.Background(), winSvcSpec(t, url, sum)); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if !strings.Contains(strings.Join(f2.log, ">"), "EXTRACT") {
+		t.Fatalf("incomplete marker (no extracted_at) must force re-extract; log=%v", f2.log)
 	}
 }
 

@@ -85,8 +85,9 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	if err := e.wipeStaging(ctx, t, p); err != nil {
 		return nil, coded("ERR_CONNECT", host, "STAGE", err)
 	}
-	// STAGING WIPE (end): surface a cleanup failure as the op error when the run
-	// otherwise succeeded; warn (preserving root cause) when it already failed.
+	// STAGING WIPE (end): declared FIRST so it runs LAST (LIFO), after the
+	// incomplete-release cleanup below. Surface a cleanup failure as the op error
+	// when the run otherwise succeeded; warn (preserving root cause) otherwise.
 	defer func() {
 		if werr := e.wipeStaging(ctx, t, p); werr != nil {
 			if err == nil {
@@ -97,23 +98,31 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 			}
 		}
 	}()
-	cached, err := e.releaseCached(ctx, t, p, tr.Artifact.Checksum)
-	if err != nil {
-		return nil, coded("ERR_CONNECT", host, "STAGE", err)
+	// INCOMPLETE-RELEASE CLEANUP: declared SECOND so it runs FIRST, while `err`
+	// still holds the genuine run result. Only a release THIS run created is
+	// removed, and only on a pre-execution failure (DESIGN §10.2). Cleanup
+	// failures are joined onto the op error.
+	createdRelease := false
+	defer func() {
+		if err != nil && createdRelease {
+			err = e.cleanupIncompleteRelease(ctx, t, p, host, err)
+		}
+	}()
+	cached, cerr := e.releaseCached(ctx, t, p, tr.Artifact.Version, tr.Artifact.Checksum)
+	if cerr != nil {
+		return nil, coded("ERR_CONNECT", host, "STAGE", cerr)
 	}
 	if !cached {
-		if err := e.fetchToStaging(ctx, t, dep, p); err != nil {
-			return nil, err // fetch writes only to staging; release tree untouched
+		if ferr := e.fetchToStaging(ctx, t, dep, p); ferr != nil {
+			return nil, ferr // fetch writes only to staging; release tree untouched
 		}
-		// Release dir now (partially) created; on any failure remove the
-		// incomplete release to keep a staging-only failure state (DESIGN §10.2).
-		if err := e.extract(ctx, t, p); err != nil {
-			_ = e.removePath(ctx, t, p.Release)
-			return nil, err
+		// extract creates the release dir — from here it is "ours".
+		createdRelease = true
+		if xerr := e.extract(ctx, t, p); xerr != nil {
+			return nil, xerr
 		}
-		if err := e.writeReleaseMarker(ctx, t, p, dep); err != nil {
-			_ = e.removePath(ctx, t, p.Release)
-			return nil, coded("ERR_CONNECT", host, "STAGE", err)
+		if merr := e.writeReleaseMarker(ctx, t, p, dep); merr != nil {
+			return nil, coded("ERR_CONNECT", host, "STAGE", merr)
 		}
 	}
 
