@@ -2,6 +2,8 @@
 package layout
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
@@ -65,14 +67,53 @@ func NewPaths(osKind spec.OSKind, installRoot, app, version string) Paths {
 	return p
 }
 
-// BuiltinEnv is merged UNDER spec environment (spec wins) — DESIGN §9.1.
-func BuiltinEnv(app, version string, p Paths) map[string]string {
-	return map[string]string{
+// Dirs returns the release-tree directories that must exist before any op,
+// in creation order (DESIGN §9.1). `current` is a junction/symlink and is NOT
+// created here; `manifest.json`/`.lock` are files, not dirs.
+func (p Paths) Dirs() []string {
+	return []string{p.Releases, p.Shared, p.SharedLogs, p.Staging}
+}
+
+// psQuote single-quotes a string for PowerShell (doubling embedded quotes).
+func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+
+// DirScript renders the idempotent directory-creation script for the target OS
+// (DESIGN §9.1): `New-Item -ItemType Directory -Force` on windows, `mkdir -p`
+// on linux. Output is deterministic (fixed dir order) so it can be golden-tested.
+func DirScript(p Paths) string {
+	dirs := p.Dirs()
+	if p.OS == spec.OSWindows {
+		items := make([]string, len(dirs))
+		for i, d := range dirs {
+			items[i] = psQuote(d)
+		}
+		return fmt.Sprintf("foreach($d in @(%s)){ New-Item -ItemType Directory -Force -Path $d | Out-Null }\nexit 0\n",
+			strings.Join(items, ","))
+	}
+	items := make([]string, len(dirs))
+	for i, d := range dirs {
+		items[i] = shQuote(d)
+	}
+	return "mkdir -p " + strings.Join(items, " ") + "\n"
+}
+
+// shQuote single-quotes a string for POSIX sh (closing/escaping embedded quotes).
+func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+
+// nodePort > 0 injects PORT (node_web_app only, per DESIGN §9.1/§9.4); callers
+// pass 0 for every other pattern so PORT is absent.
+func BuiltinEnv(app, version string, p Paths, nodePort int) map[string]string {
+	env := map[string]string{
 		"LD_APP":         app,
 		"LD_VERSION":     version,
 		"LD_RELEASE_DIR": p.Current, // stable path across releases
 		"LD_SHARED_DIR":  p.Shared,
 	}
+	if nodePort > 0 {
+		env["PORT"] = strconv.Itoa(nodePort)
+	}
+	return env
 }
 
 func MergeEnv(builtin, user map[string]string) map[string]string {

@@ -96,7 +96,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (*TestOutcome, e
 		}
 	}
 
-	env := layout.MergeEnv(layout.BuiltinEnv(tr.Metadata.Name, tr.Artifact.Version, p), tr.Runner.Env)
+	env := layout.MergeEnv(layout.BuiltinEnv(tr.Metadata.Name, tr.Artifact.Version, p, 0), tr.Runner.Env)
 	cmdline := runnerCommand(tr)
 	timeout := tr.Runner.EffectiveTimeout()
 	startedAt := time.Now()

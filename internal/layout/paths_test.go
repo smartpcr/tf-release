@@ -37,7 +37,7 @@ func TestLinuxPaths(t *testing.T) {
 
 func TestBuiltinEnvAndMerge(t *testing.T) {
 	p := NewPaths(spec.OSWindows, `C:\deploy`, "app", "1.0.0")
-	env := MergeEnv(BuiltinEnv("app", "1.0.0", p), map[string]string{"MODE": "lab", "LD_APP": "override"})
+	env := MergeEnv(BuiltinEnv("app", "1.0.0", p, 0), map[string]string{"MODE": "lab", "LD_APP": "override"})
 	if env["LD_APP"] != "override" { // spec env wins over builtins
 		t.Errorf("merge precedence: %v", env)
 	}
@@ -46,5 +46,21 @@ func TestBuiltinEnvAndMerge(t *testing.T) {
 	}
 	if env["MODE"] != "lab" {
 		t.Errorf("spec env missing: %v", env)
+	}
+	if _, ok := env["PORT"]; ok {
+		t.Errorf("PORT must be absent for non-node (nodePort=0): %v", env)
+	}
+}
+
+func TestBuiltinEnvNodePort(t *testing.T) {
+	p := NewPaths(spec.OSLinux, "/opt/deploy", "web", "3.1.0")
+	env := BuiltinEnv("web", "3.1.0", p, 8080)
+	if env["PORT"] != "8080" {
+		t.Errorf("node PORT missing/wrong: %v", env)
+	}
+	// spec environment still wins over the builtin PORT.
+	merged := MergeEnv(env, map[string]string{"PORT": "9090"})
+	if merged["PORT"] != "9090" {
+		t.Errorf("spec PORT should win: %v", merged)
 	}
 }

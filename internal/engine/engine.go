@@ -268,7 +268,11 @@ func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spe
 // ---------------------------------------------------------------------------
 
 func releaseCtx(s *spec.Deployment, p layout.Paths) pattern.ReleaseCtx {
-	env := layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, s.Artifact.Version, p), s.Environment)
+	nodePort := 0
+	if s.Pattern.Type == spec.PatternNodeWebApp {
+		nodePort = s.Pattern.Port
+	}
+	env := layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, s.Artifact.Version, p, nodePort), s.Environment)
 	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: s.Artifact.Version,
 		P: p, Spec: s, Env: env}
 }
@@ -456,15 +460,8 @@ func (e *Engine) fetchToStaging(ctx context.Context, t transport.Transport, s *s
 // ---------------------------------------------------------------------------
 
 func ensureLayout(ctx context.Context, t transport.Transport, p layout.Paths) error {
-	dirs := []string{p.Releases, p.Shared, p.SharedLogs, p.Staging}
 	if t.OS() == spec.OSWindows {
-		items := make([]string, len(dirs))
-		for i, d := range dirs {
-			items[i] = psq(d)
-		}
-		script := fmt.Sprintf(`foreach($d in @(%s)){ New-Item -ItemType Directory -Force -Path $d | Out-Null }
-exit 0`, strings.Join(items, ","))
-		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
+		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: layout.DirScript(p), TimeoutSec: 60})
 		if err != nil {
 			return err
 		}
@@ -473,8 +470,7 @@ exit 0`, strings.Join(items, ","))
 		}
 		return nil
 	}
-	script := fmt.Sprintf(`mkdir -p '%s' '%s' '%s' '%s'`, dirs[0], dirs[1], dirs[2], dirs[3])
-	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
+	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: layout.DirScript(p), TimeoutSec: 60})
 	if err != nil {
 		return err
 	}
