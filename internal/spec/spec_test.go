@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -177,6 +178,83 @@ pass_criteria: { exit_codes: [0], min_pass_rate: 1.0 }
 	}
 	if tr.EffectiveWorkRoot(OSWindows) == "" {
 		t.Fatal("work root default missing")
+	}
+}
+
+// Scenario: YAML equals JSON — the same Deployment authored in YAML and in JSON
+// must parse to byte-identical in-memory structs (and identical canonical hash).
+func TestYAMLEqualsJSON(t *testing.T) {
+	const jsonSpec = `{
+  "apiVersion": "labdeploy/v1",
+  "kind": "Deployment",
+  "metadata": { "name": "sample-svc" },
+  "target": {
+    "transport": "winrm",
+    "hosts": ["${var:HOST}"],
+    "os": "windows",
+    "credentials": { "username": "LAB\\deploy", "password_env": "LABDEPLOY_PASSWORD" }
+  },
+  "artifact": {
+    "type": "zip",
+    "version": "1.0.0",
+    "checksum": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source": { "type": "http", "url": "https://x/y.zip" }
+  },
+  "pattern": {
+    "type": "windows_service",
+    "service_name": "SampleSvc",
+    "exe": "bin\\SampleSvc.exe"
+  },
+  "health_check": { "type": "http", "http": { "url": "http://localhost:8080/health" } }
+}`
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	vars := map[string]string{"HOST": "lab-01"}
+	fromYAML, hy, err := ParseDeployment(winSvcYAML, vars, "")
+	if err != nil {
+		t.Fatalf("yaml parse: %v", err)
+	}
+	fromJSON, hj, err := ParseDeployment(jsonSpec, vars, "")
+	if err != nil {
+		t.Fatalf("json parse: %v", err)
+	}
+	if !reflect.DeepEqual(fromYAML, fromJSON) {
+		t.Fatalf("YAML and JSON produced different structs:\n yaml=%+v\n json=%+v", fromYAML, fromJSON)
+	}
+	if hy != hj {
+		t.Fatalf("canonical hash differs across formats: %s vs %s", hy, hj)
+	}
+}
+
+// Scenario: Pattern union decode — pattern.type: windows_service populates the
+// windows_service fields; fields belonging to other union members stay zero/nil.
+func TestPatternUnionDecode(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	d, _, err := ParseDeployment(winSvcYAML, map[string]string{"HOST": "lab-01"}, "")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	p := d.Pattern
+	if p.Type != PatternWindowsService {
+		t.Fatalf("wrong pattern type: %q", p.Type)
+	}
+	if p.ServiceName != "SampleSvc" {
+		t.Fatalf("windows_service member not populated: service_name=%q", p.ServiceName)
+	}
+	// docker_container members must be nil/zero.
+	if p.ContainerName != "" || p.Ports != nil || p.Volumes != nil || p.RunArgs != nil {
+		t.Fatalf("docker_container members leaked: %+v", p)
+	}
+	// node_web_app members must be zero.
+	if p.Entry != "" || p.NodeExe != "" || p.InstallDeps {
+		t.Fatalf("node_web_app members leaked: %+v", p)
+	}
+	// dotnet_api members must be zero.
+	if p.DLL != "" || p.Launcher != "" || p.DotnetExe != "" || p.URLs != "" {
+		t.Fatalf("dotnet_api members leaked: %+v", p)
+	}
+	// cluster_generic_service members must be zero.
+	if p.RoleName != "" || p.StaticAddress != "" || p.PreferredOwner != "" {
+		t.Fatalf("cluster_generic_service members leaked: %+v", p)
 	}
 }
 
