@@ -71,7 +71,7 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 		return nil, err
 	}
 
-	warn, err := AcquireLock(ctx, t, p, lockOwner(), "deploy", s.Strategy.EffectiveLockTimeout())
+	lk, warn, err := AcquireLock(ctx, t, p, lockOwner(), "deploy", s.Strategy.EffectiveLockTimeout())
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +81,7 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	defer func() {
 		rctx, cancel := lockCleanupContext(ctx)
 		defer cancel()
-		ReleaseLock(rctx, t, p)
+		ReleaseLock(rctx, lk)
 	}()
 
 	m, err := ReadManifest(ctx, t, p)
@@ -771,7 +771,7 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 	if err != nil {
 		return err
 	}
-	warn, err := AcquireLock(ctx, t, p, lockOwner(), "destroy", s.Strategy.EffectiveLockTimeout())
+	lk, warn, err := AcquireLock(ctx, t, p, lockOwner(), "destroy", s.Strategy.EffectiveLockTimeout())
 	if err != nil {
 		return err
 	}
@@ -781,11 +781,11 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 	// Release the lock on EVERY post-lock return path — including a failed tree
 	// removal in purge mode, which previously left .lock behind (evaluator
 	// item 2). The detached cleanup context ensures release runs even if ctx is
-	// already canceled (item 3).
+	// already canceled (item 3); release is ownership-safe (compare-and-delete).
 	defer func() {
 		rctx, cancel := lockCleanupContext(ctx)
 		defer cancel()
-		ReleaseLock(rctx, t, p)
+		ReleaseLock(rctx, lk)
 	}()
 	rc := releaseCtx(s, p)
 	if err := pat.Uninstall(ctx, t, rc, mode == "purge"); err != nil {

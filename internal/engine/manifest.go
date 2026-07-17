@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -180,14 +182,101 @@ type lockInfo struct {
 	Owner      string `json:"owner"`
 	Op         string `json:"op"`
 	StartedUTC string `json:"started_utc"`
+	// Token is a per-acquisition nonce that makes each lock instance unique.
+	// Release compares it so a caller only ever deletes ITS OWN lock, never a
+	// successor's that legitimately took over after a timeout (evaluator item 2).
+	Token string `json:"token"`
 }
 
-// AcquireLock performs an atomic create-new; exit 48 signals held. Stale locks (age ≥
-// timeout) are overridden with staleWarn=true.
-func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, owner, op string, timeoutSec int) (staleWarn string, err error) {
-	li, _ := json.Marshal(lockInfo{Owner: owner, Op: op, StartedUTC: time.Now().UTC().Format(time.RFC3339)})
-	b64 := base64.StdEncoding.EncodeToString(li)
+// Lock is the handle returned by AcquireLock. It carries the exact bytes we
+// persisted so ReleaseLock can perform an ownership-safe compare-and-delete.
+type Lock struct {
+	t       transport.Transport
+	paths   layout.Paths
+	content string // exact JSON persisted for this acquisition
+}
+
+func newToken() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fall back to a time-based token; uniqueness is best-effort here.
+		return fmt.Sprintf("t-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// AcquireLock takes the target lock with atomic create-new semantics
+// (DESIGN §13). exit 48 ⇒ held. A held lock is inspected: unparseable metadata
+// or age < timeout ⇒ ERR_LOCKED; a PROVEN stale lock (age ≥ timeout) is taken
+// over ATOMICALLY — the stale file is removed only if it still matches the bytes
+// we read, then the lock is re-created through the SAME exclusive create-new
+// gate, so two racing contenders cannot both win (evaluator item 1). On success
+// it returns a *Lock handle for ownership-safe release.
+func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, owner, op string, timeoutSec int) (lk *Lock, staleWarn string, err error) {
+	li, _ := json.Marshal(lockInfo{
+		Owner: owner, Op: op, StartedUTC: time.Now().UTC().Format(time.RFC3339), Token: newToken(),
+	})
+	content := string(li)
+
+	created, exit, cerr := createLockExclusive(ctx, t, p, content)
+	if cerr != nil {
+		return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", cerr)
+	}
+	if created {
+		return &Lock{t: t, paths: p, content: content}, "", nil
+	}
+	if exit != 48 {
+		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock create failed (exit %d)", exit))
+	}
+
+	// Held: inspect age. A lock may be overridden ONLY when its metadata parses
+	// AND its proven age is >= timeout. Unparseable JSON or an invalid
+	// started_utc is NOT proof of staleness, so we refuse (ERR_LOCKED) rather
+	// than clobber a lock that may still be live (evaluator item 1 / DESIGN §13).
+	raw, ok, rerr := readSmallFile(ctx, t, p.Lock)
+	if rerr != nil || !ok {
+		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock held (unreadable)"))
+	}
+	var existing lockInfo
+	if uerr := json.Unmarshal([]byte(raw), &existing); uerr != nil {
+		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+			fmt.Errorf("lock held with unparseable metadata (refusing to override): %v", uerr))
+	}
+	started, perr := time.Parse(time.RFC3339, existing.StartedUTC)
+	if perr != nil {
+		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+			fmt.Errorf("lock held by %s with unparseable started_utc %q (refusing to override): %v",
+				existing.Owner, existing.StartedUTC, perr))
+	}
+	if time.Since(started) < time.Duration(timeoutSec)*time.Second {
+		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+			fmt.Errorf("held by %s since %s (op=%s)", existing.Owner, existing.StartedUTC, existing.Op))
+	}
+
+	// Proven stale (age >= timeout): atomic takeover. Remove the stale file ONLY
+	// if it still equals the bytes we just read, then re-create through the same
+	// exclusive create-new gate. If another contender wins the race the gate
+	// returns exit 48 and we surface ERR_LOCKED instead of double-owning.
+	won, exit, terr := takeoverLockExclusive(ctx, t, p, raw, content)
+	if terr != nil {
+		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", terr)
+	}
+	if !won {
+		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+			fmt.Errorf("stale lock from %s taken over by a concurrent contender (exit %d)", existing.Owner, exit))
+	}
+	return &Lock{t: t, paths: p, content: content},
+		fmt.Sprintf("stale lock from %s (started %s) overridden on host %s",
+			existing.Owner, existing.StartedUTC, t.Host()), nil
+}
+
+// createLockExclusive runs the atomic create-new. Returns (created, exitCode,
+// transportErr): created=true on exit 0; exitCode==48 signals the file already
+// existed. DESIGN §13: PowerShell `[IO.File]::Open(CreateNew)`, POSIX `set -C`.
+func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Paths, content string) (bool, int, error) {
+	b64 := base64.StdEncoding.EncodeToString([]byte(content))
 	var r transport.Result
+	var err error
 	if t.OS() == spec.OSWindows {
 		script := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
 try { $fs=[IO.File]::Open(%s,'CreateNew'); $b=[Convert]::FromBase64String(%s); $fs.Write($b,0,$b.Length); $fs.Close(); exit 0 }
@@ -198,53 +287,57 @@ catch [System.IO.IOException] { exit 48 }`, psq(p.Root), psq(p.Lock), psq(b64))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {
-		return "", coded("ERR_CONNECT", t.Host(), "LOCK", err)
+		return false, 0, err
 	}
-	if r.ExitCode == 0 {
-		return "", nil
-	}
-	if r.ExitCode != 48 {
-		return "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock create failed: %s", r.Stderr))
-	}
-	// Held: inspect age. A lock may be overridden ONLY when its metadata parses
-	// AND its proven age is >= timeout. Unparseable JSON or an invalid
-	// started_utc is NOT proof of staleness, so we refuse (ERR_LOCKED) rather
-	// than clobber a lock that may still be live (evaluator item 1 / DESIGN §13).
-	raw, ok, rerr := readSmallFile(ctx, t, p.Lock)
-	if rerr != nil || !ok {
-		return "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock held (unreadable)"))
-	}
-	var existing lockInfo
-	if uerr := json.Unmarshal([]byte(raw), &existing); uerr != nil {
-		return "", coded("ERR_LOCKED", t.Host(), "LOCK",
-			fmt.Errorf("lock held with unparseable metadata (refusing to override): %v", uerr))
-	}
-	started, perr := time.Parse(time.RFC3339, existing.StartedUTC)
-	if perr != nil {
-		return "", coded("ERR_LOCKED", t.Host(), "LOCK",
-			fmt.Errorf("lock held by %s with unparseable started_utc %q (refusing to override): %v",
-				existing.Owner, existing.StartedUTC, perr))
-	}
-	if time.Since(started) < time.Duration(timeoutSec)*time.Second {
-		return "", coded("ERR_LOCKED", t.Host(), "LOCK",
-			fmt.Errorf("held by %s since %s (op=%s)", existing.Owner, existing.StartedUTC, existing.Op))
-	}
-	// Proven stale (age >= timeout): overwrite.
-	if werr := writeSmallFile(ctx, t, p.Lock, string(li)); werr != nil {
-		return "", coded("ERR_LOCKED", t.Host(), "LOCK", werr)
-	}
-	return fmt.Sprintf("stale lock from %s (started %s) overridden on host %s",
-		existing.Owner, existing.StartedUTC, t.Host()), nil
+	return r.ExitCode == 0, r.ExitCode, nil
 }
 
-func ReleaseLock(ctx context.Context, t transport.Transport, p layout.Paths) {
+// takeoverLockExclusive removes the stale lock IFF its current bytes still equal
+// expected (guarding against clobbering a successor that already took over),
+// then re-creates via the exclusive create-new gate. Returns (won, exitCode,
+// err); won=true only when THIS caller created the replacement.
+func takeoverLockExclusive(ctx context.Context, t transport.Transport, p layout.Paths, expected, content string) (bool, int, error) {
+	expB64 := base64.StdEncoding.EncodeToString([]byte(expected))
+	newB64 := base64.StdEncoding.EncodeToString([]byte(content))
+	var r transport.Result
+	var err error
 	if t.OS() == spec.OSWindows {
-		_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell,
-			Script: fmt.Sprintf(`Remove-Item -Force -ErrorAction SilentlyContinue %s`, psq(p.Lock)), TimeoutSec: 30})
+		script := fmt.Sprintf(`if(Test-Path %s){ $cur=[Convert]::ToBase64String([IO.File]::ReadAllBytes(%s)); if($cur -eq %s){ Remove-Item -Force %s } }
+try { $fs=[IO.File]::Open(%s,'CreateNew'); $b=[Convert]::FromBase64String(%s); $fs.Write($b,0,$b.Length); $fs.Close(); exit 0 }
+catch [System.IO.IOException] { exit 48 }`,
+			psq(p.Lock), psq(p.Lock), psq(expB64), psq(p.Lock), psq(p.Lock), psq(newB64))
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
+	} else {
+		script := fmt.Sprintf(`if [ -f '%s' ]; then cur=$(base64 < '%s' | tr -d '\n'); if [ "$cur" = '%s' ]; then rm -f '%s'; fi; fi
+(set -C; printf '%%s' '%s' | base64 -d > '%s') 2>/dev/null || exit 48`,
+			p.Lock, p.Lock, expB64, p.Lock, newB64, p.Lock)
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	return r.ExitCode == 0, r.ExitCode, nil
+}
+
+// ReleaseLock removes the lock ONLY if the persisted bytes still match this
+// handle's — an ownership-safe compare-and-delete so a caller that overran the
+// timeout cannot delete a successor's lock that legitimately took over
+// (evaluator item 2 / DESIGN §13). A nil handle is a no-op.
+func ReleaseLock(ctx context.Context, lk *Lock) {
+	if lk == nil || lk.t == nil {
 		return
 	}
-	_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh,
-		Script: fmt.Sprintf(`rm -f '%s'`, p.Lock), TimeoutSec: 30})
+	t := lk.t
+	expB64 := base64.StdEncoding.EncodeToString([]byte(lk.content))
+	if t.OS() == spec.OSWindows {
+		_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 30,
+			Script: fmt.Sprintf(`if(Test-Path %s){ $cur=[Convert]::ToBase64String([IO.File]::ReadAllBytes(%s)); if($cur -eq %s){ Remove-Item -Force -ErrorAction SilentlyContinue %s } }`,
+				psq(lk.paths.Lock), psq(lk.paths.Lock), psq(expB64), psq(lk.paths.Lock))})
+		return
+	}
+	_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, TimeoutSec: 30,
+		Script: fmt.Sprintf(`if [ -f '%s' ]; then cur=$(base64 < '%s' | tr -d '\n'); if [ "$cur" = '%s' ]; then rm -f '%s'; fi; fi`,
+			lk.paths.Lock, lk.paths.Lock, expB64, lk.paths.Lock)})
 }
 
 func psq(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }

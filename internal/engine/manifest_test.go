@@ -2,13 +2,18 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"io"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
 func testPaths() layout.Paths {
@@ -81,10 +86,13 @@ func TestAcquireLockFreshVsStale(t *testing.T) {
 	fresh.files[p.Lock] = []byte(fmt.Sprintf(
 		`{"owner":"ci-runner-7","op":"deploy","started_utc":"%s"}`,
 		time.Now().UTC().Format(time.RFC3339)))
-	warn, err := AcquireLock(context.Background(), fresh, p, "me", "deploy", timeoutSec)
+	lk, warn, err := AcquireLock(context.Background(), fresh, p, "me", "deploy", timeoutSec)
 	var ce *CodedError
 	if err == nil || !asCoded(err, &ce) || ce.Code != "ERR_LOCKED" {
 		t.Fatalf("fresh lock: want ERR_LOCKED, got warn=%q err=%v", warn, err)
+	}
+	if lk != nil {
+		t.Fatalf("fresh lock: no handle expected on ERR_LOCKED, got %+v", lk)
 	}
 	if !strings.Contains(err.Error(), "ci-runner-7") {
 		t.Fatalf("fresh lock error must name the owner, got: %v", err)
@@ -98,9 +106,12 @@ func TestAcquireLockFreshVsStale(t *testing.T) {
 	aged := time.Now().UTC().Add(-time.Duration(timeoutSec+60) * time.Second).Format(time.RFC3339)
 	stale.files[p.Lock] = []byte(fmt.Sprintf(
 		`{"owner":"dead-runner","op":"deploy","started_utc":"%s"}`, aged))
-	warn, err = AcquireLock(context.Background(), stale, p, "me", "deploy", timeoutSec)
+	lk, warn, err = AcquireLock(context.Background(), stale, p, "me", "deploy", timeoutSec)
 	if err != nil {
 		t.Fatalf("stale lock: want override success, got err=%v", err)
+	}
+	if lk == nil {
+		t.Fatal("stale lock: expected a handle after successful takeover")
 	}
 	if warn == "" || !strings.Contains(warn, "stale") || !strings.Contains(warn, "dead-runner") {
 		t.Fatalf("stale lock must emit a WARN naming the prior owner, got: %q", warn)
@@ -131,10 +142,13 @@ func TestAcquireLockUnparseableRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeHost("lab-01")
 			f.files[p.Lock] = []byte(tc.content)
-			warn, err := AcquireLock(context.Background(), f, p, "me", "deploy", tinyTimeout)
+			lk, warn, err := AcquireLock(context.Background(), f, p, "me", "deploy", tinyTimeout)
 			var ce *CodedError
 			if err == nil || !asCoded(err, &ce) || ce.Code != "ERR_LOCKED" {
 				t.Fatalf("want ERR_LOCKED for unparseable lock, got warn=%q err=%v", warn, err)
+			}
+			if lk != nil {
+				t.Fatalf("unparseable lock must not yield a handle, got %+v", lk)
 			}
 			// The original (unparseable) lock must be untouched — no override.
 			if string(f.files[p.Lock]) != tc.content {
@@ -209,7 +223,10 @@ func TestReadStatusPropagatesStatusError(t *testing.T) {
 func TestReleaseLockRunsWithCanceledContext(t *testing.T) {
 	p := testPaths()
 	f := newFakeHost("lab-01")
-	f.files[p.Lock] = []byte(`{"owner":"me","op":"deploy","started_utc":"` + nowRFC3339() + `"}`)
+	lk, _, err := AcquireLock(context.Background(), f, p, "me", "deploy", 900)
+	if err != nil || lk == nil {
+		t.Fatalf("acquire: lk=%v err=%v", lk, err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already canceled
 
@@ -218,9 +235,129 @@ func TestReleaseLockRunsWithCanceledContext(t *testing.T) {
 	if rctx.Err() != nil {
 		t.Fatalf("cleanup context must not inherit cancellation, got %v", rctx.Err())
 	}
-	ReleaseLock(rctx, f, p)
+	ReleaseLock(rctx, lk)
 	if _, held := f.files[p.Lock]; held {
 		t.Fatal("lock not released via detached cleanup context")
+	}
+}
+
+// TestReleaseLockOwnershipSafe is the regression for evaluator item 2: a caller
+// that overran the timeout must NOT delete a successor's lock. ReleaseLock is a
+// compare-and-delete keyed on the exact bytes the caller persisted.
+func TestReleaseLockOwnershipSafe(t *testing.T) {
+	p := testPaths()
+	f := newFakeHost("lab-01")
+	lk, _, err := AcquireLock(context.Background(), f, p, "slow-owner", "deploy", 900)
+	if err != nil || lk == nil {
+		t.Fatalf("acquire: lk=%v err=%v", lk, err)
+	}
+	// A successor legitimately took over after our timeout: overwrite the lock
+	// file with DIFFERENT bytes (a different owner/token).
+	successor := []byte(`{"owner":"successor","op":"deploy","started_utc":"` + nowRFC3339() + `","token":"other"}`)
+	f.files[p.Lock] = successor
+
+	ReleaseLock(context.Background(), lk) // stale owner's release must be a no-op
+	if got, held := f.files[p.Lock]; !held || string(got) != string(successor) {
+		t.Fatalf("ownership-safe release deleted/altered the successor's lock: held=%v got=%s", held, got)
+	}
+}
+
+// TestAcquireLockConcurrentTakeover is the regression for evaluator item 1: two
+// contenders racing to take over the SAME stale lock must yield EXACTLY ONE
+// winner (WARN + handle); the loser gets ERR_LOCKED. The atomic create-new gate
+// is the arbiter — no double-ownership.
+func TestAcquireLockConcurrentTakeover(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			p := lockFakePaths(osk)
+			f := newLockFake(osk)
+			aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+			f.set(p.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+aged+`","token":"stale"}`)
+
+			const timeoutSec = 900
+			type res struct {
+				lk   *Lock
+				warn string
+				err  error
+			}
+			results := make([]res, 2)
+			var wg sync.WaitGroup
+			for i := 0; i < 2; i++ {
+				wg.Add(1)
+				go func(idx int) {
+					defer wg.Done()
+					lk, warn, err := AcquireLock(context.Background(), f, p,
+						fmt.Sprintf("contender-%d", idx), "deploy", timeoutSec)
+					results[idx] = res{lk, warn, err}
+				}(i)
+			}
+			wg.Wait()
+
+			winners, losers := 0, 0
+			for _, r := range results {
+				switch {
+				case r.err == nil && r.lk != nil && strings.Contains(r.warn, "stale"):
+					winners++
+				case r.err != nil && r.lk == nil:
+					var ce *CodedError
+					if !asCoded(r.err, &ce) || ce.Code != "ERR_LOCKED" {
+						t.Fatalf("loser must fail ERR_LOCKED, got %v", r.err)
+					}
+					losers++
+				default:
+					t.Fatalf("ambiguous outcome: lk=%v warn=%q err=%v", r.lk, r.warn, r.err)
+				}
+			}
+			if winners != 1 || losers != 1 {
+				t.Fatalf("want exactly 1 winner + 1 loser, got winners=%d losers=%d", winners, losers)
+			}
+		})
+	}
+}
+
+// TestLockLifecycleLinux is the regression for evaluator item 4: exercise the
+// POSIX `set -C` create-new, exit-48 contention, stale replacement, and
+// ownership-safe release scripts against a Linux fake transport.
+func TestLockLifecycleLinux(t *testing.T) {
+	p := lockFakePaths(spec.OSLinux)
+	f := newLockFake(spec.OSLinux)
+	ctx := context.Background()
+
+	// (a) create-new on a clean host succeeds.
+	lk, warn, err := AcquireLock(ctx, f, p, "runner-a", "deploy", 900)
+	if err != nil || lk == nil || warn != "" {
+		t.Fatalf("linux fresh acquire: lk=%v warn=%q err=%v", lk, warn, err)
+	}
+	if !f.has(p.Lock) {
+		t.Fatal("linux: lock file not created via set -C")
+	}
+
+	// (b) exit-48 contention: a second acquire while held (fresh) ⇒ ERR_LOCKED.
+	lk2, _, err := AcquireLock(ctx, f, p, "runner-b", "deploy", 900)
+	var ce *CodedError
+	if err == nil || lk2 != nil || !asCoded(err, &ce) || ce.Code != "ERR_LOCKED" {
+		t.Fatalf("linux contention: want ERR_LOCKED, got lk=%v err=%v", lk2, err)
+	}
+
+	// (c) ownership-safe release removes our lock.
+	ReleaseLock(ctx, lk)
+	if f.has(p.Lock) {
+		t.Fatal("linux: ownership-safe release did not remove the lock")
+	}
+
+	// (d) stale replacement: plant an aged lock, acquire ⇒ takeover + WARN.
+	aged := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	f.set(p.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+aged+`","token":"stale"}`)
+	lk3, warn, err := AcquireLock(ctx, f, p, "runner-c", "deploy", 900)
+	if err != nil || lk3 == nil {
+		t.Fatalf("linux stale takeover: lk=%v err=%v", lk3, err)
+	}
+	if !strings.Contains(warn, "stale") || !strings.Contains(warn, "dead") {
+		t.Fatalf("linux stale takeover WARN missing: %q", warn)
+	}
+	if !strings.Contains(f.get(p.Lock), `"owner":"runner-c"`) {
+		t.Fatalf("linux stale lock not overwritten: %s", f.get(p.Lock))
 	}
 }
 
@@ -229,13 +366,150 @@ func TestReleaseLockRunsWithCanceledContext(t *testing.T) {
 func TestAcquireLockFreshWins(t *testing.T) {
 	p := testPaths()
 	f := newFakeHost("lab-01")
-	warn, err := AcquireLock(context.Background(), f, p, "me", "deploy", 900)
-	if err != nil || warn != "" {
-		t.Fatalf("uncontended acquire: warn=%q err=%v", warn, err)
+	lk, warn, err := AcquireLock(context.Background(), f, p, "me", "deploy", 900)
+	if err != nil || warn != "" || lk == nil {
+		t.Fatalf("uncontended acquire: lk=%v warn=%q err=%v", lk, warn, err)
 	}
 	if _, held := f.files[p.Lock]; !held {
 		t.Fatal("lock file was not created")
 	}
+}
+
+// ----------------------------------------------------------------------------
+// lockFake: a concurrency-safe fake transport that models the lock primitives
+// for BOTH Windows and Linux script forms, so locking is proven cross-platform
+// (evaluator item 4) and under true goroutine races (evaluator item 1).
+// ----------------------------------------------------------------------------
+
+type lockFake struct {
+	mu    sync.Mutex
+	osk   spec.OSKind
+	files map[string]string
+}
+
+func newLockFake(osk spec.OSKind) *lockFake {
+	return &lockFake{osk: osk, files: map[string]string{}}
+}
+
+func lockFakePaths(osk spec.OSKind) layout.Paths {
+	if osk == spec.OSWindows {
+		return layout.NewPaths(osk, `C:\deploy`, "sample-svc", "1.0.0")
+	}
+	return layout.NewPaths(osk, "/opt/deploy", "sample-svc", "1.0.0")
+}
+
+func (f *lockFake) set(path, content string) { f.mu.Lock(); defer f.mu.Unlock(); f.files[path] = content }
+func (f *lockFake) get(path string) string   { f.mu.Lock(); defer f.mu.Unlock(); return f.files[path] }
+func (f *lockFake) has(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.files[path]
+	return ok
+}
+
+func (f *lockFake) Connect(context.Context) error { return nil }
+func (f *lockFake) Close() error                  { return nil }
+func (f *lockFake) OS() spec.OSKind               { return f.osk }
+func (f *lockFake) Host() string                  { return "node-1" }
+func (f *lockFake) Upload(context.Context, io.Reader, int64, string) error {
+	return nil
+}
+func (f *lockFake) Download(context.Context, string, string) error {
+	return fmt.Errorf("not needed")
+}
+
+var _ transport.Transport = (*lockFake)(nil)
+
+var (
+	lfWinOpen   = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)','CreateNew'\)`)
+	lfWinNewB64 = regexp.MustCompile(`FromBase64String\('([^']*)'\)`)
+	lfWinGuard  = regexp.MustCompile(`\$cur -eq '([^']*)'`)
+	lfWinReadP  = regexp.MustCompile(`ReadAllBytes\('([^']+)'\)`)
+	lfWinRelP   = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
+
+	lfShWriteP = regexp.MustCompile(`base64 -d > '([^']+)'`)
+	lfShNewB64 = regexp.MustCompile(`printf '%s' '([^']*)' \| base64 -d`)
+	lfShGuard  = regexp.MustCompile(`\[ "\$cur" = '([^']*)' \]`)
+	lfShReadP  = regexp.MustCompile(`base64 < '([^']+)'`)
+	lfShRelP   = regexp.MustCompile(`rm -f '([^']+)'`)
+)
+
+func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+func firstGroup(re *regexp.Regexp, s string) (string, bool) {
+	if m := re.FindStringSubmatch(s); m != nil {
+		return m[1], true
+	}
+	return "", false
+}
+
+// Exec models the four lock scripts atomically at the per-Exec granularity — the
+// same guarantee a single remote command execution provides. The create-new
+// path is the exclusive arbiter, so two concurrent takeovers cannot both win.
+func (f *lockFake) Exec(_ context.Context, c transport.Cmd) (transport.Result, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := c.Script
+	win := f.osk == spec.OSWindows
+
+	isCreate := strings.Contains(s, "'CreateNew'") || strings.Contains(s, "set -C")
+	hasGuard := lfWinGuard.MatchString(s) || lfShGuard.MatchString(s)
+	// readSmallFile is the only script that signals absence via exit 3.
+	isRead := strings.Contains(s, "exit 3") && !isCreate
+
+	switch {
+	case isRead:
+		var path string
+		if win {
+			path, _ = firstGroup(lfWinReadP, s)
+		} else {
+			path, _ = firstGroup(lfShReadP, s)
+		}
+		content, ok := f.files[path]
+		if !ok {
+			return transport.Result{ExitCode: 3}, nil
+		}
+		return transport.Result{ExitCode: 0, Stdout: b64(content)}, nil
+
+	case isCreate:
+		var path, newB64, expB64 string
+		if win {
+			path, _ = firstGroup(lfWinOpen, s)
+			newB64, _ = firstGroup(lfWinNewB64, s)
+			expB64, _ = firstGroup(lfWinGuard, s)
+		} else {
+			path, _ = firstGroup(lfShWriteP, s)
+			newB64, _ = firstGroup(lfShNewB64, s)
+			expB64, _ = firstGroup(lfShGuard, s)
+		}
+		// Atomic takeover: conditionally remove the stale file ONLY if unchanged.
+		if hasGuard {
+			if cur, held := f.files[path]; held && b64(cur) == expB64 {
+				delete(f.files, path)
+			}
+		}
+		if _, held := f.files[path]; held {
+			return transport.Result{ExitCode: 48}, nil // exclusive create-new gate
+		}
+		raw, _ := base64.StdEncoding.DecodeString(newB64)
+		f.files[path] = string(raw)
+		return transport.Result{ExitCode: 0}, nil
+
+	case hasGuard: // ownership-safe release (compare-and-delete, no create)
+		var path, expB64 string
+		if win {
+			path, _ = firstGroup(lfWinRelP, s)
+			expB64, _ = firstGroup(lfWinGuard, s)
+		} else {
+			path, _ = firstGroup(lfShRelP, s)
+			expB64, _ = firstGroup(lfShGuard, s)
+		}
+		if cur, held := f.files[path]; held && b64(cur) == expB64 {
+			delete(f.files, path)
+		}
+		return transport.Result{ExitCode: 0}, nil
+	}
+	return transport.Result{ExitCode: 0}, nil
 }
 
 // TestReconcileManifest exercises the DESIGN §10.4 Read-refresh helper directly.

@@ -54,6 +54,14 @@ var reRmOne = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContin
 var reMklink = regexp.MustCompile(`mklink /J "([^"]+)" "([^"]+)"`)
 var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 
+// reTakeoverGuard captures the conditional delete-if-content-matches prefix of
+// the atomic stale-takeover script: `if($cur -eq '<expB64>'){ Remove-Item -Force '<lock>' }`.
+var reTakeoverGuard = regexp.MustCompile(`if\(\$cur -eq '([^']*)'\)\{ Remove-Item -Force '([^']+)'`)
+
+// reCondRelease captures the ownership-safe ReleaseLock script:
+// `if($cur -eq '<expB64>'){ Remove-Item -Force -ErrorAction SilentlyContinue '<lock>' }`.
+var reCondRelease = regexp.MustCompile(`if\(\$cur -eq '([^']*)'\)\{ Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
+
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
 	switch {
@@ -61,10 +69,25 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
-	case reLock.MatchString(s): // AcquireLock CreateNew
+	case reCondRelease.MatchString(s): // ownership-safe ReleaseLock (compare-and-delete)
+		m := reCondRelease.FindStringSubmatch(s)
+		expB64, path := m[1], m[2]
+		if cur, held := f.files[path]; held && base64.StdEncoding.EncodeToString(cur) == expB64 {
+			delete(f.files, path)
+		}
+		return ok(""), nil
+
+	case reLock.MatchString(s): // AcquireLock / stale-takeover CreateNew
 		p := reLock.FindStringSubmatch(s)[1]
+		// Atomic takeover prefix: delete the stale lock ONLY if its current
+		// content still matches the expected bytes (mirrors the real script).
+		if g := reTakeoverGuard.FindStringSubmatch(s); g != nil && g[2] == p {
+			if cur, held := f.files[p]; held && base64.StdEncoding.EncodeToString(cur) == g[1] {
+				delete(f.files, p)
+			}
+		}
 		if _, held := f.files[p]; held {
-			return transport.Result{ExitCode: 48}, nil
+			return transport.Result{ExitCode: 48}, nil // exclusive create-new gate
 		}
 		// content arrives via FromBase64String('<b64>')
 		if m := regexp.MustCompile(`FromBase64String\('([^']*)'\)`).FindStringSubmatch(s); m != nil {

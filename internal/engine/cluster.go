@@ -22,7 +22,7 @@ type clusterCtx struct {
 	tr     map[string]transport.Transport
 	cg     *pattern.ClusterGeneric
 	paths  func(host, version string) layout.Paths // uniform local layout per node
-	locked []string
+	locked []*Lock                                 // in acquisition (hosts) order
 }
 
 func (e *Engine) newClusterCtx(ctx context.Context, s *spec.Deployment) (*clusterCtx, error) {
@@ -56,11 +56,12 @@ func (cc *clusterCtx) closeAll() {
 }
 
 // lockAll acquires node locks in hosts order; on failure releases the ones
-// already held (DESIGN §13 cluster rule).
+// already held in REVERSE order (DESIGN §13 / architecture §2.4 cluster rule:
+// acquire hosts-order, release reverse).
 func (e *Engine) lockAll(ctx context.Context, cc *clusterCtx, op string) error {
 	for _, h := range cc.hosts {
 		p := cc.paths(h, cc.s.Artifact.Version)
-		warn, err := AcquireLock(ctx, cc.tr[h], p, lockOwner(), op, cc.s.Strategy.EffectiveLockTimeout())
+		lk, warn, err := AcquireLock(ctx, cc.tr[h], p, lockOwner(), op, cc.s.Strategy.EffectiveLockTimeout())
 		if err != nil {
 			e.unlockAll(ctx, cc)
 			return err
@@ -68,18 +69,19 @@ func (e *Engine) lockAll(ctx context.Context, cc *clusterCtx, op string) error {
 		if warn != "" {
 			e.warnf("%s", warn)
 		}
-		cc.locked = append(cc.locked, h)
+		cc.locked = append(cc.locked, lk)
 	}
 	return nil
 }
 
 func (e *Engine) unlockAll(ctx context.Context, cc *clusterCtx) {
 	// Detach from ctx cancellation so cluster cleanup releases every held node
-	// lock even when the operation was canceled/timed out (evaluator item 3).
+	// lock even when the operation was canceled/timed out (evaluator item 3),
+	// and release in REVERSE acquisition order (DESIGN §13, evaluator item 3).
 	rctx, cancel := lockCleanupContext(ctx)
 	defer cancel()
-	for _, h := range cc.locked {
-		ReleaseLock(rctx, cc.tr[h], cc.paths(h, cc.s.Artifact.Version))
+	for i := len(cc.locked) - 1; i >= 0; i-- {
+		ReleaseLock(rctx, cc.locked[i])
 	}
 	cc.locked = nil
 }
