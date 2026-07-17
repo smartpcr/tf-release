@@ -1375,8 +1375,49 @@ func TestAcquireLockDeadlineCancellationReturnsLocked(t *testing.T) {
 	}
 }
 
+// TestAcquireLockFirstOpTimeoutWithoutContentionIsConnect is the regression for
+// evaluator iter-24 item 1: if the VERY FIRST create merely hangs/times out — the
+// acquisition deadline fires DURING it and NO contention (exit 48/49, casContended)
+// was ever observed — the failure must stay ERR_CONNECT, not be laundered into
+// ERR_LOCKED. The slot is free and the gate is never reported contended; the create
+// simply blocks past the (shrunk) deadline.
+func TestAcquireLockFirstOpTimeoutWithoutContentionIsConnect(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			saved := lockAcquireBudget
+			lockAcquireBudget = 200 * time.Millisecond
+			defer func() { lockAcquireBudget = saved }()
 
-// commands, no spinning — to honor DESIGN §13 "fail fast, <5s, no wait". We assert
+			p := lockFakePaths(osk)
+			f := newLockFake(osk) // slot FREE, gate NEVER reports contention
+			// The first create blocks past the 200ms deadline; the deadline-bound
+			// ctx then cancels the in-flight Exec. No exit 48/49 is ever returned.
+			f.hook = func(op, s string) {
+				if op == "create" {
+					time.Sleep(350 * time.Millisecond)
+				}
+			}
+
+			start := time.Now()
+			lk, _, err := AcquireLock(context.Background(), f, p, "me", "deploy", 900)
+			elapsed := time.Since(start)
+
+			var ce *CodedError
+			if err == nil || lk != nil || !asCoded(err, &ce) || ce.Code != "ERR_CONNECT" {
+				t.Fatalf("a first-op timeout with no observed contention must be ERR_CONNECT, got lk=%v err=%v", lk, err)
+			}
+			if elapsed > 2*time.Second {
+				t.Fatalf("the deadline must bound the hung first op, took %v", elapsed)
+			}
+			if f.has(p.Lock) {
+				t.Fatalf("a never-acquired lock must not be present: %q", f.get(p.Lock))
+			}
+		})
+	}
+}
+
+
 // both a bounded command count and a short elapsed time.
 func TestAcquireLockFastFailsOnLiveLock(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {

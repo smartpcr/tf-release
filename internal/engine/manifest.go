@@ -295,18 +295,30 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		}
 		return ms
 	}
+	// sawContention records whether this acquisition ever OBSERVED lock contention —
+	// a held lock (create exit 48), a create-gate timeout (exit 49), or a
+	// compare-and-replace that lost the exclusive gate (casContended). Only when
+	// contention was actually established may a subsequent deadline/budget
+	// exhaustion be reported as ERR_LOCKED; a bare first-operation hang or transport
+	// timeout that never saw contention stays ERR_CONNECT (evaluator iter-24 item 1).
+	sawContention := false
 	budgetExceeded := func() (*Lock, string, error) {
-		return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
-			fmt.Errorf("lock acquisition exceeded %s budget (gate repeatedly contended)", acquireBudget))
+		if sawContention {
+			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK",
+				fmt.Errorf("lock acquisition exceeded %s budget (gate repeatedly contended)", acquireBudget))
+		}
+		return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK",
+			fmt.Errorf("lock acquisition exceeded %s budget without acquiring or observing contention", acquireBudget))
 	}
-	// acquireErr classifies a transport error from a gate op. When OUR acquisition
-	// deadline fired (actx timed out but the CALLER's ctx did not), the budget was
-	// exhausted by repeated gate contention — that is a lock-contention outcome
-	// (ERR_LOCKED), NOT a connectivity fault, so it must be classified consistently
-	// with the budget-exhaustion path above (evaluator iter-23 item 2). A genuine
-	// transport failure, or the caller cancelling its own ctx, remains ERR_CONNECT.
+	// acquireErr classifies a transport error from a gate op. ERR_LOCKED is reserved
+	// for the case where OUR acquisition deadline fired (actx timed out, the CALLER's
+	// ctx did not) AND we had already ESTABLISHED contention — otherwise a genuine
+	// transport failure, a first-op hang with no observed contention, or the caller
+	// cancelling its own ctx all remain ERR_CONNECT (evaluator iter-23 item 2,
+	// iter-24 item 1).
 	acquireErr := func(execErr error) error {
-		if ctx.Err() == nil && (errors.Is(execErr, context.DeadlineExceeded) || actx.Err() == context.DeadlineExceeded) {
+		deadlineFired := errors.Is(execErr, context.DeadlineExceeded) || actx.Err() == context.DeadlineExceeded
+		if sawContention && ctx.Err() == nil && deadlineFired {
 			return coded("ERR_LOCKED", t.Host(), "LOCK",
 				fmt.Errorf("lock acquisition exceeded %s budget (gate repeatedly contended): %w", acquireBudget, execErr))
 		}
@@ -348,6 +360,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 			// shDirLockPrologue document as retryable, so back off and re-evaluate
 			// within the budget rather than misclassifying it as ERR_CONNECT
 			// (evaluator iter-21 item 2).
+			sawContention = true
 			if attempt < maxAttempts {
 				casBackoff(actx, attempt)
 				continue
@@ -358,6 +371,8 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		if exit != 48 {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", fmt.Errorf("lock create failed (unexpected exit %d)", exit))
 		}
+		// exit 48 ⇒ the lock file is HELD: definitive evidence of lock contention.
+		sawContention = true
 
 		// Held: inspect age. A lock may be overridden ONLY when its metadata
 		// parses AND its proven age is >= timeout. Unparseable JSON, an invalid
@@ -421,6 +436,7 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		case casContended:
 			// A peer holds the exclusive gate right now (transient). Back off and
 			// re-evaluate rather than misreporting it as a mismatch/absence.
+			sawContention = true
 			if attempt < maxAttempts {
 				casBackoff(actx, attempt)
 				continue
