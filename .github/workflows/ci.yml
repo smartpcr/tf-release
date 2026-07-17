@@ -39,9 +39,11 @@ jobs:
         run: make test
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          # Pin the verified golangci-lint v2 release so a future major version
-          # cannot invalidate .golangci.yml (version: "2") and break the gate.
+          # golangci-lint-action v7+ is required to run golangci-lint v2; the v6
+          # action hard-refuses any v2.x version, which would break the DESIGN
+          # sec 20 lint gate before it runs. Pin the verified v2.12.2 release
+          # (schema version: "2" in .golangci.yml) for a reproducible gate.
           version: v2.12.2
           args: --timeout=5m
