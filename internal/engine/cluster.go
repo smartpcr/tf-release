@@ -74,8 +74,12 @@ func (e *Engine) lockAll(ctx context.Context, cc *clusterCtx, op string) error {
 }
 
 func (e *Engine) unlockAll(ctx context.Context, cc *clusterCtx) {
+	// Detach from ctx cancellation so cluster cleanup releases every held node
+	// lock even when the operation was canceled/timed out (evaluator item 3).
+	rctx, cancel := lockCleanupContext(ctx)
+	defer cancel()
 	for _, h := range cc.locked {
-		ReleaseLock(ctx, cc.tr[h], cc.paths(h, cc.s.Artifact.Version))
+		ReleaseLock(rctx, cc.tr[h], cc.paths(h, cc.s.Artifact.Version))
 	}
 	cc.locked = nil
 }

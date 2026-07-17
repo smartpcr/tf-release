@@ -146,6 +146,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "not_installed"): // Status probe
+		if f.fail["status"] {
+			return transport.Result{}, fmt.Errorf("simulated status probe transport failure")
+		}
 		if f.svc == "" {
 			return ok("not_installed"), nil
 		}
@@ -161,6 +164,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(b.String()), nil
 
 	case reRmRecurse.MatchString(s):
+		if f.fail["rmtree"] {
+			return transport.Result{}, fmt.Errorf("simulated recursive removal transport failure")
+		}
 		p := reRmRecurse.FindStringSubmatch(s)[1]
 		for k := range f.files {
 			if strings.HasPrefix(k, p) {

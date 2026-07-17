@@ -206,19 +206,30 @@ catch [System.IO.IOException] { exit 48 }`, psq(p.Root), psq(p.Lock), psq(b64))
 	if r.ExitCode != 48 {
 		return "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock create failed: %s", r.Stderr))
 	}
-	// Held: inspect age.
+	// Held: inspect age. A lock may be overridden ONLY when its metadata parses
+	// AND its proven age is >= timeout. Unparseable JSON or an invalid
+	// started_utc is NOT proof of staleness, so we refuse (ERR_LOCKED) rather
+	// than clobber a lock that may still be live (evaluator item 1 / DESIGN §13).
 	raw, ok, rerr := readSmallFile(ctx, t, p.Lock)
 	if rerr != nil || !ok {
 		return "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock held (unreadable)"))
 	}
 	var existing lockInfo
-	_ = json.Unmarshal([]byte(raw), &existing)
+	if uerr := json.Unmarshal([]byte(raw), &existing); uerr != nil {
+		return "", coded("ERR_LOCKED", t.Host(), "LOCK",
+			fmt.Errorf("lock held with unparseable metadata (refusing to override): %v", uerr))
+	}
 	started, perr := time.Parse(time.RFC3339, existing.StartedUTC)
-	if perr == nil && time.Since(started) < time.Duration(timeoutSec)*time.Second {
+	if perr != nil {
+		return "", coded("ERR_LOCKED", t.Host(), "LOCK",
+			fmt.Errorf("lock held by %s with unparseable started_utc %q (refusing to override): %v",
+				existing.Owner, existing.StartedUTC, perr))
+	}
+	if time.Since(started) < time.Duration(timeoutSec)*time.Second {
 		return "", coded("ERR_LOCKED", t.Host(), "LOCK",
 			fmt.Errorf("held by %s since %s (op=%s)", existing.Owner, existing.StartedUTC, existing.Op))
 	}
-	// stale: overwrite
+	// Proven stale (age >= timeout): overwrite.
 	if werr := writeSmallFile(ctx, t, p.Lock, string(li)); werr != nil {
 		return "", coded("ERR_LOCKED", t.Host(), "LOCK", werr)
 	}
@@ -237,3 +248,13 @@ func ReleaseLock(ctx context.Context, t transport.Transport, p layout.Paths) {
 }
 
 func psq(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+
+// lockCleanupContext returns the context used to release a lock on a deferred
+// cleanup path. It DETACHES from the operation's cancellation/deadline via
+// context.WithoutCancel so that a canceled or timed-out apply/destroy STILL
+// runs the ReleaseLock command (otherwise a canceled ctx would skip cleanup and
+// strand the .lock — evaluator item 3). Request-scoped values are preserved and
+// a bounded timeout guarantees the cleanup itself cannot hang.
+func lockCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+}

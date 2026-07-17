@@ -78,7 +78,11 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	if warn != "" {
 		e.warnf("%s", warn)
 	}
-	defer ReleaseLock(ctx, t, p)
+	defer func() {
+		rctx, cancel := lockCleanupContext(ctx)
+		defer cancel()
+		ReleaseLock(rctx, t, p)
+	}()
 
 	m, err := ReadManifest(ctx, t, p)
 	if err != nil {
@@ -731,7 +735,12 @@ func (e *Engine) ReadStatus(ctx context.Context, s *spec.Deployment) (*Status, e
 		return nil, err
 	}
 	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
-	st, _ := pat.Status(ctx, t, releaseCtx(s, rp))
+	st, serr := pat.Status(ctx, t, releaseCtx(s, rp))
+	if serr != nil {
+		// A failed status probe is a loud refresh failure, not an empty/healthy
+		// service status (evaluator item 5 / DESIGN §10.4).
+		return nil, wrapTransportErr(serr, host, "READ")
+	}
 	out := statusFrom(m, host, st)
 	out.DeployedVersion = deployedVer
 	if s.Pattern.Type == spec.PatternClusterGeneric {
@@ -769,9 +778,17 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 	if warn != "" {
 		e.warnf("%s", warn)
 	}
+	// Release the lock on EVERY post-lock return path — including a failed tree
+	// removal in purge mode, which previously left .lock behind (evaluator
+	// item 2). The detached cleanup context ensures release runs even if ctx is
+	// already canceled (item 3).
+	defer func() {
+		rctx, cancel := lockCleanupContext(ctx)
+		defer cancel()
+		ReleaseLock(rctx, t, p)
+	}()
 	rc := releaseCtx(s, p)
 	if err := pat.Uninstall(ctx, t, rc, mode == "purge"); err != nil {
-		ReleaseLock(ctx, t, p)
 		return err
 	}
 	if mode == "purge" {
@@ -779,10 +796,8 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 	}
 	// unregister: keep releases/shared, drop manifest so Read sees absent.
 	if err := e.removePath(ctx, t, p.Manifest); err != nil {
-		ReleaseLock(ctx, t, p)
 		return err
 	}
-	ReleaseLock(ctx, t, p)
 	return nil
 }
 
