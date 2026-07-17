@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -179,11 +178,6 @@ try { $c.Connect('localhost', %d); if($c.Connected){exit 0} exit 1 } catch { exi
 	}
 	return transport.Cmd{}
 }
-
-// shq POSIX-single-quotes s so it can be embedded safely in an sh script
-// (closes the quote, escapes any embedded quote, reopens). Prevents malformed
-// scripts / command injection from unrestricted spec values.
-func shq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 func truncate(s string, n int) string {
 	if len(s) <= n {
