@@ -295,12 +295,16 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		}
 		return ms
 	}
-	// sawContention records whether this acquisition ever OBSERVED lock contention —
-	// a held lock (create exit 48), a create-gate timeout (exit 49), or a
-	// compare-and-replace that lost the exclusive gate (casContended). Only when
-	// contention was actually established may a subsequent deadline/budget
-	// exhaustion be reported as ERR_LOCKED; a bare first-operation hang or transport
-	// timeout that never saw contention stays ERR_CONNECT (evaluator iter-24 item 1).
+	// sawContention records whether this acquisition ever observed LIVE lock-gate
+	// contention — a create-gate timeout (exit 49) or a compare-and-replace that lost
+	// the exclusive gate (casContended). Only these establish that a peer is actively
+	// holding the gate; the mere EXISTENCE of a lock file (create exit 48, including a
+	// proven-stale one) does NOT, since a stale-takeover swap that then times out is a
+	// transport failure, not gate contention (evaluator iter-25 item 1). Only when
+	// live contention was established may a subsequent deadline/budget exhaustion be
+	// reported as ERR_LOCKED; a bare first-operation hang, a takeover transport
+	// timeout, or any op that never saw exit-49/casContended stays ERR_CONNECT
+	// (evaluator iter-24 item 1, iter-25 item 1).
 	sawContention := false
 	budgetExceeded := func() (*Lock, string, error) {
 		if sawContention {
@@ -371,8 +375,10 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		if exit != 48 {
 			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", fmt.Errorf("lock create failed (unexpected exit %d)", exit))
 		}
-		// exit 48 ⇒ the lock file is HELD: definitive evidence of lock contention.
-		sawContention = true
+		// exit 48 ⇒ the lock file is HELD. This does NOT set sawContention: a held
+		// (possibly stale) file is not proof of LIVE gate contention, so a takeover
+		// that later times out must surface as ERR_CONNECT, not ERR_LOCKED
+		// (evaluator iter-25 item 1).
 
 		// Held: inspect age. A lock may be overridden ONLY when its metadata
 		// parses AND its proven age is >= timeout. Unparseable JSON, an invalid

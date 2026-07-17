@@ -1417,8 +1417,54 @@ func TestAcquireLockFirstOpTimeoutWithoutContentionIsConnect(t *testing.T) {
 	}
 }
 
+// TestAcquireLockStaleTakeoverTimeoutIsConnect is the regression for evaluator
+// iter-25 item 1: a PROVEN-STALE lock is observed (create exit 48, then a readable
+// aged lock), but the compare-and-replace takeover then times out WITHOUT ever
+// returning a gate outcome (casContended). Stale-lock existence is not live gate
+// contention, so this transport timeout must surface as ERR_CONNECT, not ERR_LOCKED.
+func TestAcquireLockStaleTakeoverTimeoutIsConnect(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			saved := lockAcquireBudget
+			lockAcquireBudget = 200 * time.Millisecond
+			defer func() { lockAcquireBudget = saved }()
 
-// both a bounded command count and a short elapsed time.
+			p := lockFakePaths(osk)
+			f := newLockFake(osk)
+			// A proven-stale lock: aged well beyond the timeout, so acquire proceeds
+			// to the takeover replace rather than refusing.
+			aged := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+			f.set(p.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+aged+`","token":"stale"}`)
+			// create(48) and the decision read return promptly; only the takeover
+			// replace blocks past the 200ms deadline, so the deadline fires DURING
+			// casReplace and NO casContended is ever observed.
+			f.hook = func(op, s string) {
+				if op == "casreplace" {
+					time.Sleep(350 * time.Millisecond)
+				}
+			}
+
+			start := time.Now()
+			lk, _, err := AcquireLock(context.Background(), f, p, "taker", "deploy", 900)
+			elapsed := time.Since(start)
+
+			var ce *CodedError
+			if err == nil || lk != nil || !asCoded(err, &ce) || ce.Code != "ERR_CONNECT" {
+				t.Fatalf("a stale-takeover replace timeout (no gate contention) must be ERR_CONNECT, got lk=%v err=%v", lk, err)
+			}
+			if elapsed > 2*time.Second {
+				t.Fatalf("the deadline must bound the hung takeover, took %v", elapsed)
+			}
+			// The stale lock is left intact (the takeover never completed).
+			if !f.has(p.Lock) {
+				t.Fatal("a failed takeover must not have removed the stale lock")
+			}
+		})
+	}
+}
+
+
 func TestAcquireLockFastFailsOnLiveLock(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
