@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"flag"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,13 +8,12 @@ import (
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
 
-// update regenerates the committed golden scripts: `go test ./internal/engine -run Golden -update`.
-var update = flag.Bool("update", false, "update health-check script golden files")
-
 // TestHealthScriptGolden asserts that, for each health_check.type, the script
 // generated for windows and linux matches the committed golden under
 // testdata/health/ and encodes expect_status / expect_body_regex logic
-// (Scenario: "Health script generation").
+// (Scenario: "Health script generation"). The shared `-update` flag that
+// regenerates the golden files is declared once in script_golden_test.go and
+// reused across the engine package's golden tests.
 func TestHealthScriptGolden(t *testing.T) {
 	cases := []struct {
 		name string
