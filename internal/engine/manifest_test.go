@@ -676,6 +676,186 @@ func TestCasDeleteReportsFailure(t *testing.T) {
 	}
 }
 
+// TestCasDistinguishesFailureModes is the regression for evaluator item 1: the
+// CAS primitives must NOT collapse every failure into "absent/contention".
+// A permission/operational failure (exit 71) surfaces as an error; a genuine
+// absence (48) is casAbsent; a transient exclusion contention (49) is
+// casContended — each distinct, on both platforms.
+func TestCasDistinguishesFailureModes(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			pp := lockFakePaths(osk)
+
+			// Operational failure (permission / missing flock) ⇒ error, NOT a
+			// silent absence/contention no-op.
+			for _, primitive := range []string{"casswap", "casdelete"} {
+				f := newLockFake(osk)
+				f.set(pp.Lock, "data")
+				prim := primitive
+				f.failOn = func(op, s string) (transport.Result, error, bool) {
+					if op == prim {
+						return transport.Result{ExitCode: 71, Stderr: "permission denied"}, nil, true
+					}
+					return transport.Result{}, nil, false
+				}
+				var err error
+				if primitive == "casswap" {
+					_, err = casSwap(context.Background(), f, pp.Lock, "data", "new")
+				} else {
+					_, err = casDelete(context.Background(), f, pp.Lock, "data")
+				}
+				if err == nil {
+					t.Fatalf("%s: operational failure (exit 71) must surface as an error", primitive)
+				}
+			}
+
+			// Absence (exit 48) ⇒ casAbsent, no error.
+			f := newLockFake(osk) // no lock file present
+			if oc, err := casDelete(context.Background(), f, pp.Lock, "data"); err != nil || oc != casAbsent {
+				t.Fatalf("absent lock must be casAbsent, got outcome=%d err=%v", oc, err)
+			}
+			// Transient exclusion contention (exit 49) ⇒ casContended, no error.
+			f2 := newLockFake(osk)
+			f2.set(pp.Lock, "data")
+			f2.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "casdelete" {
+					return transport.Result{ExitCode: 49}, nil, true
+				}
+				return transport.Result{}, nil, false
+			}
+			if oc, err := casDelete(context.Background(), f2, pp.Lock, "data"); err != nil || oc != casContended {
+				t.Fatalf("exclusion contention must be casContended, got outcome=%d err=%v", oc, err)
+			}
+		})
+	}
+}
+
+// TestReleaseLockRetriesContention is the regression for evaluator item 2: when a
+// mismatching CAS momentarily holds the exclusive handle (exit 49) while OUR lock
+// is still present, ReleaseLock must NOT report success — it retries, and if the
+// contention persists it surfaces an error (the lock is still ours, undeleted).
+// A contention that clears (49 then 0) must eventually delete and return nil.
+func TestReleaseLockRetriesContention(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			pp := lockFakePaths(osk)
+			content := `{"owner":"me","op":"deploy","started_utc":"` + nowRFC3339() + `","token":"tok"}`
+
+			// (a) Persistent contention: ReleaseLock must return an error, NOT nil,
+			// and the still-owned lock must remain present (never silently released).
+			f := newLockFake(osk)
+			f.set(pp.Lock, content)
+			f.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "casdelete" {
+					return transport.Result{ExitCode: 49}, nil, true // always contended
+				}
+				return transport.Result{}, nil, false
+			}
+			lk := &Lock{t: f, paths: pp, content: content, token: "tok"}
+			if err := ReleaseLock(context.Background(), lk); err == nil {
+				t.Fatal("persistent exclusion contention must be surfaced, not reported as success")
+			}
+			if !f.has(pp.Lock) {
+				t.Fatal("a contended release must not have deleted the still-owned lock")
+			}
+
+			// (b) Contention that clears: 49 twice then real delete ⇒ nil, removed.
+			f2 := newLockFake(osk)
+			f2.set(pp.Lock, content)
+			var n int
+			f2.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "casdelete" && n < 2 {
+					n++
+					return transport.Result{ExitCode: 49}, nil, true
+				}
+				return transport.Result{}, nil, false
+			}
+			lk2 := &Lock{t: f2, paths: pp, content: content, token: "tok"}
+			if err := ReleaseLock(context.Background(), lk2); err != nil {
+				t.Fatalf("a clearing contention must eventually release, got %v", err)
+			}
+			if f2.has(pp.Lock) {
+				t.Fatal("lock not removed after contention cleared")
+			}
+		})
+	}
+}
+
+// TestAcquireLockRecoversEmptyLock is the regression for evaluator item 3: a
+// `.lock` left EMPTY by a writer killed mid-create/replace (crash residue, no live
+// holder) must be RECOVERABLE — AcquireLock takes it over via the content-keyed
+// compare-and-swap and returns a handle with a recovery WARN, rather than being
+// permanently wedged as "unparseable". A NON-empty corrupt file is still refused
+// (covered by TestAcquireLockUnparseableRefused).
+func TestAcquireLockRecoversEmptyLock(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			pp := lockFakePaths(osk)
+			f := newLockFake(osk)
+			f.set(pp.Lock, "") // empty crash residue
+
+			lk, warn, err := AcquireLock(context.Background(), f, pp, "rescuer", "deploy", 900)
+			if err != nil || lk == nil {
+				t.Fatalf("empty crash-residue lock must be recovered, got lk=%v err=%v", lk, err)
+			}
+			if !strings.Contains(warn, "recovered") {
+				t.Fatalf("expected a recovery WARN, got %q", warn)
+			}
+			if !strings.Contains(f.get(pp.Lock), `"owner":"rescuer"`) {
+				t.Fatalf("recovered lock not owned by us: %q", f.get(pp.Lock))
+			}
+		})
+	}
+}
+
+// TestAcquireLockRecoversInterruptedReplacement is the deterministic
+// interruption-during-replacement regression for evaluator item 3. A stale
+// takeover whose casSwap is KILLED (transport error) leaves the canonical `.lock`
+// untouched (crash-safe replacement never truncates in place — POSIX renames a
+// temp, Windows writes-then-truncates), so a SUBSEQUENT AcquireLock still sees the
+// intact stale bytes and takes over cleanly.
+func TestAcquireLockRecoversInterruptedReplacement(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			pp := lockFakePaths(osk)
+			aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+			stale := `{"owner":"dead","op":"deploy","started_utc":"` + aged + `","token":"stale"}`
+			f := newLockFake(osk)
+			f.set(pp.Lock, stale)
+
+			// First takeover is interrupted: casSwap fails once (killed command).
+			var killed bool
+			f.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "casswap" && !killed {
+					killed = true
+					return transport.Result{}, fmt.Errorf("killed mid-replace"), true
+				}
+				return transport.Result{}, nil, false
+			}
+			lk, _, err := AcquireLock(context.Background(), f, pp, "victim", "deploy", 900)
+			if err == nil || lk != nil {
+				t.Fatalf("interrupted takeover must fail, got lk=%v err=%v", lk, err)
+			}
+			// Crash-safe: the canonical lock is NOT truncated/partial — still intact.
+			if got := f.get(pp.Lock); got != stale {
+				t.Fatalf("interrupted replacement left partial/empty lock: %q", got)
+			}
+			// A subsequent acquire (no injection) takes over cleanly.
+			lk2, warn, err2 := AcquireLock(context.Background(), f, pp, "successor", "deploy", 900)
+			if err2 != nil || lk2 == nil {
+				t.Fatalf("retry after interrupted replacement must succeed, got lk=%v err=%v", lk2, err2)
+			}
+			if !strings.Contains(warn, "stale") {
+				t.Fatalf("expected stale-takeover WARN on retry, got %q", warn)
+			}
+		})
+	}
+}
+
 // TestAcquireLockFastFailsOnLiveLock is the regression for evaluator item 5: a
 // genuinely LIVE (non-stale) held lock must be refused promptly — a handful of
 // commands, no spinning — to honor DESIGN §13 "fail fast, <5s, no wait". We assert
@@ -983,8 +1163,8 @@ func firstGroup(re *regexp.Regexp, s string) (string, bool) {
 // create-new gate (`CreateNew`/`set -C`) before a plain temp write.
 func (f *lockFake) classify(s string) string {
 	switch {
-	case strings.Contains(s, "SetLength(0)") ||
-		(strings.Contains(s, "flock -n 9") && strings.Contains(s, "base64 -d > '")):
+	case strings.Contains(s, "[IO.FileShare]::None") ||
+		(strings.Contains(s, "flock -n 9") && strings.Contains(s, `mv -f "$tmp"`)):
 		return "casswap"
 	case strings.Contains(s, "[IO.File]::Delete(") ||
 		(strings.Contains(s, "flock -n 9") && strings.Contains(s, "rm -f '")):
