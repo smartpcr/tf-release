@@ -17,13 +17,20 @@ import (
 )
 
 var (
-	_ resource.Resource              = (*E2ETestResource)(nil)
-	_ resource.ResourceWithConfigure = (*E2ETestResource)(nil)
+	_ resource.Resource                     = (*E2ETestResource)(nil)
+	_ resource.ResourceWithConfigure        = (*E2ETestResource)(nil)
+	_ resource.ResourceWithConfigValidators = (*E2ETestResource)(nil)
 )
 
 func NewE2ETestResource() resource.Resource { return &E2ETestResource{} }
 
 type E2ETestResource struct{ pd *providerData }
+
+// ConfigValidators enforces the VAL-06 exactly-one-of(spec, spec_file) rule at
+// the Terraform config layer (DESIGN §14).
+func (r *E2ETestResource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
+	return []resource.ConfigValidator{exactlyOneOfSpecValidator{}}
+}
 
 type e2eModel struct {
 	ID                types.String `tfsdk:"id"`
@@ -117,13 +124,13 @@ func (r *E2ETestResource) resolveSpec(ctx context.Context, m *e2eModel) (*spec.T
 	}
 	t, _, err := spec.ParseTestRunLenient(raw, vars)
 	if err != nil {
-		return nil, fmt.Errorf("[ERR_SPEC_INVALID] %w", err)
+		return nil, err // already [ERR_SPEC_INVALID]-coded by the spec package
 	}
 	if r.pd != nil && r.pd.DefaultTarget != nil {
 		spec.MergeTargetDefaults(&t.Target, r.pd.DefaultTarget)
 	}
 	if err := spec.ValidateTestRun(t); err != nil { // validate post-merge (DESIGN §6.2)
-		return nil, fmt.Errorf("[ERR_SPEC_INVALID] %w", err)
+		return nil, err // already [ERR_SPEC_INVALID]-coded
 	}
 	return t, nil
 }

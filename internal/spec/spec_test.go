@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -64,8 +65,14 @@ func TestSubstituteAndParse(t *testing.T) {
 
 func TestSubstituteMissingVar(t *testing.T) {
 	_, _, err := ParseDeployment(winSvcYAML, nil, "")
-	if err == nil || !strings.Contains(err.Error(), "HOST") {
-		t.Fatalf("want missing-var error naming HOST, got %v", err)
+	if err == nil {
+		t.Fatal("want missing-var error")
+	}
+	// DESIGN §6.6 contract: `unresolved variable NAME at <json-path>`, coded.
+	for _, frag := range []string{"[ERR_SPEC_INVALID]", "unresolved variable HOST", "at target.hosts[0]"} {
+		if !strings.Contains(err.Error(), frag) {
+			t.Fatalf("missing-var error missing %q: got %v", frag, err)
+		}
 	}
 }
 
@@ -79,7 +86,7 @@ func TestSubstituteEscape(t *testing.T) {
 	}
 }
 
-func TestUnknownFieldRejected(t *testing.T) { // VAL-02
+func TestUnknownFieldRejected(t *testing.T) { // schema strictness (DisallowUnknownFields)
 	bad := strings.Replace(winSvcYAML, "health_check:", "health_checkk:", 1)
 	t.Setenv("LABDEPLOY_PASSWORD", "x")
 	_, _, err := ParseDeployment(bad, map[string]string{"HOST": "h"}, "")
@@ -88,7 +95,7 @@ func TestUnknownFieldRejected(t *testing.T) { // VAL-02
 	}
 }
 
-func TestChecksumRequiredForZip(t *testing.T) { // VAL-04
+func TestChecksumRequiredForZip(t *testing.T) { // checksum required for zip (VAL-05 covers md5 format)
 	bad := strings.Replace(winSvcYAML,
 		`checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`, "", 1)
 	t.Setenv("LABDEPLOY_PASSWORD", "x")
@@ -98,7 +105,7 @@ func TestChecksumRequiredForZip(t *testing.T) { // VAL-04
 	}
 }
 
-func TestPatternOSMatrix(t *testing.T) { // VAL-06
+func TestPatternOSMatrix(t *testing.T) { // VAL-03: windows_service on linux (§14 matrix)
 	bad := strings.Replace(winSvcYAML, "os: windows", "os: linux", 1)
 	t.Setenv("LABDEPLOY_PASSWORD", "x")
 	_, _, err := ParseDeployment(bad, map[string]string{"HOST": "h"}, "")
@@ -107,7 +114,7 @@ func TestPatternOSMatrix(t *testing.T) { // VAL-06
 	}
 }
 
-func TestClusterHostsMin(t *testing.T) { // VAL-07
+func TestClusterHostsMin(t *testing.T) { // VAL-04: cluster pattern with 1 host
 	y := `
 apiVersion: labdeploy/v1
 kind: Deployment
@@ -139,8 +146,89 @@ health_check: { type: none }
 func TestMissingEnvVarNamed(t *testing.T) { // VAL-08: env presence checked pre-dial
 	y := strings.Replace(winSvcYAML, "LABDEPLOY_PASSWORD", "DEFINITELY_NOT_SET_ABC123", 1)
 	_, _, err := ParseDeployment(y, map[string]string{"HOST": "h"}, "")
-	if err == nil || !strings.Contains(err.Error(), "DEFINITELY_NOT_SET_ABC123") {
-		t.Fatalf("must name the missing env var, got %v", err)
+	if err == nil {
+		t.Fatal("must reject unset env var")
+	}
+	// DESIGN §11: `env var <NAME> referenced by <path> is not set`, naming the
+	// exact JSON path (target.credentials.password_env), coded ERR_SPEC_INVALID.
+	for _, frag := range []string{
+		"[ERR_SPEC_INVALID]",
+		"env var DEFINITELY_NOT_SET_ABC123",
+		"referenced by target.credentials.password_env",
+		"is not set",
+	} {
+		if !strings.Contains(err.Error(), frag) {
+			t.Fatalf("env-var error missing %q: got %v", frag, err)
+		}
+	}
+}
+
+// TestEnvVarPathsDistinct proves each credential/auth/account env reference is
+// reported with its own precise JSON path (evaluator feedback item 2).
+func TestEnvVarPathsDistinct(t *testing.T) {
+	cases := []struct {
+		name  string
+		yaml  string
+		unset string // env name that will be missing
+		path  string // exact JSON path expected in the error
+	}{
+		{
+			name: "ssh private_key_env",
+			yaml: `
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: keyed }
+target:
+  transport: ssh
+  hosts: ["h1"]
+  os: linux
+  credentials: { username: deploy, private_key_env: MISSING_PK_ENV_1 }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  source: { type: http, url: "https://x/y.zip" }
+pattern: { type: console_app, exe: app }
+health_check: { type: none }
+`,
+			unset: "MISSING_PK_ENV_1",
+			path:  "target.credentials.private_key_env",
+		},
+		{
+			name: "artifact source auth token_env",
+			yaml: `
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: authed }
+target:
+  transport: local
+  hosts: ["localhost"]
+  os: linux
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  source: { type: http, url: "https://x/y.zip", auth: { token_env: MISSING_TOKEN_ENV_1 } }
+pattern: { type: console_app, exe: app }
+health_check: { type: none }
+`,
+			unset: "MISSING_TOKEN_ENV_1",
+			path:  "artifact.source.auth.token_env",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_ = os.Unsetenv(c.unset)
+			_, _, err := ParseDeployment(c.yaml, nil, "")
+			if err == nil {
+				t.Fatalf("want error for unset %s", c.unset)
+			}
+			for _, frag := range []string{"[ERR_SPEC_INVALID]", "env var " + c.unset, "referenced by " + c.path, "is not set"} {
+				if !strings.Contains(err.Error(), frag) {
+					t.Fatalf("error missing %q: got %v", frag, err)
+				}
+			}
+		})
 	}
 }
 
@@ -436,5 +524,184 @@ func TestMergeTargetDefaults(t *testing.T) {
 	}
 	if d.Target.Credentials.Username != "LAB\\svc" {
 		t.Fatal("merge did not apply username")
+	}
+}
+
+func TestFilesPathTraversalRejected(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	base, _, err := ParseDeployment(winSvcYAML, map[string]string{"HOST": "lab-01"}, "")
+	if err != nil {
+		t.Fatalf("base parse: %v", err)
+	}
+
+	// A plain relative path passes.
+	base.Files = []RenderedFile{{Path: "config/app.json", Content: "{}"}}
+	if err := ValidateDeployment(base); err != nil {
+		t.Fatalf("relative path should pass: %v", err)
+	}
+
+	bad := []string{
+		"/etc/x",           // POSIX absolute
+		`C:\x`,             // Windows drive-letter absolute
+		"C:/x",             // Windows drive-letter absolute, forward slash
+		`\host\share\x`,    // Windows root-relative / UNC
+		"../escape",        // parent traversal
+		"a/../../escape",   // nested traversal
+		`sub\..\..\escape`, // Windows-separator traversal
+		`C:..\escape`,      // Windows drive-relative traversal (evaluator item 5)
+		"C:x",              // Windows drive-relative (volume-anchored)
+	}
+	for _, p := range bad {
+		base.Files = []RenderedFile{{Path: p, Content: "x"}}
+		err := ValidateDeployment(base)
+		if err == nil {
+			t.Fatalf("path %q must be rejected", p)
+		}
+		if !strings.Contains(err.Error(), "files[0].path") {
+			t.Fatalf("path %q: error must name files[0].path, got %v", p, err)
+		}
+	}
+}
+
+func TestFilesPathEmptyRejected(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	base, _, err := ParseDeployment(winSvcYAML, map[string]string{"HOST": "lab-01"}, "")
+	if err != nil {
+		t.Fatalf("base parse: %v", err)
+	}
+	base.Files = []RenderedFile{{Path: "", Content: "x"}}
+	err = ValidateDeployment(base)
+	if err == nil || !strings.Contains(err.Error(), "files[0].path") {
+		t.Fatalf("empty path must be rejected naming files[0].path, got %v", err)
+	}
+}
+
+// clusterOneHostYAML is a cluster_generic_service spec with a single host —
+// below the 2..16 requirement (VAL-04).
+const clusterOneHostYAML = `
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: clu1 }
+target:
+  transport: winrm
+  hosts: ["only-node"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  source: { type: http, url: "https://x/y.zip" }
+pattern:
+  type: cluster_generic_service
+  service_name: S
+  role_name: R
+  exe: s.exe
+health_check: { type: none }
+`
+
+// dockerWinSvcYAML pairs artifact.type docker_image with a non-docker pattern —
+// forbidden by the artifact×pattern matrix (VAL-09).
+const dockerWinSvcYAML = `
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: dk }
+target:
+  transport: winrm
+  hosts: ["h1"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: docker_image
+  version: 1.0.0
+  source: { type: docker_registry, image: "repo/img:tag" }
+pattern:
+  type: windows_service
+  service_name: S
+  exe: s.exe
+health_check: { type: none }
+`
+
+// TestValidationMatrix exercises the DESIGN §14 VAL-01..VAL-09 contract. Each
+// invalid spec must fail as [ERR_SPEC_INVALID] with the expected JSON path /
+// message fragment. VAL-06 (both `spec` and `spec_file` set) is a provider
+// schema concern, verified in internal/provider (TestVAL06ExactlyOneOfSpec).
+func TestValidationMatrix(t *testing.T) {
+	const sha = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cases := []struct {
+		id        string
+		yaml      string
+		vars      map[string]string
+		setEnv    map[string]string
+		fragments []string
+	}{
+		{
+			id:        "VAL-01 tab-broken YAML",
+			yaml:      "apiVersion: labdeploy/v1\nkind: Deployment\nmetadata:\n\tname: x\n",
+			fragments: []string{"[ERR_SPEC_INVALID]", "line"},
+		},
+		{
+			id:        "VAL-02 missing artifact.version",
+			yaml:      strings.Replace(winSvcYAML, "  version: 1.0.0\n", "", 1),
+			vars:      map[string]string{"HOST": "h"},
+			setEnv:    map[string]string{"LABDEPLOY_PASSWORD": "x"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "artifact.version"},
+		},
+		{
+			id:        "VAL-03 windows_service on linux",
+			yaml:      strings.Replace(winSvcYAML, "os: windows", "os: linux", 1),
+			vars:      map[string]string{"HOST": "h"},
+			setEnv:    map[string]string{"LABDEPLOY_PASSWORD": "x"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "pattern.type", "windows_service", "linux"},
+		},
+		{
+			id:        "VAL-04 cluster one host",
+			yaml:      clusterOneHostYAML,
+			setEnv:    map[string]string{"LABDEPLOY_PASSWORD": "x"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "target.hosts", "2..16"},
+		},
+		{
+			id:        "VAL-05 md5 checksum",
+			yaml:      strings.Replace(winSvcYAML, sha, "md5:deadbeef", 1),
+			vars:      map[string]string{"HOST": "h"},
+			setEnv:    map[string]string{"LABDEPLOY_PASSWORD": "x"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "artifact.checksum"},
+		},
+		{
+			id:        "VAL-07 unresolved variable",
+			yaml:      winSvcYAML,
+			vars:      nil,
+			setEnv:    map[string]string{"LABDEPLOY_PASSWORD": "x"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "unresolved variable HOST", "at target.hosts[0]"},
+		},
+		{
+			id:        "VAL-08 unset env var",
+			yaml:      strings.Replace(winSvcYAML, "LABDEPLOY_PASSWORD", "NEVER_SET_ENV_VAL08", 1),
+			vars:      map[string]string{"HOST": "h"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "env var NEVER_SET_ENV_VAL08", "referenced by target.credentials.password_env", "is not set"},
+		},
+		{
+			id:        "VAL-09 docker_image with windows_service",
+			yaml:      dockerWinSvcYAML,
+			setEnv:    map[string]string{"LABDEPLOY_PASSWORD": "x"},
+			fragments: []string{"[ERR_SPEC_INVALID]", "artifact.type", "docker_image", "docker_container"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.id, func(t *testing.T) {
+			for k, v := range c.setEnv {
+				t.Setenv(k, v)
+			}
+			_ = os.Unsetenv("NEVER_SET_ENV_VAL08")
+			_, _, err := ParseDeployment(c.yaml, c.vars, "")
+			if err == nil {
+				t.Fatalf("%s: expected [ERR_SPEC_INVALID], got nil", c.id)
+			}
+			for _, f := range c.fragments {
+				if !strings.Contains(err.Error(), f) {
+					t.Fatalf("%s: error missing %q: got %v", c.id, f, err)
+				}
+			}
+		})
 	}
 }

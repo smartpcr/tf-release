@@ -19,15 +19,22 @@ import (
 )
 
 var (
-	_ resource.Resource                = (*DeploymentResource)(nil)
-	_ resource.ResourceWithConfigure   = (*DeploymentResource)(nil)
-	_ resource.ResourceWithModifyPlan  = (*DeploymentResource)(nil)
-	_ resource.ResourceWithImportState = (*DeploymentResource)(nil)
+	_ resource.Resource                     = (*DeploymentResource)(nil)
+	_ resource.ResourceWithConfigure        = (*DeploymentResource)(nil)
+	_ resource.ResourceWithModifyPlan       = (*DeploymentResource)(nil)
+	_ resource.ResourceWithImportState      = (*DeploymentResource)(nil)
+	_ resource.ResourceWithConfigValidators = (*DeploymentResource)(nil)
 )
 
 func NewDeploymentResource() resource.Resource { return &DeploymentResource{} }
 
 type DeploymentResource struct{ pd *providerData }
+
+// ConfigValidators enforces the VAL-06 exactly-one-of(spec, spec_file) rule at
+// the Terraform config layer (DESIGN §14).
+func (r *DeploymentResource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
+	return []resource.ConfigValidator{exactlyOneOfSpecValidator{}}
+}
 
 type deploymentModel struct {
 	ID              types.String `tfsdk:"id"`
@@ -102,13 +109,13 @@ func (r *DeploymentResource) resolveSpec(ctx context.Context, m *deploymentModel
 	}
 	d, hash, err := spec.ParseDeploymentLenient(raw, vars, m.VersionOverride.ValueString())
 	if err != nil {
-		return nil, "", fmt.Errorf("[ERR_SPEC_INVALID] %w", err)
+		return nil, "", err // already [ERR_SPEC_INVALID]-coded by the spec package
 	}
 	if r.pd != nil && r.pd.DefaultTarget != nil {
 		spec.MergeTargetDefaults(&d.Target, r.pd.DefaultTarget)
 	}
 	if err := spec.ValidateDeployment(d); err != nil { // validate post-merge (DESIGN §6.2)
-		return nil, "", fmt.Errorf("[ERR_SPEC_INVALID] %w", err)
+		return nil, "", err // already [ERR_SPEC_INVALID]-coded
 	}
 	return d, hash, nil
 }
