@@ -292,7 +292,11 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 		"host": host, "from": s.Artifact.Version, "to": prev, "cause": orig.Error()})
 
 	pp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, prev)
-	rcPrev := releaseCtx(s, pp)
+	// Restore the PREVIOUS release: thread `prev` so LD_VERSION/ReleaseCtx.Version
+	// reflect the version being brought back up, not the failed s.Artifact.Version
+	// (DESIGN §9.1). Otherwise Configure would bake the new version's LD_VERSION
+	// into the restored previous-version service's SCM Environment value.
+	rcPrev := releaseCtxVersion(s, pp, prev)
 	rb := func() error {
 		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rcPrev) }); err != nil {
 			return err
@@ -552,13 +556,29 @@ func isAbsTargetPath(os spec.OSKind, g string) bool {
 	return strings.HasPrefix(g, "/")
 }
 
+// releaseCtx builds the pattern context for a FORWARD operation, whose release
+// version is the spec's desired artifact version (paths and env agree).
 func releaseCtx(s *spec.Deployment, p layout.Paths) pattern.ReleaseCtx {
+	return releaseCtxVersion(s, p, s.Artifact.Version)
+}
+
+// releaseCtxVersion builds the pattern context for the release identified by
+// `version` — the version actually being (re)configured on the target, which is
+// NOT necessarily s.Artifact.Version. layout.Paths carries only the version-
+// independent `current` junction (LD_RELEASE_DIR), so the running version has to
+// be threaded in explicitly. Rollback/restore MUST pass the PREVIOUS version so
+// LD_VERSION (and ReleaseCtx.Version) reflect the running release per DESIGN
+// §9.1: windows_service bakes rc.Env — including LD_VERSION — into the SCM
+// Environment value, so a restored previous-version service would otherwise come
+// up advertising the failed/new version and its /health body `v=<LD_VERSION>`
+// (§18) would be wrong.
+func releaseCtxVersion(s *spec.Deployment, p layout.Paths, version string) pattern.ReleaseCtx {
 	nodePort := 0
 	if s.Pattern.Type == spec.PatternNodeWebApp {
 		nodePort = s.Pattern.Port
 	}
-	env := layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, s.Artifact.Version, p, nodePort), s.Environment)
-	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: s.Artifact.Version,
+	env := layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, version, p, nodePort), s.Environment)
+	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: version,
 		P: p, Spec: s, Env: env}
 }
 
