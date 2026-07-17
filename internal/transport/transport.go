@@ -49,7 +49,7 @@ type Transport interface {
 	Download(ctx context.Context, remote, local string) error
 }
 
-// Coded errors (DESIGN §12) — engine maps these to diagnostics.
+// CodedError is a coded error (DESIGN §12) — the engine maps these to diagnostics.
 type CodedError struct {
 	Code string
 	Err  error

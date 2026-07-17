@@ -7,11 +7,16 @@ OS_ARCH ?= $(shell go env GOOS)_$(shell go env GOARCH)
 
 default: build
 
+# No cgo is a hard build invariant (DESIGN sec 20): the provider must be a
+# statically linked binary with no external runtime dependencies.
 build:
-	go build -ldflags "-X main.version=$(VERSION)" -o bin/$(BIN) .
+	CGO_ENABLED=0 go build -ldflags "-X main.version=$(VERSION)" -o bin/$(BIN) .
+
+tidy:
+	go mod tidy
 
 test:
-	go test ./... -count=1
+	CGO_ENABLED=0 go test ./... -count=1
 
 lint:
 	golangci-lint run

@@ -394,7 +394,7 @@ func (pc *PassCriteria) EffectiveMinPassRate() float64 {
 	return 1.0
 }
 
-// EffectiveWorkRoot: where test packages land (DESIGN §7.1).
+// EffectiveWorkRoot returns where test packages land (DESIGN §7.1).
 func (t *TestRun) EffectiveWorkRoot(os OSKind) string {
 	if t.InstallRoot != "" {
 		return t.InstallRoot

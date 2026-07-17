@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
+
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/pattern"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"

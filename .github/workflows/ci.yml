@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - feature/release
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-lint:
+    name: build / test / lint
+    runs-on: ubuntu-latest
+    env:
+      # No cgo is a hard build invariant (DESIGN sec 20).
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          check-latest: true
+
+      - name: Verify go.sum is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          # golangci-lint-action v7+ is required to run golangci-lint v2; the v6
+          # action hard-refuses any v2.x version, which would break the DESIGN
+          # sec 20 lint gate before it runs. Pin the verified v2.12.2 release
+          # (schema version: "2" in .golangci.yml) for a reproducible gate.
+          version: v2.12.2
+          args: --timeout=5m

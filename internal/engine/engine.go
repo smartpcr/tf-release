@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
+
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/artifact"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/pattern"
@@ -350,7 +351,7 @@ func (e *Engine) stageOnHost(ctx context.Context, t transport.Transport, s *spec
 	}
 	// RENDER: files land in the release dir every apply (DESIGN §6.4).
 	for _, f := range s.Files {
-		dest := layout.Join(t.OS(), p.Release, f.Path)
+		var dest string
 		if t.OS() == spec.OSWindows {
 			dest = p.Release + `\` + strings.ReplaceAll(strings.TrimLeft(f.Path, `\/`), "/", `\`)
 		} else {
@@ -648,7 +649,7 @@ func (e *Engine) pruneReleases(ctx context.Context, t transport.Transport, s *sp
 			continue
 		}
 		var ts int64
-		fmt.Sscanf(parts[1], "%d", &ts)
+		_, _ = fmt.Sscanf(parts[1], "%d", &ts)
 		rels = append(rels, rel{parts[0], ts})
 	}
 	sort.Slice(rels, func(i, j int) bool { return rels[i].ts > rels[j].ts }) // newest first

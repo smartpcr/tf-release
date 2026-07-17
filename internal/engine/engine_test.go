@@ -155,7 +155,7 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		var b strings.Builder
 		i := int64(1000)
 		for d := range f.dirs {
-			b.WriteString(fmt.Sprintf("%s|%d\n", d, i))
+			fmt.Fprintf(&b, "%s|%d\n", d, i)
 			i++
 		}
 		return ok(b.String()), nil
@@ -292,7 +292,7 @@ func TestDeployFreshInstall(t *testing.T) { // WSV-01
 		t.Fatalf("junction: %q", f.current)
 	}
 	// Manifest persisted with success result.
-	m, _ := f.files[`C:\deploy\sample-svc\manifest.json`]
+	m := f.files[`C:\deploy\sample-svc\manifest.json`]
 	if !strings.Contains(string(m), `"current_version": "1.0.0"`) ||
 		!strings.Contains(string(m), `"result": "success"`) {
 		t.Fatalf("manifest: %s\nlog=%s\nfiles=%v", m, strings.Join(f.log, "\n  "), keysOf(f.files))

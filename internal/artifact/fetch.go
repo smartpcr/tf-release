@@ -170,7 +170,7 @@ func UseTargetPull(a *spec.Artifact) bool {
 	return a.Source.Type == "http" || a.Source.Type == "nuget_feed"
 }
 
-// TargetPullScripts return remote scripts that download + sha-verify the
+// TargetPullScriptWindows returns a remote script that downloads + sha-verifies the
 // package into <staging>/pkg.zip. Auth token travels via Cmd.Env only.
 // Exit 41 == ERR_CHECKSUM_MISMATCH per DESIGN §8.3.
 func TargetPullScriptWindows(a *spec.Artifact, stagingPkg string) (script string, env map[string]string, err error) {

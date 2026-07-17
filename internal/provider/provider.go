@@ -9,8 +9,14 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
+
+// Address is the Terraform registry source address the provider server
+// advertises (DESIGN §16.1). main.go serves the provider under this address and
+// the provider test asserts it, keeping the two in sync.
+const Address = "registry.local/smartpcr/labdeploy"
 
 var _ provider.Provider = (*LabDeployProvider)(nil)
 

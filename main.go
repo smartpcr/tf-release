@@ -6,6 +6,7 @@ import (
 	"log"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/provider"
 )
 
@@ -18,7 +19,7 @@ func main() {
 	flag.Parse()
 
 	err := providerserver.Serve(context.Background(), provider.New(version), providerserver.ServeOpts{
-		Address: "registry.local/smartpcr/labdeploy",
+		Address: provider.Address,
 		Debug:   debug,
 	})
 	if err != nil {

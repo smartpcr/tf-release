@@ -149,7 +149,7 @@ type lockInfo struct {
 	StartedUTC string `json:"started_utc"`
 }
 
-// AcquireLock: atomic create-new; exit 48 signals held. Stale locks (age ≥
+// AcquireLock performs an atomic create-new; exit 48 signals held. Stale locks (age ≥
 // timeout) are overridden with staleWarn=true.
 func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, owner, op string, timeoutSec int) (staleWarn string, err error) {
 	li, _ := json.Marshal(lockInfo{Owner: owner, Op: op, StartedUTC: time.Now().UTC().Format(time.RFC3339)})
