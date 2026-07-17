@@ -54,13 +54,11 @@ var reRmOne = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContin
 var reMklink = regexp.MustCompile(`mklink /J "([^"]+)" "([^"]+)"`)
 var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 
-// reTakeoverGuard captures the conditional delete-if-content-matches prefix of
-// the atomic stale-takeover script: `if($cur -eq '<expB64>'){ Remove-Item -Force '<lock>' }`.
-var reTakeoverGuard = regexp.MustCompile(`if\(\$cur -eq '([^']*)'\)\{ Remove-Item -Force '([^']+)'`)
-
-// reCondRelease captures the ownership-safe ReleaseLock script:
-// `if($cur -eq '<expB64>'){ Remove-Item -Force -ErrorAction SilentlyContinue '<lock>' }`.
-var reCondRelease = regexp.MustCompile(`if\(\$cur -eq '([^']*)'\)\{ Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
+// reMove captures the atomic rename primitive used by claimByRename/restoreLock:
+// `[IO.File]::Move('<from>','<to>')`. The trailing catch code distinguishes a
+// seize (`catch { exit 3 }`, source-gone tolerant) from a no-replace restore
+// (`catch { exit 1 }`, dest-exists tolerant).
+var reMove = regexp.MustCompile(`\[IO\.File\]::Move\('([^']+)','([^']+)'\)`)
 
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
@@ -69,23 +67,24 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
-	case reCondRelease.MatchString(s): // ownership-safe ReleaseLock (compare-and-delete)
-		m := reCondRelease.FindStringSubmatch(s)
-		expB64, path := m[1], m[2]
-		if cur, held := f.files[path]; held && base64.StdEncoding.EncodeToString(cur) == expB64 {
-			delete(f.files, path)
-		}
-		return ok(""), nil
-
-	case reLock.MatchString(s): // AcquireLock / stale-takeover CreateNew
-		p := reLock.FindStringSubmatch(s)[1]
-		// Atomic takeover prefix: delete the stale lock ONLY if its current
-		// content still matches the expected bytes (mirrors the real script).
-		if g := reTakeoverGuard.FindStringSubmatch(s); g != nil && g[2] == p {
-			if cur, held := f.files[p]; held && base64.StdEncoding.EncodeToString(cur) == g[1] {
-				delete(f.files, p)
+	case reMove.MatchString(s): // claimByRename (seize) / restoreLock (no-replace)
+		m := reMove.FindStringSubmatch(s)
+		from, to := m[1], m[2]
+		if strings.Contains(s, "catch { exit 1 }") { // restore: fail if dest exists
+			if _, exists := f.files[to]; exists {
+				return transport.Result{ExitCode: 1}, nil
 			}
 		}
+		src, exists := f.files[from]
+		if !exists { // source gone: another contender seized it first
+			return transport.Result{ExitCode: 3}, nil
+		}
+		f.files[to] = src
+		delete(f.files, from)
+		return ok(""), nil
+
+	case reLock.MatchString(s): // AcquireLock create-new (exclusive gate)
+		p := reLock.FindStringSubmatch(s)[1]
 		if _, held := f.files[p]; held {
 			return transport.Result{ExitCode: 48}, nil // exclusive create-new gate
 		}

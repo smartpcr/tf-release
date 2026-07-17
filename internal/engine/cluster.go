@@ -75,13 +75,15 @@ func (e *Engine) lockAll(ctx context.Context, cc *clusterCtx, op string) error {
 }
 
 func (e *Engine) unlockAll(ctx context.Context, cc *clusterCtx) {
-	// Detach from ctx cancellation so cluster cleanup releases every held node
-	// lock even when the operation was canceled/timed out (evaluator item 3),
-	// and release in REVERSE acquisition order (DESIGN §13, evaluator item 3).
-	rctx, cancel := lockCleanupContext(ctx)
-	defer cancel()
+	// Release in REVERSE acquisition order (DESIGN §13, evaluator item 3), and
+	// give EACH node its OWN bounded cleanup context detached from ctx
+	// cancellation (evaluator item 3): cluster cleanup must release every held
+	// node lock even when the operation was canceled/timed out, and one slow
+	// release must not consume a shared deadline for the remaining nodes.
 	for i := len(cc.locked) - 1; i >= 0; i-- {
+		rctx, cancel := lockCleanupContext(ctx)
 		ReleaseLock(rctx, cc.locked[i])
+		cancel()
 	}
 	cc.locked = nil
 }
