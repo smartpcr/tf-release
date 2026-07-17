@@ -369,3 +369,44 @@ func TestDockerNotFetchedOnRunner(t *testing.T) {
 		t.Errorf("code = %q, want ERR_ARTIFACT_FETCH", c)
 	}
 }
+
+// UseTargetPull is the fetch-strategy gate for this workstream (DESIGN §8.3):
+// target_pull is the *default* for http/nuget sources, an explicit fetch_mode
+// overrides that default in either direction, and file:// is *always*
+// runner_push. Every rule gets its own case — a regression that flipped the
+// http/nuget default to false would silently fall back to runner_push, making
+// the runner proxy large payloads (the exact thing §8.3 forbids) with no other
+// failing test. The two override cases deliberately use a source whose default
+// is the *opposite* of the override, so they prove fetch_mode actually wins.
+func TestUseTargetPull(t *testing.T) {
+	cases := []struct {
+		name      string
+		fetchMode string
+		srcType   string
+		artType   spec.ArtifactType
+		want      bool
+	}{
+		// Defaults (no fetch_mode): http/nuget pull on the target, all else pushes.
+		{"http default pulls", "", "http", spec.ArtifactZip, true},
+		{"nuget default pulls", "", "nuget_feed", spec.ArtifactNupkg, true},
+		{"file default pushes", "", "file", spec.ArtifactZip, false},
+		{"docker default pushes", "", "docker_registry", spec.ArtifactDocker, false},
+		// Explicit fetch_mode overrides the source default in both directions.
+		{"runner_push overrides http default", "runner_push", "http", spec.ArtifactZip, false},
+		{"target_pull overrides file default", "target_pull", "file", spec.ArtifactZip, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &spec.Artifact{
+				Type:      tc.artType,
+				Version:   "1.0.0",
+				FetchMode: tc.fetchMode,
+				Source:    spec.Source{Type: tc.srcType},
+			}
+			if got := UseTargetPull(a); got != tc.want {
+				t.Errorf("UseTargetPull(fetch_mode=%q, source=%q) = %v, want %v",
+					tc.fetchMode, tc.srcType, got, tc.want)
+			}
+		})
+	}
+}
