@@ -189,4 +189,3 @@ func TestNewTransportFactoryDispatch(t *testing.T) {
 		}
 	})
 }
-
