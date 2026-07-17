@@ -100,7 +100,7 @@ func DirScript(p Paths) string {
 // shQuote single-quotes a string for POSIX sh (closing/escaping embedded quotes).
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-
+// BuiltinEnv is merged UNDER spec environment (spec wins) — DESIGN §9.1.
 // nodePort > 0 injects PORT (node_web_app only, per DESIGN §9.1/§9.4); callers
 // pass 0 for every other pattern so PORT is absent.
 func BuiltinEnv(app, version string, p Paths, nodePort int) map[string]string {

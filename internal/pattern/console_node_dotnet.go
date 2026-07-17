@@ -132,7 +132,12 @@ func (n *NodeWebApp) wrapped(rc ReleaseCtx) ReleaseCtx {
 	for k, v := range rc.Env {
 		out.Env[k] = v
 	}
-	out.Env["PORT"] = strconv.Itoa(p.Port)
+	// rc.Env already carries the §9.1-merged PORT (builtin node port, or the
+	// spec environment value which wins). Only synthesize a fallback when the
+	// merged map has none — never overwrite the spec-provided value.
+	if _, ok := out.Env["PORT"]; !ok && p.Port > 0 {
+		out.Env["PORT"] = strconv.Itoa(p.Port)
+	}
 	return out
 }
 
