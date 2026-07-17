@@ -154,16 +154,21 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, Env: env, TimeoutSec: timeout})
 	}
 	duration := int(time.Since(startedAt).Seconds())
-	if xerr != nil {
-		if strings.Contains(xerr.Error(), "timed out") {
-			return nil, coded("ERR_TIMEOUT", host, "TEST", xerr)
-		}
-		return nil, wrapTransportErr(xerr, host, "TEST")
-	}
 
-	// COLLECT (always) — results dirs + configured logs + event logs.
+	// COLLECT (always) — results dirs + configured logs + event logs. This block
+	// runs even when the runner timed out or the transport failed, so partial
+	// results/logs are captured BEFORE the error is surfaced (DESIGN §5.3
+	// "collection always happens before returning a test-failure error"; E2E-04
+	// "partial logs collected" on runner.timeout_seconds). The timeout/transport
+	// error is surfaced right after the collection block below.
 	dest := tr.Collect.EffectiveDestinationDir(tr.Metadata.Name)
 	if err := os.MkdirAll(dest, 0o755); err != nil {
+		// If the runner already failed, THAT is the primary error and the
+		// missing local results dir is secondary; otherwise the run succeeded
+		// and an uncreatable results dir is itself the failure.
+		if xerr != nil {
+			return nil, testRunErr(xerr, host)
+		}
 		return nil, fmt.Errorf("mkdir results dir %s: %w", dest, err)
 	}
 	var collectWarns []string
@@ -205,6 +210,13 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	_ = os.WriteFile(filepath.Join(dest, "runner-stdout.txt"), []byte(tail(r.Stdout, 200_000)), 0o644)
 	_ = os.WriteFile(filepath.Join(dest, "runner-stderr.txt"), []byte(tail(r.Stderr, 200_000)), 0o644)
 
+	// Best-effort collection has run; NOW surface a runner timeout / transport
+	// failure so an always() publish step still sees the partial results_dir
+	// (DESIGN §5.3; E2E-04). Result parsing and pass evaluation are skipped.
+	if xerr != nil {
+		return nil, testRunErr(xerr, host)
+	}
+
 	out := &TestOutcome{ExitCode: r.ExitCode, ResultsDir: dest, DurationSeconds: duration}
 
 	// PARSE results if a format is configured.
@@ -241,6 +253,16 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	out.Summary = summarize(out, exitOK, rateOK)
 	writeSummaryJSON(dest, tr, out, startedAt)
 	return out, nil
+}
+
+// testRunErr classifies a runner transport failure so it can be surfaced AFTER
+// best-effort collection (DESIGN §5.3; E2E-04): a "timed out" transport error
+// maps to ERR_TIMEOUT, anything else to the standard transport-mapped error.
+func testRunErr(xerr error, host string) error {
+	if strings.Contains(xerr.Error(), "timed out") {
+		return coded("ERR_TIMEOUT", host, "TEST", xerr)
+	}
+	return wrapTransportErr(xerr, host, "TEST")
 }
 
 func summarize(o *TestOutcome, exitOK, rateOK bool) string {
