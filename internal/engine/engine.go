@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/artifact"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/logs"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/pattern"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
@@ -107,6 +109,10 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 		prev = m.CurrentVersion
 	}
 	started := time.Now().UTC()
+	// Best-effort collection of logs.paths + windows_event_logs since operation
+	// start, on EVERY exit path from here (success, staging failure, rollback) —
+	// DESIGN §6.5. No-op when nothing is configured.
+	defer e.collectDeploymentLogs(ctx, t, s, p, started)
 
 	// STAGE / FETCH / CHECKSUM / EXTRACT / RENDER — no live mutation yet.
 	if err := e.stageOnHost(ctx, t, s, p, pat, rc); err != nil {
@@ -225,6 +231,9 @@ func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spe
 		prev = m.CurrentVersion
 		oldImage = m.Extra["image_id"]
 	}
+	// Best-effort log/event collection on every exit path from here (including
+	// image-pull failure) — DESIGN §6.5. No-op when nothing is configured.
+	defer e.collectDeploymentLogs(ctx, t, s, p, started)
 	if err := dc.Pull(ctx, t, rc); err != nil {
 		return nil, err
 	}
@@ -268,6 +277,61 @@ func (e *Engine) deployDocker(ctx context.Context, t transport.Transport, s *spe
 // ---------------------------------------------------------------------------
 // Shared step implementations
 // ---------------------------------------------------------------------------
+
+// collectDeploymentLogs pulls the configured log globs and windows event logs
+// from the target into a run-specific local dir (DESIGN §6.5 logs.paths /
+// logs.windows_event_logs; events `since` = operation start). Relative globs
+// resolve under the app's shared dir (`<app>/shared/`, DESIGN §6.5:339).
+// Best-effort: failures are surfaced as warnings, never fail the operation.
+func (e *Engine) collectDeploymentLogs(ctx context.Context, t transport.Transport,
+	s *spec.Deployment, p layout.Paths, started time.Time) {
+	if len(s.Logs.Paths) == 0 && len(s.Logs.WindowsEventLogs) == 0 {
+		return
+	}
+	dest := filepath.Join("labdeploy-logs", fmt.Sprintf("%s-%d", s.Metadata.Name, started.Unix()))
+	if len(s.Logs.Paths) > 0 {
+		globs := resolveTargetGlobs(t.OS(), p.Shared, s.Logs.Paths)
+		if _, w := logs.CollectFiles(ctx, t, globs, filepath.Join(dest, "logs")); len(w) > 0 {
+			for _, x := range w {
+				e.warnf("%s", x)
+			}
+		}
+	}
+	if len(s.Logs.WindowsEventLogs) > 0 {
+		if _, w := logs.CollectEventLogs(ctx, t, s.Logs.WindowsEventLogs, started, filepath.Join(dest, "events")); len(w) > 0 {
+			for _, x := range w {
+				e.warnf("%s", x)
+			}
+		}
+	}
+}
+
+// resolveTargetGlobs resolves each glob against base on the target: absolute
+// globs pass through unchanged; relative globs are joined under base using the
+// target OS separator. Used for deployment logs.paths and TestRun collect.logs
+// (`app_shared_of`).
+func resolveTargetGlobs(os spec.OSKind, base string, globs []string) []string {
+	out := make([]string, 0, len(globs))
+	for _, g := range globs {
+		if isAbsTargetPath(os, g) {
+			out = append(out, g)
+			continue
+		}
+		if os == spec.OSWindows {
+			out = append(out, base+`\`+strings.ReplaceAll(strings.TrimLeft(g, `\/`), "/", `\`))
+		} else {
+			out = append(out, base+"/"+strings.TrimLeft(g, "/"))
+		}
+	}
+	return out
+}
+
+func isAbsTargetPath(os spec.OSKind, g string) bool {
+	if os == spec.OSWindows {
+		return strings.HasPrefix(g, `\\`) || (len(g) >= 2 && g[1] == ':')
+	}
+	return strings.HasPrefix(g, "/")
+}
 
 func releaseCtx(s *spec.Deployment, p layout.Paths) pattern.ReleaseCtx {
 	nodePort := 0

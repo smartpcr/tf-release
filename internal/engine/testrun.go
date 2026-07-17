@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -155,16 +154,21 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, Env: env, TimeoutSec: timeout})
 	}
 	duration := int(time.Since(startedAt).Seconds())
-	if xerr != nil {
-		if strings.Contains(xerr.Error(), "timed out") {
-			return nil, coded("ERR_TIMEOUT", host, "TEST", xerr)
-		}
-		return nil, wrapTransportErr(xerr, host, "TEST")
-	}
 
-	// COLLECT (always) — results dirs + configured logs + event logs.
-	dest := tr.Collect.EffectiveDestinationDir()
+	// COLLECT (always) — results dirs + configured logs + event logs. This block
+	// runs even when the runner timed out or the transport failed, so partial
+	// results/logs are captured BEFORE the error is surfaced (DESIGN §5.3
+	// "collection always happens before returning a test-failure error"; E2E-04
+	// "partial logs collected" on runner.timeout_seconds). The timeout/transport
+	// error is surfaced right after the collection block below.
+	dest := tr.Collect.EffectiveDestinationDir(tr.Metadata.Name)
 	if err := os.MkdirAll(dest, 0o755); err != nil {
+		// If the runner already failed, THAT is the primary error and the
+		// missing local results dir is secondary; otherwise the run succeeded
+		// and an uncreatable results dir is itself the failure.
+		if xerr != nil {
+			return nil, testRunErr(xerr, host)
+		}
 		return nil, fmt.Errorf("mkdir results dir %s: %w", dest, err)
 	}
 	var collectWarns []string
@@ -177,22 +181,26 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 			resultGlobs = append(resultGlobs, p.Release+"/"+strings.TrimLeft(rp, "/"))
 		}
 	}
-	files, warns := logs.CollectFiles(ctx, t, resultGlobs, filepath.Join(dest, "results"))
+	// CollectFiles extracts the archive itself (preserving relative paths) and
+	// returns the result files; parse them by walking the whole results tree.
+	_, warns := logs.CollectFiles(ctx, t, resultGlobs, filepath.Join(dest, "results"))
 	collectWarns = append(collectWarns, warns...)
-	localResults := filepath.Join(dest, "results", sanitizeHost(host))
-	if len(files) > 0 {
-		if err := unpackLocal(files[0], localResults); err != nil {
-			collectWarns = append(collectWarns, fmt.Sprintf("unpack results: %v", err))
-		}
-	}
-	// 2. Extra log globs.
+	localResults := filepath.Join(dest, "results")
+	// 2. Extra log globs — CollectFiles extracts them into results_dir/logs/<host>/.
+	// Relative globs resolve under the named deployment's shared dir when
+	// `collect.app_shared_of` is set (DESIGN §7:373); absolute globs pass through.
 	if len(tr.Collect.Logs) > 0 {
-		_, w := logs.CollectFiles(ctx, t, tr.Collect.Logs, filepath.Join(dest, "logs"))
+		logGlobs := tr.Collect.Logs
+		if tr.Collect.AppSharedOf != "" {
+			sp := layout.NewPaths(t.OS(), tr.EffectiveWorkRoot(t.OS()), tr.Collect.AppSharedOf, "")
+			logGlobs = resolveTargetGlobs(t.OS(), sp.Shared, tr.Collect.Logs)
+		}
+		_, w := logs.CollectFiles(ctx, t, logGlobs, filepath.Join(dest, "logs"))
 		collectWarns = append(collectWarns, w...)
 	}
 	// 3. Windows event logs since test start.
 	if len(tr.Collect.WindowsEventLogs) > 0 {
-		_, w := logs.CollectEventLogs(ctx, t, tr.Collect.WindowsEventLogs, startedAt.Add(-time.Minute), filepath.Join(dest, "events"))
+		_, w := logs.CollectEventLogs(ctx, t, tr.Collect.WindowsEventLogs, startedAt, filepath.Join(dest, "events"))
 		collectWarns = append(collectWarns, w...)
 	}
 	for _, w := range collectWarns {
@@ -202,11 +210,18 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	_ = os.WriteFile(filepath.Join(dest, "runner-stdout.txt"), []byte(tail(r.Stdout, 200_000)), 0o644)
 	_ = os.WriteFile(filepath.Join(dest, "runner-stderr.txt"), []byte(tail(r.Stderr, 200_000)), 0o644)
 
+	// Best-effort collection has run; NOW surface a runner timeout / transport
+	// failure so an always() publish step still sees the partial results_dir
+	// (DESIGN §5.3; E2E-04). Result parsing and pass evaluation are skipped.
+	if xerr != nil {
+		return nil, testRunErr(xerr, host)
+	}
+
 	out := &TestOutcome{ExitCode: r.ExitCode, ResultsDir: dest, DurationSeconds: duration}
 
 	// PARSE results if a format is configured.
 	if f := tr.Results.Format; f == "trx" || f == "junit" {
-		c, matched, perr := logs.SumResults(f, localResults, flatten(tr.Results.Paths))
+		c, matched, perr := logs.SumResults(f, localResults, tr.Results.Paths)
 		if perr != nil {
 			// Missing/corrupt results with format set ⇒ ERR_TEST_FAILED (E2E-06).
 			return out, coded("ERR_TEST_FAILED", host, "TEST",
@@ -240,6 +255,16 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	return out, nil
 }
 
+// testRunErr classifies a runner transport failure so it can be surfaced AFTER
+// best-effort collection (DESIGN §5.3; E2E-04): a "timed out" transport error
+// maps to ERR_TIMEOUT, anything else to the standard transport-mapped error.
+func testRunErr(xerr error, host string) error {
+	if strings.Contains(xerr.Error(), "timed out") {
+		return coded("ERR_TIMEOUT", host, "TEST", xerr)
+	}
+	return wrapTransportErr(xerr, host, "TEST")
+}
+
 func summarize(o *TestOutcome, exitOK, rateOK bool) string {
 	return fmt.Sprintf("passed=%t exit=%d(ok=%t) tests=%d passed=%d failed=%d skipped=%d rate_ok=%t duration=%ds",
 		o.Passed, o.ExitCode, exitOK, o.Total, o.PassedTests, o.FailedTests, o.SkippedTests, rateOK, o.DurationSeconds)
@@ -261,48 +286,9 @@ func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started tim
 	_ = os.WriteFile(filepath.Join(dest, "summary.json"), b, 0o644)
 }
 
-// unpackLocal expands the downloaded logs.zip/tar.gz into dir for parsing.
-func unpackLocal(archive, dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	if strings.HasSuffix(archive, ".zip") {
-		return runLocal("unzip", "-o", "-q", archive, "-d", dir)
-	}
-	return runLocal("tar", "xzf", archive, "-C", dir)
-}
-
-func runLocal(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %v: %v: %s", name, args, err, tail(string(out), 500))
-	}
-	return nil
-}
-
-// flatten strips directory components so globs match against the unpacked
-// flat archive layout (Compress-Archive flattens; tar preserves — match base).
-func flatten(patterns []string) []string {
-	out := make([]string, 0, len(patterns)*2)
-	for _, p := range patterns {
-		out = append(out, p, filepath.Base(p))
-	}
-	return out
-}
-
 func tail(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return s[len(s)-n:]
-}
-
-func sanitizeHost(h string) string {
-	return strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, strings.ToLower(h))
 }
