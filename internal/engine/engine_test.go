@@ -61,11 +61,14 @@ var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 var reCasOpen = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open,\[IO\.FileAccess\]::ReadWrite,\[IO\.FileShare\]::Delete\)`)
 var reCurEq = regexp.MustCompile(`\$cur -eq '([^']*)'`)
 
-// reCasReplace captures the exclusive-handle open used by casReplace
-// (FileShare::None). The single command holds the OS handle, compares the current
-// bytes to `expect`, and rewrites the successor bytes in place (SetLength+Write)
-// with NO intervening absent slot — the atomic stale takeover.
-var reCasReplace = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open,\[IO\.FileAccess\]::ReadWrite,\[IO\.FileShare\]::None\)`)
+// reCasReplace captures the atomic crash-safe compare-and-replace used by
+// casReplace: a per-path Global mutex serializes the compare, then the successor
+// bytes are published by writing a private temp and swapping it in with an atomic
+// [IO.File]::Replace (NTFS transacted, write-through) — NO in-place mutation, so an
+// interruption leaves either the intact stale lock or the intact successor, never
+// a partial/mixed file. reCasReplace captures the destination from the Replace call.
+var reCasReplace = regexp.MustCompile(`\[IO\.File\]::Replace\(\$tmp,'([^']+)',`)
+var reCurNe = regexp.MustCompile(`\$cur -ne '([^']*)'`)
 
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
@@ -74,14 +77,14 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
-	case reCasReplace.MatchString(s): // casReplace exclusive-handle compare-and-replace
+	case reCasReplace.MatchString(s): // casReplace atomic crash-safe compare-and-replace
 		m := reCasReplace.FindStringSubmatch(s)
 		path := m[1]
 		cur, exists := f.files[path]
 		if !exists {
 			return transport.Result{ExitCode: 48}, nil // slot released
 		}
-		em := reCurEq.FindStringSubmatch(s)
+		em := reCurNe.FindStringSubmatch(s)
 		if em == nil || base64.StdEncoding.EncodeToString(cur) != em[1] {
 			return transport.Result{ExitCode: 10}, nil // a fresh successor already installed
 		}

@@ -811,12 +811,17 @@ func TestAcquireLockRefusesEmptyLock(t *testing.T) {
 
 // TestStaleTakeoverIsAtomicReplace proves the takeover shape (evaluator items 1,
 // 2 & 4): a proven-stale lock is overridden by a SINGLE atomic compare-and-replace
-// that swaps our bytes in place of the stale bytes, with the stale-owner WARN
-// preserved. Crucially, there is NO delete-then-recreate gap: the canonical slot
-// is never momentarily absent, so a late newcomer can never slip in and acquire
-// warning-less. If the compare-and-replace itself is killed, the canonical lock
-// stays the INTACT stale bytes (nothing partial), and a subsequent acquire still
-// takes over cleanly.
+// that swaps our bytes for the stale bytes, with the stale-owner WARN preserved.
+// There is NO delete-then-recreate gap: the canonical slot is never momentarily
+// absent, so a late newcomer can never slip in and acquire warning-less.
+//
+// Crash-safety (iter-19 item 1 & 2): part (a) models a crash DURING the actual
+// replacement — the private temp is fully written but the atomic swap never
+// commits (crashReplace) — and asserts the canonical `.lock` is left with the
+// INTACT stale bytes (never truncated/partial), that only a `.mx.` temp is
+// orphaned (never the `.lock` itself), and that a subsequent acquire still takes
+// over cleanly WITH the stale WARN. This exercises the fake's replace path rather
+// than short-circuiting before it, substantiating the interruption claim.
 func TestStaleTakeoverIsAtomicReplace(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
 		osk := osk
@@ -825,25 +830,44 @@ func TestStaleTakeoverIsAtomicReplace(t *testing.T) {
 			aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
 			stale := `{"owner":"dead","op":"deploy","started_utc":"` + aged + `","token":"stale"}`
 
-			// (a) Interrupted replace: the compare-and-replace is killed once. The
-			// canonical lock is left INTACT (never partial/empty), and a retry
-			// takes over cleanly with the stale WARN.
+			// (a) Crash DURING replacement: the compare succeeds and the temp is
+			// written, but the atomic swap never commits. The canonical lock must
+			// remain the INTACT stale bytes; only a `.mx.` temp may be orphaned.
 			f := newLockFake(osk)
 			f.set(pp.Lock, stale)
-			var killed bool
-			f.failOn = func(op, s string) (transport.Result, error, bool) {
-				if op == "casreplace" && !killed {
-					killed = true
-					return transport.Result{}, fmt.Errorf("killed mid-replace"), true
-				}
-				return transport.Result{}, nil, false
-			}
+			f.crashReplace = true
 			lk, _, err := AcquireLock(context.Background(), f, pp, "victim", "deploy", 900)
 			if err == nil || lk != nil {
-				t.Fatalf("interrupted takeover must fail, got lk=%v err=%v", lk, err)
+				t.Fatalf("crashed takeover must fail, got lk=%v err=%v", lk, err)
 			}
 			if got := f.get(pp.Lock); got != stale {
-				t.Fatalf("interrupted replace left a corrupted/partial lock: %q", got)
+				t.Fatalf("crash during replace left a corrupted/partial lock: %q", got)
+			}
+			// The canonical `.lock` is never the thing left partial — any residue
+			// is a uniquely-named `.mx.` temp, which is inert (ignored by acquire).
+			f.mu.Lock()
+			for k, v := range f.files {
+				if k == pp.Lock {
+					continue
+				}
+				if !strings.Contains(k, ".mx.") {
+					f.mu.Unlock()
+					t.Fatalf("unexpected residue %q=%q (only .mx. temps allowed)", k, v)
+				}
+			}
+			f.mu.Unlock()
+
+			// A clean retry against the SAME fake (crash cleared) still takes over.
+			f.crashReplace = false
+			lkR, warnR, errR := AcquireLock(context.Background(), f, pp, "successor", "deploy", 900)
+			if errR != nil || lkR == nil {
+				t.Fatalf("retry after crash must take over, got lk=%v err=%v", lkR, errR)
+			}
+			if !strings.Contains(warnR, "stale") || !strings.Contains(warnR, "dead") {
+				t.Fatalf("retry after crash dropped the stale WARN, got %q", warnR)
+			}
+			if !strings.Contains(f.get(pp.Lock), `"owner":"successor"`) {
+				t.Fatalf("retry after crash did not install our lock: %q", f.get(pp.Lock))
 			}
 
 			// (b) Clean takeover: the compare-and-replace succeeds, the WARN names
@@ -863,6 +887,47 @@ func TestStaleTakeoverIsAtomicReplace(t *testing.T) {
 		})
 	}
 }
+
+// TestWindowsTakeoverScriptIsCrashSafe structurally substantiates evaluator
+// iter-19 items 1 & 2 at the SCRIPT level: it captures the exact Windows
+// compare-and-replace command the engine emits and asserts it (a) publishes via a
+// private temp swapped in with the atomic, crash-safe [IO.File]::Replace, (b)
+// serializes the compare-and-swap with a per-path Global mutex, and (c) NEVER
+// mutates the destination in place — i.e. no SetLength/Position/$fs.Write against
+// the live `.lock` handle that could leave partial/mixed JSON after interruption.
+func TestWindowsTakeoverScriptIsCrashSafe(t *testing.T) {
+	pp := lockFakePaths(spec.OSWindows)
+	aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	stale := `{"owner":"dead","op":"deploy","started_utc":"` + aged + `","token":"stale"}`
+	f := newLockFake(spec.OSWindows)
+	f.set(pp.Lock, stale)
+
+	var replaceScript string
+	f.hook = func(op, s string) {
+		if op == "casreplace" {
+			replaceScript = s
+		}
+	}
+	if _, _, err := AcquireLock(context.Background(), f, pp, "successor", "deploy", 900); err != nil {
+		t.Fatalf("takeover must succeed: %v", err)
+	}
+	if replaceScript == "" {
+		t.Fatal("no Windows compare-and-replace script was captured")
+	}
+	// Crash-safe publish: temp write + atomic Replace.
+	for _, want := range []string{"WriteAllBytes($tmp", "[IO.File]::Replace($tmp,", `Global\labdeploy-lock-`, "$mtx.WaitOne", "$mtx.ReleaseMutex"} {
+		if !strings.Contains(replaceScript, want) {
+			t.Fatalf("Windows replace script missing crash-safe/serialization element %q:\n%s", want, replaceScript)
+		}
+	}
+	// NO in-place mutation of the live destination handle.
+	for _, bad := range []string{"SetLength(", "$fs.Write(", "$fs.Position"} {
+		if strings.Contains(replaceScript, bad) {
+			t.Fatalf("Windows replace script mutates the lock in place (%q) — not crash-safe:\n%s", bad, replaceScript)
+		}
+	}
+}
+
 
 // TestLateNewcomerDuringTakeoverStillWarns is the DISTINCT interleaving demanded
 // by evaluator item 1: a late newcomer B that races a takeover must NOT be able to
@@ -1295,6 +1360,10 @@ type lockFake struct {
 	// execN counts Exec calls (under f.mu) so the fast-fail test can assert a
 	// held-fresh lock is refused in a bounded number of commands (item 5).
 	execN int
+	// crashReplace, when true, makes casreplace model a crash DURING the atomic
+	// replace: the private temp is fully written but the swap never commits, so
+	// the canonical lock keeps its intact prior bytes (crash-safety, iter-19 item 1).
+	crashReplace bool
 }
 
 func newLockFake(osk spec.OSKind) *lockFake {
@@ -1346,6 +1415,9 @@ var (
 	lfCurEqWin   = regexp.MustCompile(`\$cur -eq '([^']*)'`)
 	lfCasPathSh  = regexp.MustCompile(`exec 9<'([^']+)'`)
 	lfCurNeSh    = regexp.MustCompile(`\[ "\$cur" != '([^']*)' \]`)
+	// CAS compare-and-REPLACE (atomic crash-safe stale takeover).
+	lfCasReplaceWin = regexp.MustCompile(`\[IO\.File\]::Replace\(\$tmp,'([^']+)',`)
+	lfCurNeWin      = regexp.MustCompile(`\$cur -ne '([^']*)'`)
 )
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -1358,15 +1430,14 @@ func firstGroup(re *regexp.Regexp, s string) (string, bool) {
 }
 
 // classify maps a lock script to exactly one primitive. Order matters: the CAS
-// compare-and-REPLACE (atomic stale takeover; reuses the exclusive-gate open and
-// base64 fragments) MUST be recognized BEFORE the compare-and-delete, which in
-// turn precedes the plain read/delete cases, and the atomic create-publish
-// (`Move($tmp,...)`/`ln "$tmp"`) before a plain temp write. casreplace is keyed on
-// the in-place `$fs.SetLength(` (Windows) or the temp `mv -f "$tmp"` (POSIX),
+// compare-and-REPLACE (atomic crash-safe stale takeover; reuses ReadAllBytes /
+// WriteAllBytes / FromBase64String fragments) MUST be recognized BEFORE the
+// compare-and-delete, read, create, and write cases. casreplace is keyed on the
+// atomic `[IO.File]::Replace(` (Windows) or the temp `mv -f "$tmp"` (POSIX),
 // neither of which appears in any other primitive.
 func (f *lockFake) classify(s string) string {
 	switch {
-	case strings.Contains(s, "$fs.SetLength(") ||
+	case strings.Contains(s, "[IO.File]::Replace(") ||
 		(strings.Contains(s, "flock -n 9") && strings.Contains(s, `mv -f "$tmp"`)):
 		return "casreplace"
 	case strings.Contains(s, "[IO.File]::Delete(") ||
@@ -1458,11 +1529,11 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.files[path] = string(raw)
 		return transport.Result{ExitCode: 0}, nil
 
-	case "casreplace": // single exclusive-gate compare-and-replace (stale takeover)
+	case "casreplace": // atomic crash-safe compare-and-replace (stale takeover)
 		var path, expB64, newB64 string
 		if win {
-			path, _ = firstGroup(lfCasOpenWin, s)
-			expB64, _ = firstGroup(lfCurEqWin, s)
+			path, _ = firstGroup(lfCasReplaceWin, s)
+			expB64, _ = firstGroup(lfCurNeWin, s)
 			newB64, _ = firstGroup(lfNewB64Win, s)
 		} else {
 			path, _ = firstGroup(lfCasPathSh, s)
@@ -1477,7 +1548,16 @@ func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 			return transport.Result{ExitCode: 10}, nil // a fresh successor already installed
 		}
 		raw, _ := base64.StdEncoding.DecodeString(newB64)
-		f.files[path] = string(raw) // atomic replace: never absent/empty/partial
+		if f.crashReplace {
+			// Model a crash DURING the replace: the private temp is fully written
+			// (an orphan `.mx.` file), but the process dies BEFORE the atomic
+			// [IO.File]::Replace/mv swap commits. The canonical lock is therefore
+			// left UNTOUCHED (the intact stale bytes) — never truncated/partial —
+			// which is exactly the crash-safety contract (evaluator iter-19 item 1).
+			f.files[path+".mx.crash"] = string(raw) // orphan temp, never the .lock
+			return transport.Result{}, fmt.Errorf("crash before atomic replace commit")
+		}
+		f.files[path] = string(raw) // atomic swap: stale bytes -> successor, never partial
 		return transport.Result{ExitCode: 0}, nil
 
 	case "casdelete": // single exclusive-handle compare-and-delete of a HELD lock

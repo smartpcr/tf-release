@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -460,40 +461,57 @@ exit 0`, path, path, path, path, expectB64, path)
 	return classifyCas("compare-and-delete", path, r)
 }
 
-// casReplace performs an atomic compare-and-REPLACE on a proven-stale `.lock`: in
-// a SINGLE exclusive-gate command it swaps `newContent` in place of the exact
-// stale `expect` bytes, so the canonical slot is NEVER absent between removing the
-// stale lock and installing the successor. This closes the delete-then-recreate
-// gap where a late newcomer could create into the empty slot and acquire without
-// the mandated stale WARN (evaluator item 1). Outcomes mirror casDelete: casDone
-// (we installed our successor), casMismatch (a peer already installed FRESH bytes
-// — abort), casAbsent (the slot was released — retry a clean create), casContended
-// (a peer holds the gate right now — retry); any other exit is a Go error.
+// casReplace performs an atomic compare-and-REPLACE on a proven-stale `.lock`: it
+// swaps `newContent` in place of the exact stale `expect` bytes, so the canonical
+// slot is NEVER absent between removing the stale lock and installing the
+// successor. This closes the delete-then-recreate gap where a late newcomer could
+// create into the empty slot and acquire without the mandated stale WARN
+// (evaluator item 1). Outcomes mirror casDelete: casDone (we installed our
+// successor), casMismatch (a peer already installed FRESH bytes — abort), casAbsent
+// (the slot was released — retry a clean create), casContended (a peer holds the
+// gate right now — retry); any other exit is a Go error.
 //
-// Crash-safety note: POSIX replaces via a private temp + atomic `mv -f`, so it is
-// fully crash-safe. Windows cannot rename-replace a handle-held file (a
-// delete-pending name is retained until the handle closes), so it rewrites in
-// place under the exclusive handle (SetLength+Write+Flush). A crash mid-write is
-// scoped ONLY to this rare stale-takeover path; the common create path stays
-// fully temp+publish crash-safe, and a proven-stale lock is already degraded.
+// Crash-safety (evaluator iter-19 item 1): BOTH platforms replace via a private
+// temp that is fully written first and then swapped in with a SINGLE atomic
+// filesystem operation — POSIX `mv -f "$tmp"` (rename) and Windows
+// `[IO.File]::Replace($tmp,dest,$null)` (an NTFS transacted replace with
+// write-through). The canonical `.lock` therefore transitions atomically from the
+// stale bytes to the successor bytes with NO in-place mutation: an interruption at
+// any instant leaves EITHER the intact stale lock (temp orphaned) OR the intact
+// successor lock — never a truncated/partial/mixed JSON that would wedge
+// acquisition. Compare-and-swap atomicity (so two contenders can't both "win") is
+// provided by a per-path OS mutex: POSIX `flock` on the open fd, Windows a
+// `Global\` named mutex. The mutex serializes the read-compare-then-swap critical
+// section across processes; if a holder crashes mid-section the mutex is abandoned
+// (WaitOne throws AbandonedMutexException) and the next acquirer proceeds — the
+// crash-safe atomic swap guarantees the file it observes is never partial.
 func casReplace(ctx context.Context, t transport.Transport, path, expect, newContent string) (casOutcome, error) {
 	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
 	newB64 := base64.StdEncoding.EncodeToString([]byte(newContent))
 	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`try{$fs=[IO.File]::Open(%s,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}
-catch [System.IO.FileNotFoundException]{exit 48}
-catch [System.IO.DirectoryNotFoundException]{exit 48}
-catch [System.IO.IOException]{exit 49}
-catch{exit 71}
+		// Per-path Global mutex serializes the compare-and-swap across processes.
+		sum := sha1.Sum([]byte(path))
+		mutexName := `Global\labdeploy-lock-` + hex.EncodeToString(sum[:])
+		script := fmt.Sprintf(`$mtx=New-Object System.Threading.Mutex($false,%s)
 $rc=99
+$got=$false
+try{$got=$mtx.WaitOne(20000)}catch [System.Threading.AbandonedMutexException]{$got=$true}
+if(-not $got){$mtx.Dispose();exit 49}
 try{
-$len=[int]$fs.Length; $b=New-Object byte[] $len; [void]$fs.Read($b,0,$len)
-$cur=[Convert]::ToBase64String($b)
-if($cur -eq %s){ try{ $nb=[Convert]::FromBase64String(%s); $fs.SetLength($nb.Length); $fs.Position=0; $fs.Write($nb,0,$nb.Length); $fs.Flush($true); $rc=0 }catch{ $rc=17 } } else { $rc=10 }
-} finally { $fs.Close() }
-exit $rc`, psq(path), psq(expectB64), psq(newB64))
+if(-not [IO.File]::Exists(%s)){$rc=48}
+else{
+$cur=[Convert]::ToBase64String([IO.File]::ReadAllBytes(%s))
+if($cur -ne %s){$rc=10}
+else{
+$tmp=%s + '.mx.' + [Guid]::NewGuid().ToString('N')
+try{$nb=[Convert]::FromBase64String(%s); [IO.File]::WriteAllBytes($tmp,$nb); [IO.File]::Replace($tmp,%s,$null); $rc=0}
+catch{Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; $rc=17}
+}
+}
+}finally{$mtx.ReleaseMutex();$mtx.Dispose()}
+exit $rc`, psq(mutexName), psq(path), psq(path), psq(expectB64), psq(path), psq(newB64), psq(path))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
 	} else {
 		script := fmt.Sprintf(`[ -e '%s' ] || exit 48
