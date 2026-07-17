@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -51,33 +52,83 @@ func codeOf(err error) string {
 	return ""
 }
 
-// T5 — Fetch sha verify and 404 (DESIGN ART-02/ART-03, §8.2).
+// isolateTempDir points os.CreateTemp("") at a fresh empty dir for the duration
+// of a subtest, so we can prove the runner temp file is deleted (nothing leaks).
+// Go's os.TempDir consults TMPDIR (unix) and TMP/TEMP (windows); set all three.
+func isolateTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
+	return dir
+}
+
+func countTempPkgs(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read temp dir: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "labdeploy-") {
+			n++
+		}
+	}
+	return n
+}
+
+// T5 — Fetch sha verify, header auth injection, and 404 (DESIGN ART-02/ART-03, §8.2).
 func TestFetchShaVerifyAnd404(t *testing.T) {
 	body, goodHex := sampleZip(t)
 
+	// Large 404 body to prove the diagnostic truncates to the first 256 bytes:
+	// 256 'A' (kept) followed by 300 'B' (must be dropped).
+	notFoundBody := strings.Repeat("A", 256) + strings.Repeat("B", 300)
+
+	const wantAuth = "Bearer s3cr3t-token"
+	var gotAuth string
+	var authHits int
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/pkg.zip", func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		authHits++
 		w.Header().Set("Content-Type", "application/zip")
 		_, _ = w.Write(body)
 	})
 	mux.HandleFunc("/missing.zip", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "no such package", http.StatusNotFound)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(notFoundBody))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	t.Run("good sha passes", func(t *testing.T) {
+	t.Run("good sha passes and injects auth header", func(t *testing.T) {
+		t.Setenv("LD_HTTP_TOKEN", "s3cr3t-token")
 		a := &spec.Artifact{
 			Type:     spec.ArtifactZip,
 			Version:  "1.0.0",
 			Checksum: "sha256:" + goodHex,
-			Source:   spec.Source{Type: "http", URL: srv.URL + "/pkg.zip"},
+			Source: spec.Source{
+				Type: "http",
+				URL:  srv.URL + "/pkg.zip",
+				Auth: spec.SourceAuth{TokenEnv: "LD_HTTP_TOKEN"},
+			},
 		}
+		gotAuth, authHits = "", 0
 		got, err := Fetch(context.Background(), a)
 		if err != nil {
 			t.Fatalf("Fetch: unexpected error: %v", err)
 		}
 		defer os.Remove(got.LocalPath)
+		if authHits != 1 {
+			t.Fatalf("server saw %d requests, want 1", authHits)
+		}
+		if gotAuth != wantAuth {
+			t.Errorf("server received Authorization = %q, want %q", gotAuth, wantAuth)
+		}
 		if got.Sha256 != goodHex {
 			t.Errorf("sha = %s, want %s", got.Sha256, goodHex)
 		}
@@ -89,7 +140,7 @@ func TestFetchShaVerifyAnd404(t *testing.T) {
 		}
 	})
 
-	t.Run("404 yields ERR_ARTIFACT_FETCH with status", func(t *testing.T) {
+	t.Run("404 yields ERR_ARTIFACT_FETCH with status and 256B body", func(t *testing.T) {
 		a := &spec.Artifact{
 			Type:     spec.ArtifactZip,
 			Version:  "1.0.0",
@@ -103,12 +154,25 @@ func TestFetchShaVerifyAnd404(t *testing.T) {
 		if c := codeOf(err); c != "ERR_ARTIFACT_FETCH" {
 			t.Errorf("code = %q, want ERR_ARTIFACT_FETCH", c)
 		}
-		if !strings.Contains(err.Error(), "404") {
+		msg := err.Error()
+		if !strings.Contains(msg, "404") {
 			t.Errorf("error missing status 404: %v", err)
+		}
+		// First 256 bytes ('A'×256) must be present as a contiguous run...
+		if !strings.Contains(msg, strings.Repeat("A", 256)) {
+			t.Errorf("error missing first 256 body bytes: %v", err)
+		}
+		// ...but not a 257th body byte, and nothing from the 'B' run past byte 256.
+		if strings.Contains(msg, strings.Repeat("A", 257)) {
+			t.Errorf("error echoed more than 256 body bytes: %v", err)
+		}
+		if strings.Contains(msg, "B") {
+			t.Errorf("error included body past 256 bytes: %v", err)
 		}
 	})
 
-	t.Run("checksum mismatch deletes temp and codes", func(t *testing.T) {
+	t.Run("checksum mismatch codes and deletes runner temp file", func(t *testing.T) {
+		dir := isolateTempDir(t)
 		bad := strings.Repeat("0", 64)
 		a := &spec.Artifact{
 			Type:     spec.ArtifactZip,
@@ -125,6 +189,51 @@ func TestFetchShaVerifyAnd404(t *testing.T) {
 		}
 		if c := codeOf(err); c != "ERR_CHECKSUM_MISMATCH" {
 			t.Errorf("code = %q, want ERR_CHECKSUM_MISMATCH", c)
+		}
+		if n := countTempPkgs(t, dir); n != 0 {
+			t.Errorf("temp file leaked after mismatch: %d labdeploy-* file(s) remain in %s", n, dir)
+		}
+	})
+}
+
+// AuthHeader resolves exact bearer/basic values from auth.token_env (DESIGN §6.3):
+// nuget bearer -> "Bearer <tok>"; nuget default -> Basic base64("pat:<tok>").
+func TestNugetAuthHeaderValues(t *testing.T) {
+	const tok = "s3cr3t-pat"
+	t.Setenv("LD_NUGET_TOKEN", tok)
+
+	t.Run("bearer scheme", func(t *testing.T) {
+		a := nugetFixture() // scheme: bearer, token_env: LD_NUGET_TOKEN
+		name, value := AuthHeader(a)
+		if name != "Authorization" {
+			t.Errorf("header name = %q, want Authorization", name)
+		}
+		if want := "Bearer " + tok; value != want {
+			t.Errorf("bearer value = %q, want %q", value, want)
+		}
+	})
+
+	t.Run("default basic scheme uses pat user", func(t *testing.T) {
+		a := nugetFixture()
+		a.Source.Auth.Scheme = "" // default -> basic, user=pat
+		name, value := AuthHeader(a)
+		if name != "Authorization" {
+			t.Errorf("header name = %q, want Authorization", name)
+		}
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("pat:"+tok))
+		if value != want {
+			t.Errorf("basic value = %q, want %q", value, want)
+		}
+	})
+
+	t.Run("explicit basic with username", func(t *testing.T) {
+		a := nugetFixture()
+		a.Source.Auth.Scheme = "basic"
+		a.Source.Auth.Username = "svc"
+		_, value := AuthHeader(a)
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("svc:"+tok))
+		if value != want {
+			t.Errorf("basic value = %q, want %q", value, want)
 		}
 	})
 }
