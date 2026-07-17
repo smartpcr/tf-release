@@ -208,6 +208,42 @@ func newToken() string {
 	return hex.EncodeToString(b[:])
 }
 
+// Gate lease parameters (evaluator item 3). The serialization gate `<lock>.mx`
+// carries a lease timestamp so a gate stranded by a crashed/killed holder can be
+// recovered without permanently disabling locking. Recovery is SAFETY-preserving
+// because a gate holder runs its critical section under a context bounded to
+// gateLeaseSeconds, while a contender only recovers a gate whose age exceeds
+// gateTTLSeconds (> gateLeaseSeconds): by the time any contender judges the gate
+// abandoned, the previous holder's bounded critical-section context has already
+// expired, so it can no longer mutate the canonical `.lock`. The residual window
+// (a remote FS op that lands after its client context expired) degrades to a
+// stale/ownable `.lock` — recoverable by the lock's own age-based takeover — not
+// to two concurrently live owners.
+const (
+	gateLeaseSeconds = 45 // max wall-clock a holder may spend in the gated critical section
+	gateTTLSeconds   = 90 // a gate older than this is treated as abandoned and recovered
+)
+
+// gateInfo is the lease persisted inside `<lock>.mx`: a unique token plus the
+// creation timestamp used to detect an abandoned gate.
+type gateInfo struct {
+	Token      string `json:"token"`
+	StartedUTC string `json:"started_utc"`
+}
+
+func gateContent(token string) string {
+	b, _ := json.Marshal(gateInfo{Token: token, StartedUTC: time.Now().UTC().Format(time.RFC3339)})
+	return string(b)
+}
+
+// cleanupCtx returns a bounded context DETACHED from the operation's
+// cancellation/deadline (context.WithoutCancel) so gate/temp cleanup still runs
+// even when the operation ctx was canceled or timed out (evaluator item 1). A
+// short bound guarantees the cleanup itself cannot hang.
+func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+}
+
 // AcquireLock takes the target lock with atomic create-new semantics
 // (DESIGN §13). exit 48 ⇒ held. A held lock is inspected: unparseable metadata
 // or age < timeout ⇒ ERR_LOCKED; a PROVEN stale lock (age >= timeout) is taken
@@ -294,26 +330,43 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 }
 
 // takeoverUnderGate attempts a single gated stale-takeover. It acquires the
-// exclusive gate; if busy it returns (done=false) so the caller re-evaluates.
-// While holding the gate — released on EVERY path, including transport errors
-// (evaluator item 4) — it re-reads `.lock`: only when it still holds the exact
-// stale bytes we judged does it REPLACE them in place with our content via one
-// atomic rename (never emptying the canonical slot). Any other state (vanished,
-// or already replaced by a prior successor) yields done=false for re-evaluation.
+// exclusive gate; if busy it tries to recover an ABANDONED gate (evaluator item
+// 3) and returns (done=false) so the caller re-evaluates. While holding the gate
+// — released via a DETACHED cleanup context on EVERY path, including cancellation
+// (evaluator item 1) — it runs a BOUNDED critical section (gateLeaseSeconds) that
+// re-reads `.lock` and only REPLACES it in place when it still holds the exact
+// stale bytes we judged (never emptying the canonical slot). Any other state
+// (vanished, or already replaced by a prior successor) yields done=false.
 func takeoverUnderGate(ctx context.Context, t transport.Transport, p layout.Paths, raw string, existing lockInfo, content, token string) (done bool, lk *Lock, warn string, err error) {
-	gotGate, gexit, gerr := createExclusiveAt(ctx, t, p.Root, gatePath(p.Lock), token)
+	gate := gatePath(p.Lock)
+	gotGate, gexit, gerr := createExclusiveAt(ctx, t, p.Root, gate, gateContent(token))
 	if gerr != nil {
 		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", gerr)
 	}
 	if !gotGate {
 		if gexit == 48 {
-			return false, nil, "", nil // gate busy — caller re-evaluates
+			// Gate held: recover it if the holder abandoned it, then re-evaluate.
+			if _, rerr := recoverStaleGate(ctx, t, p, token); rerr != nil {
+				return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", rerr)
+			}
+			return false, nil, "", nil
 		}
 		return false, nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("takeover gate create failed (exit %d)", gexit))
 	}
-	defer func() { _ = deletePath(ctx, t, gatePath(p.Lock)) }()
+	// Release the gate on every exit path via a DETACHED, bounded context so a
+	// canceled/timed-out operation still frees the gate (item 1).
+	defer func() {
+		cc, cancel := cleanupCtx(ctx)
+		defer cancel()
+		_ = deletePath(cc, t, gate)
+	}()
 
-	cur, ok, rerr := readSmallFile(ctx, t, p.Lock)
+	// Bound the critical section so a slow/stuck holder is forced to stop before
+	// any contender would judge the gate abandoned (gateLeaseSeconds < gateTTL).
+	csCtx, cancel := context.WithTimeout(ctx, gateLeaseSeconds*time.Second)
+	defer cancel()
+
+	cur, ok, rerr := readSmallFile(csCtx, t, p.Lock)
 	if rerr != nil {
 		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", rerr)
 	}
@@ -325,10 +378,71 @@ func takeoverUnderGate(ctx context.Context, t transport.Transport, p layout.Path
 	// Still the exact stale lock we judged: atomically REPLACE it in place. The
 	// canonical `.lock` is never removed, so fresh CreateNew contenders keep
 	// seeing exit 48 and no empty slot is ever exposed.
-	if rerr := replaceInPlace(ctx, t, p, p.Lock, content, token); rerr != nil {
+	if rerr := replaceInPlace(csCtx, t, p, p.Lock, content, token); rerr != nil {
 		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", rerr)
 	}
 	return true, &Lock{t: t, paths: p, content: content, token: token}, staleWarnMsg(existing, t.Host()), nil
+}
+
+// recoverStaleGate inspects a held `<lock>.mx` and, if its lease age exceeds
+// gateTTLSeconds (holder crashed/killed), seizes it with a single ATOMIC RENAME
+// so exactly one contender recovers it, then deletes it — freeing the gate slot
+// without ever risking two live holders (a fresh, non-abandoned gate is left
+// untouched). Returns (freed, transportErr); freed=true means the slot is now (or
+// already was) available so the caller should retry. An unparseable or fresh gate
+// returns freed=false (genuinely busy — refuse, do NOT recover).
+func recoverStaleGate(ctx context.Context, t transport.Transport, p layout.Paths, token string) (bool, error) {
+	gate := gatePath(p.Lock)
+	raw, ok, err := readSmallFile(ctx, t, gate)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return true, nil // gate vanished on its own — slot free, retry
+	}
+	var gi gateInfo
+	if uerr := json.Unmarshal([]byte(raw), &gi); uerr != nil {
+		return false, nil // unparseable — treat as busy, never force-recover blindly
+	}
+	started, perr := time.Parse(time.RFC3339, gi.StartedUTC)
+	if perr != nil || time.Since(started) < gateTTLSeconds*time.Second {
+		return false, nil // fresh (or unparseable timestamp) — genuinely busy
+	}
+	// Abandoned: seize via atomic rename (indivisible — exactly one winner) then
+	// delete. Emptying the GATE slot briefly is safe: the gate is a mutex, not the
+	// ownership record, and create-new re-establishes exclusivity for the retry.
+	dead := gate + ".dead." + token
+	won, serr := seizeByRename(ctx, t, gate, dead)
+	if serr != nil {
+		return false, serr
+	}
+	if won {
+		cc, cancel := cleanupCtx(ctx)
+		defer cancel()
+		_ = deletePath(cc, t, dead)
+	}
+	return true, nil // freed by us or a peer — retry
+}
+
+// seizeByRename atomically renames `from` to `to`. rename(2) / [IO.File]::Move is
+// indivisible: among concurrent callers renaming the SAME source, exactly one
+// succeeds and the rest observe "source gone". Used ONLY to recover an abandoned
+// gate (never the canonical `.lock`). Returns (won, transportErr); won=false when
+// the source no longer exists.
+func seizeByRename(ctx context.Context, t transport.Transport, from, to string) (bool, error) {
+	var r transport.Result
+	var err error
+	if t.OS() == spec.OSWindows {
+		script := fmt.Sprintf(`try { [IO.File]::Move(%s,%s); exit 0 } catch { exit 3 }`, psq(from), psq(to))
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
+	} else {
+		script := fmt.Sprintf(`if mv '%s' '%s' 2>/dev/null; then exit 0; else exit 3; fi`, from, to)
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
+	}
+	if err != nil {
+		return false, err
+	}
+	return r.ExitCode == 0, nil
 }
 
 func staleWarnMsg(existing lockInfo, host string) string {
@@ -377,8 +491,13 @@ func gatePath(lock string) string { return lock + ".mx" }
 // `.tmp.*` residue is stranded (evaluator item 4).
 func replaceInPlace(ctx context.Context, t transport.Transport, p layout.Paths, lockPath, content, token string) error {
 	tmp := lockPath + ".tmp." + token
+	cleanupTmp := func() {
+		cc, cancel := cleanupCtx(ctx)
+		defer cancel()
+		_ = deletePath(cc, t, tmp)
+	}
 	if werr := writeSmallFile(ctx, t, tmp, content); werr != nil {
-		_ = deletePath(ctx, t, tmp)
+		cleanupTmp()
 		return werr
 	}
 	var r transport.Result
@@ -394,27 +513,40 @@ func replaceInPlace(ctx context.Context, t transport.Transport, p layout.Paths, 
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
 	}
 	if err != nil {
-		_ = deletePath(ctx, t, tmp)
+		cleanupTmp()
 		return err
 	}
 	if r.ExitCode != 0 {
-		_ = deletePath(ctx, t, tmp)
+		cleanupTmp()
 		return fmt.Errorf("atomic replace of %s failed (exit %d): %s", lockPath, r.ExitCode, r.Stderr)
 	}
 	return nil
 }
 
-// deletePath unconditionally removes a single file (the gate, or an owned lock).
+// deletePath removes a single file (the gate, an owned lock, or a temp) and
+// INSPECTS the command result so a failed removal is reported as an error rather
+// than a silent success (evaluator item 2). Both scripts re-check existence after
+// the remove and exit nonzero if the file is still present, so a permissions or
+// I/O failure surfaces to the caller instead of leaving a stranded gate/lock that
+// cleanup believed it had removed.
 func deletePath(ctx context.Context, t transport.Transport, path string) error {
+	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`Remove-Item -Force -ErrorAction SilentlyContinue %s`, psq(path))
-		_, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
+		script := fmt.Sprintf(`Remove-Item -Force -ErrorAction SilentlyContinue %s
+if (Test-Path -LiteralPath %s) { exit 17 } else { exit 0 }`, psq(path), psq(path))
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
 	} else {
-		script := fmt.Sprintf(`rm -f '%s'`, path)
-		_, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
+		script := fmt.Sprintf(`rm -f '%s'; if [ -e '%s' ]; then exit 17; else exit 0; fi`, path, path)
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return fmt.Errorf("delete %s failed (exit %d): %s", path, r.ExitCode, r.Stderr)
+	}
+	return nil
 }
 
 // ReleaseLock releases the lock UNDER THE SERIALIZATION GATE so a caller that
@@ -425,7 +557,10 @@ func deletePath(ctx context.Context, t transport.Transport, path string) error {
 // gate and replaces `.lock` in place, ownership verification and removal are
 // never interleaved with a takeover and NO unowned lock is ever temporarily
 // removed. A nil handle, a persistently-busy gate, or a transport error is a
-// safe no-op (never an unsafe delete). The gate is released on every path.
+// safe no-op (never an unsafe delete). The gate is released via a DETACHED
+// cleanup context on every path (item 1), an abandoned gate is recovered so a
+// crashed peer can never permanently block release (item 3), and the critical
+// section is bounded (gateLeaseSeconds).
 func ReleaseLock(ctx context.Context, lk *Lock) {
 	if lk == nil || lk.t == nil {
 		return
@@ -434,16 +569,24 @@ func ReleaseLock(ctx context.Context, lk *Lock) {
 	gate := gatePath(lk.paths.Lock)
 	const gateAttempts = 64
 	for attempt := 0; attempt < gateAttempts; attempt++ {
-		gotGate, gexit, gerr := createExclusiveAt(ctx, t, lk.paths.Root, gate, lk.token)
+		gotGate, gexit, gerr := createExclusiveAt(ctx, t, lk.paths.Root, gate, gateContent(lk.token))
 		if gerr != nil {
 			return // transport error — do NOT risk an unsafe delete
 		}
 		if gotGate {
 			func() {
-				defer func() { _ = deletePath(ctx, t, gate) }()
-				cur, ok, _ := readSmallFile(ctx, t, lk.paths.Lock)
+				// Release the gate via a DETACHED, bounded context so a canceled
+				// operation still frees it (item 1).
+				defer func() {
+					cc, cancel := cleanupCtx(ctx)
+					defer cancel()
+					_ = deletePath(cc, t, gate)
+				}()
+				csCtx, cancel := context.WithTimeout(ctx, gateLeaseSeconds*time.Second)
+				defer cancel()
+				cur, ok, _ := readSmallFile(csCtx, t, lk.paths.Lock)
 				if ok && cur == lk.content {
-					_ = deletePath(ctx, t, lk.paths.Lock) // still ours — release it
+					_ = deletePath(csCtx, t, lk.paths.Lock) // still ours — release it
 				}
 				// Otherwise a successor owns it (or it is already gone): leave it.
 			}()
@@ -452,7 +595,12 @@ func ReleaseLock(ctx context.Context, lk *Lock) {
 		if gexit != 48 {
 			return // unexpected gate failure — safe no-op
 		}
-		// Gate busy (a takeover/release is in flight); brief backoff then retry.
+		// Gate busy: recover it if abandoned (item 3), else brief backoff + retry.
+		if freed, rerr := recoverStaleGate(ctx, t, lk.paths, lk.token); rerr != nil {
+			return // transport error during recovery — safe no-op
+		} else if freed {
+			continue // slot freed — retry the gate create immediately
+		}
 		select {
 		case <-ctx.Done():
 			return

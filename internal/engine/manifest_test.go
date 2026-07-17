@@ -600,8 +600,152 @@ func TestTakeoverErrorPathsCleanUp(t *testing.T) {
 	}
 }
 
-// ctxProbe wraps a lockFake and records, per host, the context handed to the
-// FIRST Exec of that node's release, plus the reverse-order sequence. It lets
+// TestTakeoverCleanupSurvivesCancellation is the canceled-cleanup half of
+// evaluator items 1 & 4: if the operation context is canceled MID-takeover (here
+// at the post-gate `.lock` read), the takeover must fail BUT the serialization
+// gate must still be released — proving the gate cleanup runs under a
+// cancellation-detached context, not the canceled operation context. The
+// canonical `.lock` is never emptied.
+func TestTakeoverCleanupSurvivesCancellation(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			p := lockFakePaths(osk)
+			f := newLockFake(osk)
+			aged := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+			f.set(p.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+aged+`","token":"stale"}`)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			// Cancel exactly when the post-gate critical-section read runs (gate
+			// present). The decision read BEFORE the gate must not trip it.
+			f.hook = func(op, s string) {
+				if op == "read" && f.has(gatePath(p.Lock)) {
+					cancel()
+				}
+			}
+
+			lk, _, err := AcquireLock(ctx, f, p, "victim", "deploy", 900)
+			if lk != nil || err == nil {
+				t.Fatalf("expected canceled takeover to fail, got lk=%v err=%v", lk, err)
+			}
+			// Detached cleanup must have freed the gate despite the canceled ctx.
+			if f.has(gatePath(p.Lock)) {
+				t.Fatal("serialization gate stranded: cleanup used the canceled op context")
+			}
+			// Canonical lock was never emptied.
+			if !f.has(p.Lock) {
+				t.Fatal("canonical lock left absent after a canceled takeover")
+			}
+			// No temp residue.
+			f.mu.Lock()
+			for k := range f.files {
+				if strings.Contains(k, ".tmp.") {
+					f.mu.Unlock()
+					t.Fatalf("leaked temp residue %q", k)
+				}
+			}
+			f.mu.Unlock()
+		})
+	}
+}
+
+// TestDeletePathReportsFailure is the exit-code half of evaluator item 2: a
+// removal command that exits nonzero must be surfaced as an error, not reported
+// as success. Both a clean delete (success) and an injected nonzero delete
+// (error) are exercised per OS.
+func TestDeletePathReportsFailure(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			p := lockFakePaths(osk)
+			f := newLockFake(osk)
+			f.set(p.Lock, "data")
+
+			// Success path: file removed, no error.
+			if err := deletePath(context.Background(), f, p.Lock); err != nil {
+				t.Fatalf("clean delete must succeed, got %v", err)
+			}
+			if f.has(p.Lock) {
+				t.Fatal("file not removed by a successful delete")
+			}
+
+			// Failure path: nonzero exit must surface as an error.
+			f.set(p.Lock, "data")
+			f.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "delete" {
+					return transport.Result{ExitCode: 17, Stderr: "access denied"}, nil, true
+				}
+				return transport.Result{}, nil, false
+			}
+			if err := deletePath(context.Background(), f, p.Lock); err == nil {
+				t.Fatal("a nonzero deletion exit must be reported as an error, not success")
+			}
+		})
+	}
+}
+
+// TestStrandedGateRecovered is the gate-liveness half of evaluator item 3: a
+// gate stranded by a crashed holder (aged past gateTTLSeconds) must be recovered
+// so takeover can proceed, while a FRESH gate (a genuinely live critical section)
+// must NOT be recovered — contention fails fast and the live gate survives.
+func TestStrandedGateRecovered(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			agedLock := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+
+			// (a) Abandoned gate: aged lease ⇒ recovered ⇒ takeover completes.
+			p := lockFakePaths(osk)
+			f := newLockFake(osk)
+			f.set(p.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+agedLock+`","token":"stale"}`)
+			oldGate := time.Now().UTC().Add(-time.Duration(gateTTLSeconds+30) * time.Second).Format(time.RFC3339)
+			f.set(gatePath(p.Lock), `{"token":"ghost","started_utc":"`+oldGate+`"}`)
+
+			lk, warn, err := AcquireLock(context.Background(), f, p, "rescuer", "deploy", 900)
+			if err != nil || lk == nil {
+				t.Fatalf("(a) abandoned gate must be recovered and takeover succeed, got lk=%v err=%v", lk, err)
+			}
+			if !strings.Contains(warn, "stale") {
+				t.Fatalf("(a) expected stale-takeover WARN, got %q", warn)
+			}
+			if got := f.get(p.Lock); !strings.Contains(got, `"owner":"rescuer"`) {
+				t.Fatalf("(a) lock not taken over after gate recovery: %q", got)
+			}
+			f.mu.Lock()
+			for k := range f.files {
+				if strings.Contains(k, ".mx") || strings.Contains(k, ".dead.") || strings.Contains(k, ".tmp.") {
+					f.mu.Unlock()
+					t.Fatalf("(a) leaked gate/recovery residue %q", k)
+				}
+			}
+			f.mu.Unlock()
+
+			// (b) Fresh gate: a live critical section must NOT be recovered.
+			p2 := lockFakePaths(osk)
+			f2 := newLockFake(osk)
+			f2.set(p2.Lock, `{"owner":"dead","op":"deploy","started_utc":"`+agedLock+`","token":"stale"}`)
+			freshGate := `{"token":"live","started_utc":"` + nowRFC3339() + `"}`
+			f2.set(gatePath(p2.Lock), freshGate)
+
+			lk2, _, err2 := AcquireLock(context.Background(), f2, p2, "intruder", "deploy", 900)
+			if lk2 != nil || err2 == nil {
+				t.Fatalf("(b) a fresh gate must block takeover, got lk=%v err=%v", lk2, err2)
+			}
+			var ce *CodedError
+			if !asCoded(err2, &ce) || ce.Code != "ERR_LOCKED" {
+				t.Fatalf("(b) expected ERR_LOCKED against a live gate, got %v", err2)
+			}
+			if f2.get(gatePath(p2.Lock)) != freshGate {
+				t.Fatal("(b) a live gate was wrongly recovered/altered")
+			}
+			if !strings.Contains(f2.get(p2.Lock), `"owner":"dead"`) {
+				t.Fatal("(b) the stale lock was taken over despite a live gate")
+			}
+		})
+	}
+}
+
+// ctxProbe wraps a lockFake and records, per host, the context handed to the// FIRST Exec of that node's release, plus the reverse-order sequence. It lets
 // TestClusterUnlockPerNodeContext prove each node gets its OWN cleanup context.
 type ctxProbe struct {
 	*lockFake
@@ -820,6 +964,8 @@ var (
 	lfNewB64Sh   = regexp.MustCompile(`printf '%s' '([^']*)'`)
 	lfDelWin     = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
 	lfDelSh      = regexp.MustCompile(`rm -f '([^']+)'`)
+	lfSeizeWin   = regexp.MustCompile(`\[IO\.File\]::Move\('([^']+)','([^']+)'\)`)
+	lfSeizeSh    = regexp.MustCompile(`if mv '([^']+)' '([^']+)'`)
 )
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -833,7 +979,9 @@ func firstGroup(re *regexp.Regexp, s string) (string, bool) {
 
 // classify maps a lock script to exactly one primitive. Order matters: the
 // exclusive create-new gate (`CreateNew`/`set -C`) MUST be distinguished from a
-// plain temp write (both mention base64 on POSIX), and read from both.
+// plain temp write (both mention base64 on POSIX), the gate-recovery seize
+// (`[IO.File]::Move`/`if mv`) from the in-place replace (`Replace`/`mv -f`), and
+// read from create/write.
 func (f *lockFake) classify(s string) string {
 	switch {
 	case strings.Contains(s, "ReadAllBytes(") || strings.Contains(s, "base64 < '"):
@@ -842,6 +990,8 @@ func (f *lockFake) classify(s string) string {
 		return "create"
 	case strings.Contains(s, "WriteAllBytes(") || strings.Contains(s, "base64 -d > '"):
 		return "write"
+	case strings.Contains(s, "[IO.File]::Move(") || strings.Contains(s, "if mv '"):
+		return "seize"
 	case strings.Contains(s, "[IO.File]::Replace(") || strings.Contains(s, "mv -f '"):
 		return "replace"
 	case strings.Contains(s, "Remove-Item") || strings.Contains(s, "rm -f '"):
@@ -855,13 +1005,18 @@ func (f *lockFake) classify(s string) string {
 // at command boundaries (the interleaving the evaluator asked us to model). The
 // exclusive create-new gate is the sole serializer for takeover and release, and
 // the in-place atomic replace never leaves the canonical `.lock` absent, so two
-// contenders can never both win and no empty slot is ever exposed.
-func (f *lockFake) Exec(_ context.Context, c transport.Cmd) (transport.Result, error) {
+// contenders can never both win and no empty slot is ever exposed. It HONORS
+// context cancellation (a canceled ctx fails the op) so tests can prove that
+// cleanup uses a cancellation-detached context (evaluator items 1 & 4).
+func (f *lockFake) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
 	win := f.osk == spec.OSWindows
 	op := f.classify(s)
 	if f.hook != nil {
 		f.hook(op, s) // BEFORE locking so a blocking rendezvous doesn't hold f.mu
+	}
+	if err := ctx.Err(); err != nil {
+		return transport.Result{}, err // canceled/timed-out ctx fails the op
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -913,6 +1068,23 @@ func (f *lockFake) Exec(_ context.Context, c transport.Cmd) (transport.Result, e
 		}
 		raw, _ := base64.StdEncoding.DecodeString(newB64)
 		f.files[path] = string(raw)
+		return transport.Result{ExitCode: 0}, nil
+
+	case "seize": // atomic rename used ONLY to recover an abandoned gate
+		var from, to string
+		if win {
+			m := lfSeizeWin.FindStringSubmatch(s)
+			from, to = m[1], m[2]
+		} else {
+			m := lfSeizeSh.FindStringSubmatch(s)
+			from, to = m[1], m[2]
+		}
+		src, ok := f.files[from]
+		if !ok {
+			return transport.Result{ExitCode: 3}, nil // source gone: a peer seized first
+		}
+		f.files[to] = src
+		delete(f.files, from)
 		return transport.Result{ExitCode: 0}, nil
 
 	case "replace": // atomic in-place replace: dst is NEVER momentarily absent

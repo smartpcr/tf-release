@@ -60,6 +60,11 @@ var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 // emptied during a stale takeover).
 var reReplace = regexp.MustCompile(`\[IO\.File\]::Replace\('([^']+)','([^']+)',\$null\)`)
 
+// reSeize captures the atomic rename used ONLY to recover an abandoned gate:
+// `[IO.File]::Move('<from>','<to>')`. Exactly one contender wins; the rest see
+// source-gone (exit 3).
+var reSeize = regexp.MustCompile(`\[IO\.File\]::Move\('([^']+)','([^']+)'\)`)
+
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
 	switch {
@@ -75,6 +80,17 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 			return transport.Result{ExitCode: 1, Stderr: "temp missing"}, nil
 		}
 		f.files[to] = src // atomic: dst present throughout
+		delete(f.files, from)
+		return ok(""), nil
+
+	case reSeize.MatchString(s): // recoverStaleGate atomic rename
+		m := reSeize.FindStringSubmatch(s)
+		from, to := m[1], m[2]
+		src, exists := f.files[from]
+		if !exists {
+			return transport.Result{ExitCode: 3}, nil // source gone: a peer seized first
+		}
+		f.files[to] = src
 		delete(f.files, from)
 		return ok(""), nil
 
