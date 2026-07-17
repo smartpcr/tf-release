@@ -186,14 +186,16 @@ type Pattern struct {
 // populated member is a self-describing, type-safe projection of the union.
 
 type ConsoleAppPattern struct {
-	InstallRoot   string   `json:"install_root,omitempty"`
-	PostInstall   string   `json:"post_install,omitempty"`
-	Exe           string   `json:"exe"`
-	Args          []string `json:"args,omitempty"`
-	VerifyCommand string   `json:"verify_command,omitempty"`
+	Type          PatternType `json:"type"`
+	InstallRoot   string      `json:"install_root,omitempty"`
+	PostInstall   string      `json:"post_install,omitempty"`
+	Exe           string      `json:"exe"`
+	Args          []string    `json:"args,omitempty"`
+	VerifyCommand string      `json:"verify_command,omitempty"`
 }
 
 type WindowsServicePattern struct {
+	Type               PatternType    `json:"type"`
 	InstallRoot        string         `json:"install_root,omitempty"`
 	PostInstall        string         `json:"post_install,omitempty"`
 	ServiceName        string         `json:"service_name"`
@@ -209,22 +211,26 @@ type WindowsServicePattern struct {
 	StopTimeoutSeconds int            `json:"stop_timeout_seconds,omitempty"`
 }
 
+// node_web_app (DESIGN §6.4): installed as a WinSW-wrapped Windows service. Its
+// legal fields are service_name, entry, node_exe, port, install_deps, winsw_exe,
+// stop_timeout_seconds — it does NOT accept start_type/account/recovery.
 type NodeWebAppPattern struct {
-	InstallRoot        string         `json:"install_root,omitempty"`
-	PostInstall        string         `json:"post_install,omitempty"`
-	ServiceName        string         `json:"service_name"`
-	Entry              string         `json:"entry"`
-	NodeExe            string         `json:"node_exe,omitempty"`
-	Port               int            `json:"port"`
-	InstallDeps        bool           `json:"install_deps,omitempty"`
-	WinswExe           string         `json:"winsw_exe,omitempty"`
-	StartType          string         `json:"start_type,omitempty"`
-	Account            ServiceAccount `json:"account,omitempty"`
-	Recovery           Recovery       `json:"recovery,omitempty"`
-	StopTimeoutSeconds int            `json:"stop_timeout_seconds,omitempty"`
+	Type               PatternType `json:"type"`
+	InstallRoot        string      `json:"install_root,omitempty"`
+	PostInstall        string      `json:"post_install,omitempty"`
+	ServiceName        string      `json:"service_name"`
+	Entry              string      `json:"entry"`
+	NodeExe            string      `json:"node_exe,omitempty"`
+	Port               int         `json:"port"`
+	InstallDeps        bool        `json:"install_deps,omitempty"`
+	WinswExe           string      `json:"winsw_exe,omitempty"`
+	StopTimeoutSeconds int         `json:"stop_timeout_seconds,omitempty"`
 }
 
+// dotnet_api (DESIGN §6.4): args/account/recovery/stop_timeout_seconds mirror
+// windows_service, but start_type is NOT a documented field for this variant.
 type DotnetAPIPattern struct {
+	Type               PatternType    `json:"type"`
 	InstallRoot        string         `json:"install_root,omitempty"`
 	PostInstall        string         `json:"post_install,omitempty"`
 	ServiceName        string         `json:"service_name"`
@@ -236,13 +242,16 @@ type DotnetAPIPattern struct {
 	Hosting            string         `json:"hosting,omitempty"`
 	Args               []string       `json:"args,omitempty"`
 	WinswExe           string         `json:"winsw_exe,omitempty"`
-	StartType          string         `json:"start_type,omitempty"`
 	Account            ServiceAccount `json:"account,omitempty"`
 	Recovery           Recovery       `json:"recovery,omitempty"`
 	StopTimeoutSeconds int            `json:"stop_timeout_seconds,omitempty"`
 }
 
+// cluster_generic_service (DESIGN §6.4): account/recovery/stop_timeout_seconds
+// mirror windows_service; start_type is not a documented field (start type is
+// forced to manual/demand by the cluster verbs — DESIGN §9.5 C1).
 type ClusterGenericPattern struct {
+	Type               PatternType    `json:"type"`
 	InstallRoot        string         `json:"install_root,omitempty"`
 	PostInstall        string         `json:"post_install,omitempty"`
 	ServiceName        string         `json:"service_name"`
@@ -251,42 +260,51 @@ type ClusterGenericPattern struct {
 	Args               []string       `json:"args,omitempty"`
 	StaticAddress      string         `json:"static_address,omitempty"`
 	PreferredOwner     string         `json:"preferred_owner,omitempty"`
-	StartType          string         `json:"start_type,omitempty"`
 	Account            ServiceAccount `json:"account,omitempty"`
 	Recovery           Recovery       `json:"recovery,omitempty"`
 	StopTimeoutSeconds int            `json:"stop_timeout_seconds,omitempty"`
 }
 
 type DockerContainerPattern struct {
-	InstallRoot   string   `json:"install_root,omitempty"`
-	PostInstall   string   `json:"post_install,omitempty"`
-	ContainerName string   `json:"container_name"`
-	Ports         []string `json:"ports,omitempty"`
-	Volumes       []string `json:"volumes,omitempty"`
-	RestartPolicy string   `json:"restart_policy,omitempty"`
-	RunArgs       []string `json:"run_args,omitempty"`
+	Type          PatternType `json:"type"`
+	InstallRoot   string      `json:"install_root,omitempty"`
+	PostInstall   string      `json:"post_install,omitempty"`
+	ContainerName string      `json:"container_name"`
+	Ports         []string    `json:"ports,omitempty"`
+	Volumes       []string    `json:"volumes,omitempty"`
+	RestartPolicy string      `json:"restart_policy,omitempty"`
+	RunArgs       []string    `json:"run_args,omitempty"`
 }
 
 // UnmarshalJSON implements type-directed decoding of the pattern.type
 // discriminated union (DESIGN §6.4). It (1) decodes the shared/flat fields —
-// rejecting unknown keys so parse-time strictness is preserved — and (2) decodes
-// the SAME raw object into the concrete member struct selected by `type`,
-// leaving every other member nil. Both YAML and JSON specs reach here because
-// parse.go converts YAML to JSON before decoding.
+// rejecting unknown keys so parse-time strictness is preserved — and (2) STRICTLY
+// decodes the SAME raw object into the concrete member struct selected by `type`,
+// leaving every other member nil. Because the concrete decode also rejects
+// unknown fields, a field that belongs to another variant (e.g. container_name
+// on a windows_service) is rejected rather than silently retained. Both YAML and
+// JSON specs reach here because parse.go converts YAML to JSON before decoding.
 func (p *Pattern) UnmarshalJSON(data []byte) error {
 	type rawPattern Pattern // alias sheds the custom method to avoid recursion
 	var rp rawPattern
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&rp); err != nil {
+	if err := strictDecode(data, &rp); err != nil {
 		return err
 	}
 	*p = Pattern(rp)
 	return p.decodeUnion(data)
 }
 
-// decodeUnion resets all concrete members then populates exactly the one named
-// by p.Type from the raw pattern object.
+// strictDecode unmarshals data into v, rejecting any field not present in v's
+// schema (json.Decoder.DisallowUnknownFields).
+func strictDecode(data []byte, v interface{}) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
+// decodeUnion resets all concrete members then STRICTLY populates exactly the one
+// named by p.Type from the raw pattern object, so each concrete schema rejects
+// fields that belong to a different variant.
 func (p *Pattern) decodeUnion(data []byte) error {
 	p.ConsoleApp = nil
 	p.WindowsService = nil
@@ -295,41 +313,48 @@ func (p *Pattern) decodeUnion(data []byte) error {
 	p.ClusterGeneric = nil
 	p.DockerContainer = nil
 
+	wrap := func(err error) error {
+		if err != nil {
+			return fmt.Errorf("pattern.type %s: %w", p.Type, err)
+		}
+		return nil
+	}
+
 	switch p.Type {
 	case PatternConsoleApp:
 		var m ConsoleAppPattern
-		if err := json.Unmarshal(data, &m); err != nil {
-			return err
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
 		}
 		p.ConsoleApp = &m
 	case PatternWindowsService:
 		var m WindowsServicePattern
-		if err := json.Unmarshal(data, &m); err != nil {
-			return err
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
 		}
 		p.WindowsService = &m
 	case PatternNodeWebApp:
 		var m NodeWebAppPattern
-		if err := json.Unmarshal(data, &m); err != nil {
-			return err
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
 		}
 		p.NodeWebApp = &m
 	case PatternDotnetAPI:
 		var m DotnetAPIPattern
-		if err := json.Unmarshal(data, &m); err != nil {
-			return err
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
 		}
 		p.DotnetAPI = &m
 	case PatternClusterGeneric:
 		var m ClusterGenericPattern
-		if err := json.Unmarshal(data, &m); err != nil {
-			return err
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
 		}
 		p.ClusterGeneric = &m
 	case PatternDockerCont:
 		var m DockerContainerPattern
-		if err := json.Unmarshal(data, &m); err != nil {
-			return err
+		if err := strictDecode(data, &m); err != nil {
+			return wrap(err)
 		}
 		p.DockerContainer = &m
 	case "":

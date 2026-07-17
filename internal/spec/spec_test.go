@@ -300,6 +300,8 @@ health_check: { type: none }
 			func(p *Pattern) bool { return p.NodeWebApp != nil }},
 		{"dotnet_api", "type: dotnet_api\n  service_name: S\n  exe: api.exe", PatternDotnetAPI,
 			func(p *Pattern) bool { return p.DotnetAPI != nil }},
+		{"cluster_generic_service", "type: cluster_generic_service\n  service_name: S\n  role_name: R\n  exe: s.exe", PatternClusterGeneric,
+			func(p *Pattern) bool { return p.ClusterGeneric != nil }},
 		{"docker_container", "type: docker_container\n  container_name: c", PatternDockerCont,
 			func(p *Pattern) bool { return p.DockerContainer != nil }},
 	}
@@ -361,6 +363,52 @@ health_check: { type: none }
 				t.Fatalf("expected exactly 1 concrete member non-nil, got %d", nonNil)
 			}
 		})
+	}
+}
+
+// A field that belongs to a DIFFERENT union variant must be rejected by the
+// selected concrete schema, not silently accepted (strict discriminated union).
+func TestPatternUnionRejectsCrossVariantField(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	// windows_service spec carrying docker_container's container_name.
+	bad := strings.Replace(winSvcYAML,
+		"  service_name: SampleSvc",
+		"  service_name: SampleSvc\n  container_name: sneaky",
+		1)
+	_, _, err := ParseDeploymentLenient(bad, map[string]string{"HOST": "h"}, "")
+	if err == nil {
+		t.Fatal("cross-variant field container_name on windows_service must be rejected")
+	}
+	if !strings.Contains(err.Error(), "container_name") {
+		t.Fatalf("error should name the offending field, got %v", err)
+	}
+	// node_web_app must reject start_type (not a documented node_web_app field).
+	nodeBad := `
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: n }
+target:
+  transport: winrm
+  hosts: ["h1"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  source: { type: http, url: "https://x/y.zip" }
+pattern:
+  type: node_web_app
+  service_name: S
+  entry: server.js
+  port: 8080
+  winsw_exe: winsw.exe
+  start_type: auto
+health_check: { type: none }
+`
+	if _, _, err := ParseDeploymentLenient(nodeBad, nil, ""); err == nil ||
+		!strings.Contains(err.Error(), "start_type") {
+		t.Fatalf("node_web_app must reject start_type, got %v", err)
 	}
 }
 
