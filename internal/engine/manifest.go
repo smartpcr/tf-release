@@ -208,55 +208,50 @@ func newToken() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Gate lease parameters (evaluator item 3). The serialization gate `<lock>.mx`
-// carries a lease timestamp so a gate stranded by a crashed/killed holder can be
-// recovered without permanently disabling locking. Recovery is SAFETY-preserving
-// because a gate holder runs its critical section under a context bounded to
-// gateLeaseSeconds, while a contender only recovers a gate whose age exceeds
-// gateTTLSeconds (> gateLeaseSeconds): by the time any contender judges the gate
-// abandoned, the previous holder's bounded critical-section context has already
-// expired, so it can no longer mutate the canonical `.lock`. The residual window
-// (a remote FS op that lands after its client context expired) degrades to a
-// stale/ownable `.lock` — recoverable by the lock's own age-based takeover — not
-// to two concurrently live owners.
-const (
-	gateLeaseSeconds = 45 // max wall-clock a holder may spend in the gated critical section
-	gateTTLSeconds   = 90 // a gate older than this is treated as abandoned and recovered
-)
-
-// gateInfo is the lease persisted inside `<lock>.mx`: a unique token plus the
-// creation timestamp used to detect an abandoned gate.
-type gateInfo struct {
-	Token      string `json:"token"`
-	StartedUTC string `json:"started_utc"`
-}
-
-func gateContent(token string) string {
-	b, _ := json.Marshal(gateInfo{Token: token, StartedUTC: time.Now().UTC().Format(time.RFC3339)})
-	return string(b)
-}
-
-// cleanupCtx returns a bounded context DETACHED from the operation's
-// cancellation/deadline (context.WithoutCancel) so gate/temp cleanup still runs
-// even when the operation ctx was canceled or timed out (evaluator item 1). A
-// short bound guarantees the cleanup itself cannot hang.
-func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-}
+// Locking primitive (DESIGN §13) — a note on why there is NO serialization gate.
+//
+// Earlier iterations serialized stale-takeover/release through a persistent
+// `<lock>.mx` gate file. A gate file that outlives its holder (process crash,
+// lost cleanup, canceled context) is a LIVENESS hazard, and every attempt to
+// "recover" such a gate over a stateless Exec transport reintroduced a SAFETY
+// race: reading the gate and then renaming/deleting it targets a MUTABLE
+// pathname, so a fresh holder can recreate the gate in the gap and the recoverer
+// steals it — two critical sections then mutate the same `.lock` (dual owner).
+// There is no file-system compare-and-swap keyed on content, so "verify then act
+// on a pathname" is fundamentally unfixable.
+//
+// This design removes the gate. Every mutation of a HELD `.lock` (stale takeover
+// and ownership-safe release) runs as a SINGLE remote command that holds an
+// EXCLUSIVE OS file handle for the command's entire lifetime and performs the
+// compare-and-swap / compare-and-delete atomically before releasing the handle.
+// The handle is a true process-lifetime primitive: the OS drops it when the
+// command process exits — normally OR on crash/kill — so nothing can be stranded
+// and no separate recovery path (with its unavoidable TOCTOU) is ever needed.
+// Windows uses `[IO.File]::Open(..., FileShare.None/Delete)`; POSIX uses
+// `flock -n` on the lock fd. Concurrent mutators serialize on that handle, so
+// exactly one compare-and-swap can win — the canonical `.lock` is never emptied
+// mid-takeover and two operations can never both believe they own it.
 
 // AcquireLock takes the target lock with atomic create-new semantics
 // (DESIGN §13). exit 48 ⇒ held. A held lock is inspected: unparseable metadata
-// or age < timeout ⇒ ERR_LOCKED; a PROVEN stale lock (age >= timeout) is taken
-// over UNDER A SERIALIZATION GATE by REPLACING `.lock` in place with a single
-// atomic rename, so the canonical lock path is NEVER momentarily absent and two
-// operations can never both believe they hold it (evaluator items 1 & 4). On
-// success it returns a *Lock handle for ownership-safe release.
+// or age < timeout ⇒ ERR_LOCKED (fail fast, no wait); a PROVEN stale lock
+// (age >= timeout) is taken over with a SINGLE atomic compare-and-swap that
+// overwrites `.lock` in place only while it still holds the exact stale bytes we
+// judged, so the canonical path is NEVER momentarily absent and two operations
+// can never both believe they hold it. On success it returns a *Lock handle for
+// ownership-safe release.
+//
+// The loop retries ONLY the transient, non-contention states — the holder
+// released between our create and our read (lock vanished) or another contender
+// won the compare-and-swap for the SAME stale bytes (our CAS reported a mismatch)
+// — and re-evaluates from scratch. A genuinely LIVE held lock is judged not-stale
+// on the very first pass and returns ERR_LOCKED immediately: no spinning, a
+// handful of commands at most (DESIGN §13 "<5s, no wait").
 func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, owner, op string, timeoutSec int) (lk *Lock, staleWarn string, err error) {
-	// A held lock that DISAPPEARS mid-inspection (the holder released) or a lost
-	// gate race is a transient state, not contention, so we re-evaluate from
-	// scratch. The loop is bounded; a genuinely live lock is judged not-stale on
-	// the next pass and returns ERR_LOCKED immediately (no spinning).
-	const maxAttempts = 64
+	// Small bound: each retry either wins the create-new, wins the CAS, or reads a
+	// now-FRESH lock and returns ERR_LOCKED. Only a repeatedly-vanishing/-contended
+	// slot spins, which cannot progress, so a tiny cap keeps us well under 5s.
+	const maxAttempts = 8
 	for attempt := 0; ; attempt++ {
 		token := newToken()
 		li, _ := json.Marshal(lockInfo{
@@ -307,20 +302,23 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 				fmt.Errorf("held by %s since %s (op=%s)", existing.Owner, existing.StartedUTC, existing.Op))
 		}
 
-		// Proven stale (age >= timeout): take over UNDER THE SERIALIZATION GATE.
-		// The gate (an exclusive create-new on `<lock>.mx`) admits exactly one
-		// takeover-or-release critical section at a time. While we hold it we
-		// REPLACE `.lock` in place with a single atomic rename — the canonical
-		// path is never absent, so a concurrent fresh CreateNew always observes
-		// exit 48 and no third contender can slip into an empty slot (items 1,2).
-		done, tlk, twarn, terr := takeoverUnderGate(ctx, t, p, raw, existing, content, token)
-		if terr != nil {
-			return nil, "", terr
+		// Proven stale (age >= timeout): take it over with a SINGLE atomic
+		// compare-and-swap. casSwap holds an exclusive OS handle for the whole
+		// command and overwrites `.lock` in place ONLY while it still holds the
+		// exact stale bytes we just read — the canonical path is never emptied, so
+		// a concurrent fresh CreateNew always observes exit 48 and no third
+		// contender can slip into an empty slot. Exactly one CAS can win.
+		swapped, serr := casSwap(ctx, t, p.Lock, raw, content)
+		if serr != nil {
+			return nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", serr)
 		}
-		if done {
-			return tlk, twarn, nil
+		if swapped {
+			return &Lock{t: t, paths: p, content: content, token: token},
+				staleWarnMsg(existing, t.Host()), nil
 		}
-		// Gate was busy, or `.lock` changed/vanished under us — re-evaluate.
+		// Another contender changed/released `.lock` under us (CAS mismatch) — the
+		// slot now holds either a fresh successor or nothing. Re-evaluate: the next
+		// pass reads the fresh lock and returns ERR_LOCKED, or races the free slot.
 		if attempt < maxAttempts {
 			continue
 		}
@@ -329,120 +327,97 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 	}
 }
 
-// takeoverUnderGate attempts a single gated stale-takeover. It acquires the
-// exclusive gate; if busy it tries to recover an ABANDONED gate (evaluator item
-// 3) and returns (done=false) so the caller re-evaluates. While holding the gate
-// — released via a DETACHED cleanup context on EVERY path, including cancellation
-// (evaluator item 1) — it runs a BOUNDED critical section (gateLeaseSeconds) that
-// re-reads `.lock` and only REPLACES it in place when it still holds the exact
-// stale bytes we judged (never emptying the canonical slot). Any other state
-// (vanished, or already replaced by a prior successor) yields done=false.
-func takeoverUnderGate(ctx context.Context, t transport.Transport, p layout.Paths, raw string, existing lockInfo, content, token string) (done bool, lk *Lock, warn string, err error) {
-	gate := gatePath(p.Lock)
-	gotGate, gexit, gerr := createExclusiveAt(ctx, t, p.Root, gate, gateContent(token))
-	if gerr != nil {
-		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", gerr)
-	}
-	if !gotGate {
-		if gexit == 48 {
-			// Gate held: recover it if the holder abandoned it, then re-evaluate.
-			if _, rerr := recoverStaleGate(ctx, t, p, token); rerr != nil {
-				return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", rerr)
-			}
-			return false, nil, "", nil
-		}
-		return false, nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("takeover gate create failed (exit %d)", gexit))
-	}
-	// Release the gate on every exit path via a DETACHED, bounded context so a
-	// canceled/timed-out operation still frees the gate (item 1).
-	defer func() {
-		cc, cancel := cleanupCtx(ctx)
-		defer cancel()
-		_ = deletePath(cc, t, gate)
-	}()
-
-	// Bound the critical section so a slow/stuck holder is forced to stop before
-	// any contender would judge the gate abandoned (gateLeaseSeconds < gateTTL).
-	csCtx, cancel := context.WithTimeout(ctx, gateLeaseSeconds*time.Second)
-	defer cancel()
-
-	cur, ok, rerr := readSmallFile(csCtx, t, p.Lock)
-	if rerr != nil {
-		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", rerr)
-	}
-	if !ok || cur != raw {
-		// Vanished (holder released) or already replaced by a prior successor —
-		// nothing for us to override here. Re-evaluate from the top.
-		return false, nil, "", nil
-	}
-	// Still the exact stale lock we judged: atomically REPLACE it in place. The
-	// canonical `.lock` is never removed, so fresh CreateNew contenders keep
-	// seeing exit 48 and no empty slot is ever exposed.
-	if rerr := replaceInPlace(csCtx, t, p, p.Lock, content, token); rerr != nil {
-		return false, nil, "", coded("ERR_CONNECT", t.Host(), "LOCK", rerr)
-	}
-	return true, &Lock{t: t, paths: p, content: content, token: token}, staleWarnMsg(existing, t.Host()), nil
-}
-
-// recoverStaleGate inspects a held `<lock>.mx` and, if its lease age exceeds
-// gateTTLSeconds (holder crashed/killed), seizes it with a single ATOMIC RENAME
-// so exactly one contender recovers it, then deletes it — freeing the gate slot
-// without ever risking two live holders (a fresh, non-abandoned gate is left
-// untouched). Returns (freed, transportErr); freed=true means the slot is now (or
-// already was) available so the caller should retry. An unparseable or fresh gate
-// returns freed=false (genuinely busy — refuse, do NOT recover).
-func recoverStaleGate(ctx context.Context, t transport.Transport, p layout.Paths, token string) (bool, error) {
-	gate := gatePath(p.Lock)
-	raw, ok, err := readSmallFile(ctx, t, gate)
-	if err != nil {
-		return false, err
-	}
-	if !ok {
-		return true, nil // gate vanished on its own — slot free, retry
-	}
-	var gi gateInfo
-	if uerr := json.Unmarshal([]byte(raw), &gi); uerr != nil {
-		return false, nil // unparseable — treat as busy, never force-recover blindly
-	}
-	started, perr := time.Parse(time.RFC3339, gi.StartedUTC)
-	if perr != nil || time.Since(started) < gateTTLSeconds*time.Second {
-		return false, nil // fresh (or unparseable timestamp) — genuinely busy
-	}
-	// Abandoned: seize via atomic rename (indivisible — exactly one winner) then
-	// delete. Emptying the GATE slot briefly is safe: the gate is a mutex, not the
-	// ownership record, and create-new re-establishes exclusivity for the retry.
-	dead := gate + ".dead." + token
-	won, serr := seizeByRename(ctx, t, gate, dead)
-	if serr != nil {
-		return false, serr
-	}
-	if won {
-		cc, cancel := cleanupCtx(ctx)
-		defer cancel()
-		_ = deletePath(cc, t, dead)
-	}
-	return true, nil // freed by us or a peer — retry
-}
-
-// seizeByRename atomically renames `from` to `to`. rename(2) / [IO.File]::Move is
-// indivisible: among concurrent callers renaming the SAME source, exactly one
-// succeeds and the rest observe "source gone". Used ONLY to recover an abandoned
-// gate (never the canonical `.lock`). Returns (won, transportErr); won=false when
-// the source no longer exists.
-func seizeByRename(ctx context.Context, t transport.Transport, from, to string) (bool, error) {
+// casSwap performs an atomic compare-and-swap on a HELD `.lock`: in a SINGLE
+// remote command it opens the file with an EXCLUSIVE OS handle, and only if the
+// current bytes equal `expect` does it overwrite them with `content`, all before
+// the handle is released. Because the exclusive handle is held for the command's
+// whole lifetime and dropped by the OS when the command exits (normally or on
+// crash), concurrent takeovers serialize on it and exactly one can win — the
+// canonical path is never emptied. Exit map: 0 ⇒ swapped; 10 ⇒ current bytes no
+// longer equal `expect` (a peer changed/released it); 48 ⇒ absent or momentarily
+// locked by a peer's CAS; anything else ⇒ error. (10/48 ⇒ swapped=false, no error
+// — the caller re-evaluates.)
+func casSwap(ctx context.Context, t transport.Transport, path, expect, content string) (bool, error) {
+	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
+	newB64 := base64.StdEncoding.EncodeToString([]byte(content))
 	var r transport.Result
 	var err error
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`try { [IO.File]::Move(%s,%s); exit 0 } catch { exit 3 }`, psq(from), psq(to))
+		script := fmt.Sprintf(`try{$fs=[IO.File]::Open(%s,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{exit 48}
+$rc=99
+try{
+$len=[int]$fs.Length; $b=New-Object byte[] $len; [void]$fs.Read($b,0,$len)
+$cur=[Convert]::ToBase64String($b)
+if($cur -eq %s){ $nb=[Convert]::FromBase64String(%s); $fs.SetLength(0); $fs.Position=0; $fs.Write($nb,0,$nb.Length); $rc=0 } else { $rc=10 }
+} finally { $fs.Close() }
+exit $rc`, psq(path), psq(expectB64), psq(newB64))
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
+	} else {
+		script := fmt.Sprintf(`exec 9<'%s' 2>/dev/null || exit 48
+flock -n 9 || exit 48
+cur=$(base64 < '%s' | tr -d '\n')
+if [ "$cur" != '%s' ]; then exit 10; fi
+printf '%%s' '%s' | base64 -d > '%s'
+exit 0`, path, path, expectB64, newB64, path)
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
+	}
+	if err != nil {
+		return false, err
+	}
+	switch r.ExitCode {
+	case 0:
+		return true, nil
+	case 10, 48:
+		return false, nil
+	default:
+		return false, fmt.Errorf("compare-and-swap of %s failed (exit %d): %s", path, r.ExitCode, r.Stderr)
+	}
+}
+
+// casDelete performs an atomic compare-and-delete on a HELD `.lock`: in a SINGLE
+// remote command it opens the file with an EXCLUSIVE OS handle and removes it
+// ONLY if the current bytes equal `expect` (this handle's owned content). A
+// successor that legitimately took over after our timeout has DIFFERENT bytes, so
+// its lock is never removed. Exit map: 0 ⇒ deleted (we owned it); 10 ⇒ not ours
+// (no-op); 48 ⇒ already absent or momentarily locked by a peer (no-op); anything
+// else ⇒ the removal itself FAILED and is surfaced as an error so the caller can
+// retry/log it rather than silently strand the lock.
+func casDelete(ctx context.Context, t transport.Transport, path, expect string) (bool, error) {
+	expectB64 := base64.StdEncoding.EncodeToString([]byte(expect))
+	var r transport.Result
+	var err error
+	if t.OS() == spec.OSWindows {
+		script := fmt.Sprintf(`try{$fs=[IO.File]::Open(%s,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Delete)}catch{exit 48}
+$rc=99
+try{
+$len=[int]$fs.Length; $b=New-Object byte[] $len; [void]$fs.Read($b,0,$len)
+$cur=[Convert]::ToBase64String($b)
+if($cur -eq %s){ [IO.File]::Delete(%s); $rc=0 } else { $rc=10 }
+} finally { $fs.Close() }
+if($rc -eq 0 -and (Test-Path -LiteralPath %s)){ exit 17 }
+exit $rc`, psq(path), psq(expectB64), psq(path), psq(path))
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
 	} else {
-		script := fmt.Sprintf(`if mv '%s' '%s' 2>/dev/null; then exit 0; else exit 3; fi`, from, to)
+		script := fmt.Sprintf(`exec 9<'%s' 2>/dev/null || exit 48
+flock -n 9 || exit 48
+cur=$(base64 < '%s' | tr -d '\n')
+if [ "$cur" != '%s' ]; then exit 10; fi
+rm -f '%s'
+if [ -e '%s' ]; then exit 17; fi
+exit 0`, path, path, expectB64, path, path)
 		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
 	}
 	if err != nil {
 		return false, err
 	}
-	return r.ExitCode == 0, nil
+	switch r.ExitCode {
+	case 0:
+		return true, nil
+	case 10, 48:
+		return false, nil
+	default:
+		return false, fmt.Errorf("compare-and-delete of %s failed (exit %d): %s", path, r.ExitCode, r.Stderr)
+	}
 }
 
 func staleWarnMsg(existing lockInfo, host string) string {
@@ -455,11 +430,10 @@ func createLockExclusive(ctx context.Context, t transport.Transport, p layout.Pa
 	return createExclusiveAt(ctx, t, p.Root, p.Lock, content)
 }
 
-// createExclusiveAt runs the atomic create-new at an arbitrary path (used for
-// both the canonical `.lock` and the `<lock>.mx` serialization gate). Returns
-// (created, exitCode, transportErr): created=true on exit 0; exitCode==48 signals
-// the file already existed. DESIGN §13: PowerShell `[IO.File]::Open(CreateNew)`,
-// POSIX `set -C`.
+// createExclusiveAt runs the atomic create-new on the canonical lock path.
+// Returns (created, exitCode, transportErr): created=true on exit 0;
+// exitCode==48 signals the file already existed. DESIGN §13: PowerShell
+// `[IO.File]::Open(CreateNew)`, POSIX `set -C`.
 func createExclusiveAt(ctx context.Context, t transport.Transport, root, path, content string) (bool, int, error) {
 	b64 := base64.StdEncoding.EncodeToString([]byte(content))
 	var r transport.Result
@@ -479,134 +453,37 @@ catch [System.IO.IOException] { exit 48 }`, psq(root), psq(path), psq(b64))
 	return r.ExitCode == 0, r.ExitCode, nil
 }
 
-// gatePath is the per-lock serialization gate: an exclusive create-new file that
-// admits exactly one takeover/release critical section at a time, so the
-// canonical `.lock` is only ever mutated by one gated operation.
-func gatePath(lock string) string { return lock + ".mx" }
-
-// replaceInPlace atomically overwrites `lockPath` with content by writing a
-// unique temp file then renaming it ONTO the destination (POSIX rename / Windows
-// [IO.File]::Replace are atomic and never leave the destination absent). Callers
-// must hold the serialization gate. On any error the temp is cleaned up so no
-// `.tmp.*` residue is stranded (evaluator item 4).
-func replaceInPlace(ctx context.Context, t transport.Transport, p layout.Paths, lockPath, content, token string) error {
-	tmp := lockPath + ".tmp." + token
-	cleanupTmp := func() {
-		cc, cancel := cleanupCtx(ctx)
-		defer cancel()
-		_ = deletePath(cc, t, tmp)
-	}
-	if werr := writeSmallFile(ctx, t, tmp, content); werr != nil {
-		cleanupTmp()
-		return werr
-	}
-	var r transport.Result
-	var err error
-	if t.OS() == spec.OSWindows {
-		// [IO.File]::Replace atomically swaps tmp onto lockPath (dst must exist,
-		// which the gate guarantees) with no intervening absent state.
-		script := fmt.Sprintf(`[IO.File]::Replace(%s,%s,$null)`, psq(tmp), psq(lockPath))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 60})
-	} else {
-		// rename(2) via `mv -f` atomically replaces the destination.
-		script := fmt.Sprintf(`mv -f '%s' '%s'`, tmp, lockPath)
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 60})
-	}
-	if err != nil {
-		cleanupTmp()
-		return err
-	}
-	if r.ExitCode != 0 {
-		cleanupTmp()
-		return fmt.Errorf("atomic replace of %s failed (exit %d): %s", lockPath, r.ExitCode, r.Stderr)
-	}
-	return nil
-}
-
-// deletePath removes a single file (the gate, an owned lock, or a temp) and
-// INSPECTS the command result so a failed removal is reported as an error rather
-// than a silent success (evaluator item 2). Both scripts re-check existence after
-// the remove and exit nonzero if the file is still present, so a permissions or
-// I/O failure surfaces to the caller instead of leaving a stranded gate/lock that
-// cleanup believed it had removed.
-func deletePath(ctx context.Context, t transport.Transport, path string) error {
-	var r transport.Result
-	var err error
-	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf(`Remove-Item -Force -ErrorAction SilentlyContinue %s
-if (Test-Path -LiteralPath %s) { exit 17 } else { exit 0 }`, psq(path), psq(path))
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 30})
-	} else {
-		script := fmt.Sprintf(`rm -f '%s'; if [ -e '%s' ]; then exit 17; else exit 0; fi`, path, path)
-		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 30})
-	}
-	if err != nil {
-		return err
-	}
-	if r.ExitCode != 0 {
-		return fmt.Errorf("delete %s failed (exit %d): %s", path, r.ExitCode, r.Stderr)
-	}
-	return nil
-}
-
-// ReleaseLock releases the lock UNDER THE SERIALIZATION GATE so a caller that
-// overran the timeout can never delete a successor's lock (evaluator item 2).
-// It acquires the exclusive gate, then removes `.lock` ONLY when the persisted
-// bytes still equal this handle's exact content; if a successor has legitimately
-// replaced them, the lock is left untouched. Because takeover also holds this
-// gate and replaces `.lock` in place, ownership verification and removal are
-// never interleaved with a takeover and NO unowned lock is ever temporarily
-// removed. A nil handle, a persistently-busy gate, or a transport error is a
-// safe no-op (never an unsafe delete). The gate is released via a DETACHED
-// cleanup context on every path (item 1), an abandoned gate is recovered so a
-// crashed peer can never permanently block release (item 3), and the critical
-// section is bounded (gateLeaseSeconds).
-func ReleaseLock(ctx context.Context, lk *Lock) {
+// ReleaseLock releases the lock with a SINGLE atomic compare-and-delete
+// (casDelete): in one exclusive-handle command it removes `.lock` ONLY when the
+// persisted bytes still equal this handle's exact content. A caller that overran
+// the timeout can therefore never delete a successor's lock — the successor's
+// bytes differ, so casDelete is a safe no-op. Because the check and the removal
+// happen inside one command that holds the file's exclusive OS handle, no
+// takeover can interleave between "verify" and "delete", and there is no
+// persistent gate that could be stranded by a crash. A nil handle, an already
+// absent/foreign lock, or a momentary peer lock is a safe no-op. A removal that
+// actually FAILS (permissions/IO) is retried a few times and, if still failing,
+// surfaced to the caller so it is logged rather than silently stranding the lock
+// (evaluator item 3).
+func ReleaseLock(ctx context.Context, lk *Lock) error {
 	if lk == nil || lk.t == nil {
-		return
+		return nil
 	}
-	t := lk.t
-	gate := gatePath(lk.paths.Lock)
-	const gateAttempts = 64
-	for attempt := 0; attempt < gateAttempts; attempt++ {
-		gotGate, gexit, gerr := createExclusiveAt(ctx, t, lk.paths.Root, gate, gateContent(lk.token))
-		if gerr != nil {
-			return // transport error — do NOT risk an unsafe delete
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		_, err := casDelete(ctx, lk.t, lk.paths.Lock, lk.content)
+		if err == nil {
+			return nil // deleted, or safely left a successor's/absent lock alone
 		}
-		if gotGate {
-			func() {
-				// Release the gate via a DETACHED, bounded context so a canceled
-				// operation still frees it (item 1).
-				defer func() {
-					cc, cancel := cleanupCtx(ctx)
-					defer cancel()
-					_ = deletePath(cc, t, gate)
-				}()
-				csCtx, cancel := context.WithTimeout(ctx, gateLeaseSeconds*time.Second)
-				defer cancel()
-				cur, ok, _ := readSmallFile(csCtx, t, lk.paths.Lock)
-				if ok && cur == lk.content {
-					_ = deletePath(csCtx, t, lk.paths.Lock) // still ours — release it
-				}
-				// Otherwise a successor owns it (or it is already gone): leave it.
-			}()
-			return
-		}
-		if gexit != 48 {
-			return // unexpected gate failure — safe no-op
-		}
-		// Gate busy: recover it if abandoned (item 3), else brief backoff + retry.
-		if freed, rerr := recoverStaleGate(ctx, t, lk.paths, lk.token); rerr != nil {
-			return // transport error during recovery — safe no-op
-		} else if freed {
-			continue // slot freed — retry the gate create immediately
-		}
+		lastErr = err
 		select {
 		case <-ctx.Done():
-			return
-		case <-time.After(time.Duration(attempt+1) * time.Millisecond):
+			return lastErr
+		case <-time.After(time.Duration(i+1) * 5 * time.Millisecond):
 		}
 	}
+	return lastErr
 }
 
 func psq(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }

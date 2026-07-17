@@ -54,16 +54,13 @@ var reRmOne = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContin
 var reMklink = regexp.MustCompile(`mklink /J "([^"]+)" "([^"]+)"`)
 var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 
-// reReplace captures the atomic in-place replace primitive used by
-// replaceInPlace: `[IO.File]::Replace('<tmp>','<lock>',$null)`. It overwrites the
-// destination without ever leaving it absent (the canonical lock slot is never
-// emptied during a stale takeover).
-var reReplace = regexp.MustCompile(`\[IO\.File\]::Replace\('([^']+)','([^']+)',\$null\)`)
-
-// reSeize captures the atomic rename used ONLY to recover an abandoned gate:
-// `[IO.File]::Move('<from>','<to>')`. Exactly one contender wins; the rest see
-// source-gone (exit 3).
-var reSeize = regexp.MustCompile(`\[IO\.File\]::Move\('([^']+)','([^']+)'\)`)
+// reCasOpen captures the exclusive-handle open shared by casSwap (FileShare::None)
+// and casDelete (FileShare::Delete). The single command holds the OS handle for
+// its whole lifetime and atomically compares-then-swaps/deletes, so no persistent
+// gate is needed and nothing can be stranded on crash.
+var reCasOpen = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)',\[IO\.FileMode\]::Open,\[IO\.FileAccess\]::ReadWrite,\[IO\.FileShare\]::(None|Delete)\)`)
+var reCurEq = regexp.MustCompile(`\$cur -eq '([^']*)'`)
+var reNewB64 = regexp.MustCompile(`FromBase64String\('([^']*)'\)`)
 
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
@@ -72,26 +69,27 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
-	case reReplace.MatchString(s): // replaceInPlace atomic overwrite
-		m := reReplace.FindStringSubmatch(s)
-		from, to := m[1], m[2]
-		src, exists := f.files[from]
+	case reCasOpen.MatchString(s): // casSwap / casDelete exclusive-handle CAS
+		m := reCasOpen.FindStringSubmatch(s)
+		path, share := m[1], m[2]
+		cur, exists := f.files[path]
 		if !exists {
-			return transport.Result{ExitCode: 1, Stderr: "temp missing"}, nil
+			return transport.Result{ExitCode: 48}, nil // absent or peer-locked
 		}
-		f.files[to] = src // atomic: dst present throughout
-		delete(f.files, from)
-		return ok(""), nil
-
-	case reSeize.MatchString(s): // recoverStaleGate atomic rename
-		m := reSeize.FindStringSubmatch(s)
-		from, to := m[1], m[2]
-		src, exists := f.files[from]
-		if !exists {
-			return transport.Result{ExitCode: 3}, nil // source gone: a peer seized first
+		em := reCurEq.FindStringSubmatch(s)
+		if em == nil || base64.StdEncoding.EncodeToString(cur) != em[1] {
+			return transport.Result{ExitCode: 10}, nil // content changed: not ours
 		}
-		f.files[to] = src
-		delete(f.files, from)
+		if share == "None" { // casSwap: overwrite in place
+			nm := reNewB64.FindStringSubmatch(s)
+			if nm == nil {
+				return transport.Result{ExitCode: 99}, nil
+			}
+			nb, _ := base64.StdEncoding.DecodeString(nm[1])
+			f.files[path] = nb
+			return ok(""), nil
+		}
+		delete(f.files, path) // casDelete: compare-and-delete
 		return ok(""), nil
 
 	case reLock.MatchString(s): // AcquireLock create-new (exclusive gate)

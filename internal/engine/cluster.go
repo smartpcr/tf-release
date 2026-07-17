@@ -82,7 +82,9 @@ func (e *Engine) unlockAll(ctx context.Context, cc *clusterCtx) {
 	// release must not consume a shared deadline for the remaining nodes.
 	for i := len(cc.locked) - 1; i >= 0; i-- {
 		rctx, cancel := lockCleanupContext(ctx)
-		ReleaseLock(rctx, cc.locked[i])
+		if rerr := ReleaseLock(rctx, cc.locked[i]); rerr != nil {
+			e.warnf("lock release failed: %v", rerr)
+		}
 		cancel()
 	}
 	cc.locked = nil

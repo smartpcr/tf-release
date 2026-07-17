@@ -81,7 +81,9 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 	defer func() {
 		rctx, cancel := lockCleanupContext(ctx)
 		defer cancel()
-		ReleaseLock(rctx, lk)
+		if rerr := ReleaseLock(rctx, lk); rerr != nil {
+			e.warnf("lock release failed on %s: %v", host, rerr)
+		}
 	}()
 
 	m, err := ReadManifest(ctx, t, p)
@@ -781,7 +783,9 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 	defer func() {
 		rctx, cancel := lockCleanupContext(ctx)
 		defer cancel()
-		ReleaseLock(rctx, lk)
+		if rerr := ReleaseLock(rctx, lk); rerr != nil {
+			e.warnf("lock release failed on %s: %v", host, rerr)
+		}
 	}()
 	rc := releaseCtx(s, p)
 	if err := pat.Uninstall(ctx, t, rc, mode == "purge"); err != nil {
