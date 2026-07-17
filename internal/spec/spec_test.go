@@ -225,8 +225,9 @@ func TestYAMLEqualsJSON(t *testing.T) {
 	}
 }
 
-// Scenario: Pattern union decode — pattern.type: windows_service populates the
-// windows_service fields; fields belonging to other union members stay zero/nil.
+// Scenario: Pattern union decode — pattern.type: windows_service selects the
+// concrete windows_service member (non-nil) via type-directed decoding, and
+// every OTHER concrete union member is nil (DESIGN §6.4).
 func TestPatternUnionDecode(t *testing.T) {
 	t.Setenv("LABDEPLOY_PASSWORD", "x")
 	d, _, err := ParseDeployment(winSvcYAML, map[string]string{"HOST": "lab-01"}, "")
@@ -237,24 +238,129 @@ func TestPatternUnionDecode(t *testing.T) {
 	if p.Type != PatternWindowsService {
 		t.Fatalf("wrong pattern type: %q", p.Type)
 	}
-	if p.ServiceName != "SampleSvc" {
-		t.Fatalf("windows_service member not populated: service_name=%q", p.ServiceName)
+	// The selected concrete member must be non-nil and populated.
+	if p.WindowsService == nil {
+		t.Fatal("windows_service concrete member is nil; type-directed decode failed")
 	}
-	// docker_container members must be nil/zero.
-	if p.ContainerName != "" || p.Ports != nil || p.Volumes != nil || p.RunArgs != nil {
-		t.Fatalf("docker_container members leaked: %+v", p)
+	if p.WindowsService.ServiceName != "SampleSvc" {
+		t.Fatalf("windows_service member not populated: %+v", p.WindowsService)
 	}
-	// node_web_app members must be zero.
-	if p.Entry != "" || p.NodeExe != "" || p.InstallDeps {
-		t.Fatalf("node_web_app members leaked: %+v", p)
+	if p.WindowsService.Exe != `bin\SampleSvc.exe` {
+		t.Fatalf("windows_service.exe not populated: %q", p.WindowsService.Exe)
 	}
-	// dotnet_api members must be zero.
-	if p.DLL != "" || p.Launcher != "" || p.DotnetExe != "" || p.URLs != "" {
-		t.Fatalf("dotnet_api members leaked: %+v", p)
+	// Every OTHER concrete union member must be nil.
+	if p.ConsoleApp != nil {
+		t.Fatalf("console_app member should be nil, got %+v", p.ConsoleApp)
 	}
-	// cluster_generic_service members must be zero.
-	if p.RoleName != "" || p.StaticAddress != "" || p.PreferredOwner != "" {
-		t.Fatalf("cluster_generic_service members leaked: %+v", p)
+	if p.NodeWebApp != nil {
+		t.Fatalf("node_web_app member should be nil, got %+v", p.NodeWebApp)
+	}
+	if p.DotnetAPI != nil {
+		t.Fatalf("dotnet_api member should be nil, got %+v", p.DotnetAPI)
+	}
+	if p.ClusterGeneric != nil {
+		t.Fatalf("cluster_generic_service member should be nil, got %+v", p.ClusterGeneric)
+	}
+	if p.DockerContainer != nil {
+		t.Fatalf("docker_container member should be nil, got %+v", p.DockerContainer)
+	}
+}
+
+// Each pattern.type selects exactly one concrete union member; assert the whole
+// matrix so no two members are ever simultaneously non-nil.
+func TestPatternUnionMatrix(t *testing.T) {
+	base := `
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: p }
+target:
+  transport: winrm
+  hosts: ["h1"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  source: { type: http, url: "https://x/y.zip" }
+health_check: { type: none }
+`
+	t.Setenv("LABDEPLOY_PASSWORD", "x")
+	cases := []struct {
+		name    string
+		pattern string
+		typ     PatternType
+		pick    func(*Pattern) bool
+	}{
+		{"console_app", "type: console_app\n  exe: app.exe", PatternConsoleApp,
+			func(p *Pattern) bool { return p.ConsoleApp != nil }},
+		{"windows_service", "type: windows_service\n  service_name: S\n  exe: s.exe", PatternWindowsService,
+			func(p *Pattern) bool { return p.WindowsService != nil }},
+		{"node_web_app", "type: node_web_app\n  service_name: S\n  entry: server.js\n  port: 8080\n  winsw_exe: winsw.exe", PatternNodeWebApp,
+			func(p *Pattern) bool { return p.NodeWebApp != nil }},
+		{"dotnet_api", "type: dotnet_api\n  service_name: S\n  exe: api.exe", PatternDotnetAPI,
+			func(p *Pattern) bool { return p.DotnetAPI != nil }},
+		{"docker_container", "type: docker_container\n  container_name: c", PatternDockerCont,
+			func(p *Pattern) bool { return p.DockerContainer != nil }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			y := strings.Replace(base, "health_check:", "pattern:\n  "+c.pattern+"\nhealth_check:", 1)
+			// docker_container requires docker_image artifact; swap for that case.
+			if c.typ == PatternDockerCont {
+				y = strings.Replace(y, "type: zip", "type: docker_image", 1)
+				y = strings.Replace(y, `  checksum: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+`, "", 1)
+				y = strings.Replace(y, `source: { type: http, url: "https://x/y.zip" }`,
+					`source: { type: docker_registry, image: "repo/img", tag: "1" }`, 1)
+			}
+			d, _, err := ParseDeploymentLenient(y, nil, "")
+			if err != nil {
+				t.Fatalf("parse %s: %v", c.name, err)
+			}
+			if d.Pattern.Type != c.typ {
+				t.Fatalf("type mismatch: got %q", d.Pattern.Type)
+			}
+			if !c.pick(&d.Pattern) {
+				t.Fatalf("%s concrete member not selected: %+v", c.name, d.Pattern)
+			}
+			members := []interface{}{
+				d.Pattern.ConsoleApp, d.Pattern.WindowsService, d.Pattern.NodeWebApp,
+				d.Pattern.DotnetAPI, d.Pattern.ClusterGeneric, d.Pattern.DockerContainer,
+			}
+			nonNil := 0
+			for _, m := range members {
+				switch v := m.(type) {
+				case *ConsoleAppPattern:
+					if v != nil {
+						nonNil++
+					}
+				case *WindowsServicePattern:
+					if v != nil {
+						nonNil++
+					}
+				case *NodeWebAppPattern:
+					if v != nil {
+						nonNil++
+					}
+				case *DotnetAPIPattern:
+					if v != nil {
+						nonNil++
+					}
+				case *ClusterGenericPattern:
+					if v != nil {
+						nonNil++
+					}
+				case *DockerContainerPattern:
+					if v != nil {
+						nonNil++
+					}
+				}
+			}
+			if nonNil != 1 {
+				t.Fatalf("expected exactly 1 concrete member non-nil, got %d", nonNil)
+			}
+		})
 	}
 }
 

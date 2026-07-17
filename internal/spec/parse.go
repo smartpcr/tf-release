@@ -105,6 +105,9 @@ func ParseDeploymentLenient(raw string, vars map[string]string, versionOverride 
 	var d Deployment
 	dec := json.NewDecoder(strings.NewReader(string(jb)))
 	dec.DisallowUnknownFields()
+	// dec.Decode invokes Pattern.UnmarshalJSON, which performs type-directed
+	// decoding of the pattern.type discriminated union into the matching concrete
+	// member (DESIGN §6.4). See types.go Pattern.decodeUnion.
 	if err := dec.Decode(&d); err != nil {
 		return nil, "", fmt.Errorf("spec decode: %w", err)
 	}
