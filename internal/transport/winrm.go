@@ -10,12 +10,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/masterzen/winrm"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
 
-const winrmChunkRaw = 48000 // raw bytes/chunk (DESIGN §8.1) → ~64KB base64
+const (
+	winrmChunkRaw    = 48000            // raw bytes/chunk (DESIGN §8.1) → ~64KB base64
+	winrmProgressLog = 5 * 1024 * 1024 // TRACE upload progress every 5 MB (DESIGN §8.1)
+)
+
+// runFunc matches winrm.Client.RunWithContextWithString so tests can inject a
+// fake shell channel without a live WinRM server.
+type runFunc func(ctx context.Context, command, stdin string) (string, string, int, error)
 
 type winrmTransport struct {
 	host, user, pass string
@@ -24,6 +32,9 @@ type winrmTransport struct {
 	opTimeoutSec     int
 	retries          int
 	client           *winrm.Client
+	// run is the command channel. Nil in production (falls back to the winrm
+	// client); a test seam injects a fake to exercise Upload/Download/Exec.
+	run runFunc
 }
 
 func newWinRM(host string, port int, user, pass string, https, insecure bool, opTimeout, retries int) *winrmTransport {
@@ -41,16 +52,19 @@ func (w *winrmTransport) Connect(ctx context.Context) error {
 	ep := winrm.NewEndpoint(w.host, w.port, w.https, w.insecure, nil, nil, nil,
 		time.Duration(w.opTimeoutSec)*time.Second)
 	return retryConnect(ctx, w.retries, 5*time.Second, func() error {
-		cli, err := winrm.NewClient(ep, w.user, w.pass)
-		if err != nil {
-			return noRetry(ErrConnect(err))
+		if w.run == nil { // production path; tests pre-seed w.run
+			cli, err := winrm.NewClient(ep, w.user, w.pass)
+			if err != nil {
+				return noRetry(ErrConnect(err))
+			}
+			w.client = cli
 		}
 		// probe: cheap command validates both reachability and credentials
-		_, _, code, err := cli.RunWithContextWithString(ctx, "cmd.exe /c echo ok", "")
+		_, _, code, err := w.runCmd(ctx, "cmd.exe /c echo ok")
 		if err == nil && code == 0 {
-			w.client = cli
 			return nil
 		}
+		w.client = nil
 		if err != nil && isAuthErr(err) {
 			return noRetry(ErrAuth(err)) // never retried (DESIGN §8.1)
 		}
@@ -69,8 +83,19 @@ func isAuthErr(err error) bool {
 
 func (w *winrmTransport) Close() error { w.client = nil; return nil }
 
-func (w *winrmTransport) Exec(ctx context.Context, c Cmd) (Result, error) {
+// runCmd dispatches one command over the injected test seam or the live client.
+func (w *winrmTransport) runCmd(ctx context.Context, line string) (string, string, int, error) {
+	if w.run != nil {
+		return w.run(ctx, line, "")
+	}
 	if w.client == nil {
+		return "", "", 0, ErrConnect(fmt.Errorf("not connected"))
+	}
+	return w.client.RunWithContextWithString(ctx, line, "")
+}
+
+func (w *winrmTransport) Exec(ctx context.Context, c Cmd) (Result, error) {
+	if w.run == nil && w.client == nil {
 		return Result{}, ErrConnect(fmt.Errorf("not connected"))
 	}
 	line, err := BuildCommandLine(spec.OSWindows, c)
@@ -82,17 +107,23 @@ func (w *winrmTransport) Exec(ctx context.Context, c Cmd) (Result, error) {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(c.TimeoutSec)*time.Second)
 		defer cancel()
 	}
-	stdout, stderr, code, err := w.client.RunWithContextWithString(ctx, line, "")
+	stdout, stderr, code, err := w.runCmd(ctx, line)
 	if err != nil {
+		// A mid-session auth rejection (401/unauthorized) maps to ERR_AUTH so
+		// the engine surfaces a credentials diagnostic rather than a transient
+		// connect error (DESIGN §8.1).
+		if isAuthErr(err) {
+			return Result{}, ErrAuth(fmt.Errorf("winrm exec: %w", err))
+		}
 		return Result{}, ErrConnect(fmt.Errorf("winrm exec: %w", err))
 	}
 	return Result{ExitCode: code, Stdout: stdout, Stderr: stderr}, nil
 }
 
-// uploadChunk describes one base64 append operation. Offset/Len are the byte
+// uploadChunk describes one base64 write operation. Offset/Len are the byte
 // window of the source payload this chunk carries; First marks the chunk that
-// CREATES the remote file (WriteAllBytes) vs. later chunks that APPEND via a
-// FileStream (DESIGN §8.1).
+// CREATES the remote file (FileMode CreateNew) vs. later chunks that APPEND via
+// a FileStream (DESIGN §8.1, implementation-plan Stage 2.2 step 4).
 type uploadChunk struct {
 	Offset int
 	Len    int
@@ -119,31 +150,53 @@ func planUploadChunks(size int) []uploadChunk {
 	return chunks
 }
 
-// uploadChunkScript renders the PowerShell for one chunk. The first chunk
-// creates the file with WriteAllBytes; subsequent chunks open a FileStream in
-// Append mode and Write (DESIGN §8.1).
+// uploadChunkScript renders the PowerShell for one chunk. The first chunk opens
+// the file in CreateNew mode (fails if the destination already exists — the
+// caller pre-deletes any stale file so re-runs stay idempotent while never
+// silently overwriting a concurrent writer's file); subsequent chunks open a
+// FileStream in Append mode and Write (DESIGN §8.1, implementation-plan step 4).
 func uploadChunkScript(remote, b64 string, first bool) string {
+	mode := "Append"
 	if first {
-		return fmt.Sprintf(
-			`[IO.File]::WriteAllBytes(%s,[Convert]::FromBase64String(%s))`,
-			psq(remote), psq(b64))
+		mode = "CreateNew"
 	}
 	return fmt.Sprintf(
-		`$b=[Convert]::FromBase64String(%s);$fs=[IO.File]::Open(%s,'Append');$fs.Write($b,0,$b.Length);$fs.Close()`,
-		psq(b64), psq(remote))
+		`$b=[Convert]::FromBase64String(%s);$fs=[IO.File]::Open(%s,[IO.FileMode]::%s,[IO.FileAccess]::Write);$fs.Write($b,0,$b.Length);$fs.Close()`,
+		psq(b64), psq(remote), mode)
 }
 
-// emptyFileScript creates a zero-byte remote file.
+// emptyFileScript creates a zero-byte remote file via CreateNew.
 func emptyFileScript(remote string) string {
-	return fmt.Sprintf(`[IO.File]::WriteAllBytes(%s,[byte[]]@())`, psq(remote))
+	return fmt.Sprintf(
+		`$fs=[IO.File]::Open(%s,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write);$fs.Close()`,
+		psq(remote))
 }
 
-// Upload streams local → remote path via base64 chunk appends (DESIGN §8.1).
+// remoteParentDir safely derives the parent directory of a remote path,
+// returning "" when the path carries no directory separator (avoids the
+// negative-index slice panic on bare filenames).
+func remoteParentDir(remote string) string {
+	idx := strings.LastIndexAny(remote, `\/`)
+	if idx < 0 {
+		return ""
+	}
+	return remote[:idx]
+}
+
+// Upload streams local → remote path via base64 chunk writes (DESIGN §8.1).
 func (w *winrmTransport) Upload(ctx context.Context, local io.Reader, size int64, remote string) error {
-	dir := remote[:strings.LastIndexAny(remote, `\/`)]
-	mk := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null`, psq(dir))
-	if r, err := w.Exec(ctx, Cmd{Shell: ShellPowerShell, Script: mk}); err != nil || r.ExitCode != 0 {
-		return fmt.Errorf("mkdir %s: exit=%d err=%v stderr=%s", dir, r.ExitCode, err, r.Stderr)
+	if dir := remoteParentDir(remote); dir != "" {
+		mk := fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null`, psq(dir))
+		if r, err := w.Exec(ctx, Cmd{Shell: ShellPowerShell, Script: mk}); err != nil || r.ExitCode != 0 {
+			return fmt.Errorf("mkdir %s: exit=%d err=%v stderr=%s", dir, r.ExitCode, err, r.Stderr)
+		}
+	}
+
+	// Pre-delete any stale destination so the CreateNew first chunk succeeds on
+	// re-run without ever overwriting mid-write.
+	rm := fmt.Sprintf(`if(Test-Path -LiteralPath %s){Remove-Item -LiteralPath %s -Force}`, psq(remote), psq(remote))
+	if r, err := w.Exec(ctx, Cmd{Shell: ShellPowerShell, Script: rm}); err != nil || r.ExitCode != 0 {
+		return fmt.Errorf("clear %s: exit=%d err=%v stderr=%s", remote, r.ExitCode, err, r.Stderr)
 	}
 
 	chunks := planUploadChunks(int(size))
@@ -155,6 +208,7 @@ func (w *winrmTransport) Upload(ctx context.Context, local io.Reader, size int64
 	}
 
 	buf := make([]byte, winrmChunkRaw)
+	var sent, lastLogged int64
 	for _, ch := range chunks {
 		if _, err := io.ReadFull(local, buf[:ch.Len]); err != nil {
 			return fmt.Errorf("read upload payload at offset %d: %w", ch.Offset, err)
@@ -167,6 +221,13 @@ func (w *winrmTransport) Upload(ctx context.Context, local io.Reader, size int64
 		}
 		if r.ExitCode != 0 {
 			return fmt.Errorf("upload chunk to %s: %s", remote, r.Stderr)
+		}
+		sent += int64(ch.Len)
+		if sent-lastLogged >= winrmProgressLog {
+			lastLogged = sent
+			tflog.Trace(ctx, "winrm upload progress", map[string]interface{}{
+				"remote": remote, "bytes_sent": sent, "total_bytes": size,
+			})
 		}
 	}
 	return nil

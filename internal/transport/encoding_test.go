@@ -92,13 +92,13 @@ func TestEncodedCommandGoldenBytes(t *testing.T) {
 	}
 	decoded := string(utf16.Decode(u16))
 
-	// O'Brien must be escaped to O''Brien inside a single-quoted assignment,
-	// emitted in sorted key order (GREETING before TOKEN).
-	if !strings.Contains(decoded, "$env:GREETING='O''Brien'") {
-		t.Fatalf("single-quote escaping wrong; decoded payload:\n%s", decoded)
+	// O'Brien must be escaped to O''Brien inside a single-quoted, semicolon-
+	// terminated assignment, emitted in sorted key order (GREETING before TOKEN).
+	if !strings.Contains(decoded, "$env:GREETING='O''Brien';") {
+		t.Fatalf("single-quote/semicolon escaping wrong; decoded payload:\n%s", decoded)
 	}
-	if !strings.Contains(decoded, "$env:TOKEN='s3cr3t-value'") {
-		t.Fatalf("token env assignment missing; decoded payload:\n%s", decoded)
+	if !strings.Contains(decoded, "$env:TOKEN='s3cr3t-value';") {
+		t.Fatalf("token env assignment missing semicolon form; decoded payload:\n%s", decoded)
 	}
 	gi := strings.Index(decoded, "$env:GREETING")
 	ti := strings.Index(decoded, "$env:TOKEN")
