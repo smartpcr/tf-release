@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -32,17 +33,22 @@ func (e *Engine) newClusterCtx(ctx context.Context, s *spec.Deployment) (*cluste
 		return layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, version)
 	}
 	for _, h := range cc.hosts {
+		sl := newStepLogger(s, h)
+		vstart := time.Now()
 		t, err := e.NewTransport(&s.Target, h)
 		if err != nil {
+			sl.emit(ctx, "VALIDATE", vstart)
 			cc.closeAll()
 			return nil, err
 		}
+		sl.emit(ctx, "VALIDATE", vstart)
 		cstart := time.Now()
 		if err := t.Connect(ctx); err != nil {
+			sl.emit(ctx, "CONNECT", cstart)
 			cc.closeAll()
 			return nil, wrapTransportErr(err, h, "CONNECT")
 		}
-		newStepLogger(s, h).emit(ctx, "CONNECT", cstart)
+		sl.emit(ctx, "CONNECT", cstart)
 		cc.tr[h] = t
 	}
 	return cc, nil
@@ -203,24 +209,33 @@ func (e *Engine) clusterCreate(ctx context.Context, cc *clusterCtx) (*Status, er
 		}
 	}
 	// C2: role creation on coordinator.
-	if err := cc.cg.CreateRole(ctx, cc.coord(), s.Pattern.ServiceName, s.Pattern.RoleName, s.Pattern.StaticAddress); err != nil {
+	slCoord := newStepLogger(s, cc.hosts[0])
+	if err := slCoord.timed(ctx, "CREATE_ROLE", func() error {
+		return cc.cg.CreateRole(ctx, cc.coord(), s.Pattern.ServiceName, s.Pattern.RoleName, s.Pattern.StaticAddress)
+	}); err != nil {
+		e.clusterFinalize(ctx, cc, "", started, "failed")
 		return nil, err
 	}
 	// C3: preferred owners.
 	if s.Pattern.PreferredOwner != "" {
 		ordered := preferredFirst(cc.hosts, strings.ToLower(s.Pattern.PreferredOwner))
-		if err := cc.cg.SetPreferredOwners(ctx, cc.coord(), s.Pattern.RoleName, ordered); err != nil {
+		if err := slCoord.timed(ctx, "SET_OWNERS", func() error {
+			return cc.cg.SetPreferredOwners(ctx, cc.coord(), s.Pattern.RoleName, ordered)
+		}); err != nil {
+			e.clusterFinalize(ctx, cc, "", started, "failed")
 			return nil, err
 		}
 	}
 	// C4: bring online.
-	if err := cc.cg.StartGroup(ctx, cc.coord(), s.Pattern.RoleName, 120); err != nil {
+	if err := slCoord.timed(ctx, "START", func() error {
+		return cc.cg.StartGroup(ctx, cc.coord(), s.Pattern.RoleName, 120)
+	}); err != nil {
 		e.clusterFinalize(ctx, cc, "", started, "failed")
 		return nil, err
 	}
 	// C5: settle + health on the owner node.
 	time.Sleep(time.Duration(s.Strategy.Cluster.EffectiveSettle()) * time.Second)
-	if err := e.clusterHealthOnOwner(ctx, cc); err != nil {
+	if err := slCoord.timed(ctx, "HEALTH", func() error { return e.clusterHealthOnOwner(ctx, cc) }); err != nil {
 		_ = cc.cg.StopGroup(ctx, cc.coord(), s.Pattern.RoleName)
 		e.clusterFinalize(ctx, cc, "", started, "failed")
 		return nil, fmt.Errorf("%w; role stopped after failed create (CLU-01 failure path)", err)
@@ -312,16 +327,21 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 	if po := strings.ToLower(s.Pattern.PreferredOwner); po != "" {
 		poHost := matchHost(cc.hosts, po)
 		if poHost != "" && poHost != firstNew {
-			if err := cc.cg.MoveGroup(ctx, cc.coord(), s.Pattern.RoleName, poHost, drain); err != nil {
+			slPo := newStepLogger(s, poHost)
+			if err := slPo.timed(ctx, "MOVE_GROUP", func() error {
+				return cc.cg.MoveGroup(ctx, cc.coord(), s.Pattern.RoleName, poHost, drain)
+			}); err != nil {
 				return nil, e.clusterRollback(ctx, cc, owner, passives, prevVersion, started, err)
 			}
 			time.Sleep(time.Duration(settle) * time.Second)
-			if err := e.clusterHealthOn(ctx, cc, poHost); err != nil {
+			if err := slPo.timed(ctx, "HEALTH", func() error { return e.clusterHealthOn(ctx, cc, poHost) }); err != nil {
 				return nil, e.clusterRollback(ctx, cc, owner, passives, prevVersion, started, err)
 			}
 		}
 		ordered := preferredFirst(cc.hosts, po)
-		if err := cc.cg.SetPreferredOwners(ctx, cc.coord(), s.Pattern.RoleName, ordered); err != nil {
+		if err := newStepLogger(s, cc.hosts[0]).timed(ctx, "SET_OWNERS", func() error {
+			return cc.cg.SetPreferredOwners(ctx, cc.coord(), s.Pattern.RoleName, ordered)
+		}); err != nil {
 			e.warnf("set preferred owners failed: %v", err)
 		}
 	}
@@ -357,15 +377,26 @@ func (e *Engine) clusterRollback(ctx context.Context, cc *clusterCtx, oldOwner s
 	rbStart := time.Now()
 
 	// R1: move role back to old owner (still on prev junction until U6 ran;
-	// if U6 already switched it, restore its junction FIRST).
+	// if U6 already switched it, restore its junction FIRST). SWITCH/CONFIGURE
+	// here are idempotent restores, but a genuine failure means the old owner is
+	// NOT restored — those errors are collected (not suppressed) so the rollback
+	// cannot falsely report a recovered cluster (evaluator iter2 item 8).
 	pPrevOwner := cc.paths(oldOwner, prevVersion)
 	slOwner := slFor(oldOwner)
-	_ = slOwner.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[oldOwner], pPrevOwner) }) // idempotent restore
-	_ = slOwner.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[oldOwner], releaseCtx(s, pPrevOwner)) })
+	var restoreErrs []error
+	if err := slOwner.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[oldOwner], pPrevOwner) }); err != nil {
+		restoreErrs = append(restoreErrs, fmt.Errorf("owner %s junction restore: %w", oldOwner, err))
+	}
+	if err := slOwner.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[oldOwner], releaseCtx(s, pPrevOwner)) }); err != nil {
+		restoreErrs = append(restoreErrs, fmt.Errorf("owner %s reconfigure: %w", oldOwner, err))
+	}
 	if err := slOwner.timed(ctx, "MOVE_GROUP", func() error {
 		return cc.cg.MoveGroup(ctx, cc.coord(), s.Pattern.RoleName, oldOwner, drain)
 	}); err != nil {
 		slOwner.emit(ctx, "ROLLBACK", rbStart)
+		// Write failed manifests so target state is recorded before we surface
+		// ERR_ROLLBACK_FAILED (evaluator iter2 item 9).
+		e.clusterFinalizeVersion(ctx, cc, prevVersion, "", started, "failed")
 		return coded("ERR_ROLLBACK_FAILED", oldOwner, "ROLLBACK",
 			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — role could not return to %s; deploy: %v; move-back: %v", oldOwner, oldOwner, orig, err))
 	}
@@ -373,20 +404,34 @@ func (e *Engine) clusterRollback(ctx context.Context, cc *clusterCtx, oldOwner s
 	time.Sleep(time.Duration(s.Strategy.Cluster.EffectiveSettle()) * time.Second)
 	if err := slOwner.timed(ctx, "HEALTH", func() error { return e.clusterHealthOnVersion(ctx, cc, oldOwner, prevVersion) }); err != nil {
 		slOwner.emit(ctx, "ROLLBACK", rbStart)
+		e.clusterFinalizeVersion(ctx, cc, prevVersion, "", started, "failed")
 		return coded("ERR_ROLLBACK_FAILED", oldOwner, "ROLLBACK",
 			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — old version unhealthy after move-back; deploy: %v; health: %v", oldOwner, orig, err))
 	}
-	// R3: restore passive junctions + registration to prev.
+	// R3: restore passive junctions + registration to prev. A passive that fails
+	// to restore leaves the cluster partially updated, so its error is collected
+	// and forces ERR_ROLLBACK_FAILED rather than a silent rolled_back (item 8).
 	for _, h := range passives {
 		pp := cc.paths(h, prevVersion)
 		slp := slFor(h)
 		if err := slp.timed(ctx, "SWITCH", func() error { return e.switchJunction(ctx, cc.tr[h], pp) }); err != nil {
-			e.warnf("rollback: junction restore failed on %s: %v", h, err)
+			restoreErrs = append(restoreErrs, fmt.Errorf("passive %s junction restore: %w", h, err))
 			continue
 		}
-		_ = slp.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[h], releaseCtx(s, pp)) })
+		if err := slp.timed(ctx, "CONFIGURE", func() error { return cc.cg.Configure(ctx, cc.tr[h], releaseCtx(s, pp)) }); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("passive %s reconfigure: %w", h, err))
+		}
 	}
 	slOwner.emit(ctx, "ROLLBACK", rbStart)
+	if len(restoreErrs) > 0 {
+		// Role is back on the old owner and healthy, but one or more nodes were
+		// not restored to prev — record failed manifests and surface the unknown
+		// state instead of reporting a clean rollback (item 8 + item 9).
+		e.clusterFinalizeVersion(ctx, cc, prevVersion, "", started, "failed")
+		return coded("ERR_ROLLBACK_FAILED", oldOwner, "ROLLBACK",
+			fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — role restored to %s but node(s) not fully rolled back; deploy: %v; restore errors: %v",
+				oldOwner, oldOwner, orig, errors.Join(restoreErrs...)))
+	}
 	// R4: manifests reflect rolled_back state.
 	e.clusterFinalizeVersion(ctx, cc, prevVersion, "", started, "rolled_back")
 	// R5: surface original failure.

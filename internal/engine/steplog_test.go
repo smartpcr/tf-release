@@ -118,11 +118,14 @@ func TestStepLogFreshSingleHostOrder(t *testing.T) {
 	steps := captureSteps(t, &buf)
 	names := stepNames(steps)
 
-	// Fresh single-host deploy executes every fixed step exactly once, in the
-	// state-machine order (STOP→SWITCH→CONFIGURE→START per DESIGN §9.2).
+	// Fresh single-host deploy executes every fixed step exactly once. The
+	// staging steps follow the pinned fixed-step order (implementation-plan.md:224
+	// / DESIGN §8.5): FETCH → CHECKSUM → STAGE → EXTRACT → RENDER. The switchover
+	// steps follow the normative state-machine execution order
+	// (STOP → SWITCH → CONFIGURE → START, DESIGN §9.2).
 	want := []string{
 		"VALIDATE", "CONNECT", "PREFLIGHT", "LOCK",
-		"STAGE", "FETCH", "CHECKSUM", "EXTRACT", "RENDER",
+		"FETCH", "CHECKSUM", "STAGE", "EXTRACT", "RENDER",
 		"STOP", "SWITCH", "CONFIGURE", "START", "HEALTH",
 		"FINALIZE", "PRUNE", "UNLOCK",
 	}
