@@ -1,0 +1,6 @@
+$ErrorActionPreference='Continue'
+$paths = @('C:\app\logs\*.log','C:\app\_results\*.trx') | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty FullName -Unique
+if(-not $paths){ Write-Output 'NOFILES'; exit 0 }
+Compress-Archive -Path $paths -DestinationPath 'C:\Windows\Temp\labdeploy-logs.zip' -Force
+Write-Output 'ZIPPED'
+exit 0

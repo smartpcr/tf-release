@@ -30,17 +30,8 @@ func CollectFiles(ctx context.Context, t transport.Transport, globs []string, de
 	stamp := time.Now().UTC().Format("20060102T150405Z")
 	if t.OS() == spec.OSWindows {
 		remoteZip := fmt.Sprintf(`%s\labdeploy-logs-%s.zip`, `C:\Windows\Temp`, stamp)
-		items := make([]string, len(globs))
-		for i, g := range globs {
-			items[i] = psq(g)
-		}
-		script := fmt.Sprintf(`$ErrorActionPreference='Continue'
-$paths = @(%s) | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty FullName -Unique
-if(-not $paths){ Write-Output 'NOFILES'; exit 0 }
-Compress-Archive -Path $paths -DestinationPath %s -Force
-Write-Output 'ZIPPED'
-exit 0`, strings.Join(items, ","), psq(remoteZip))
-		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 300})
+		cmd := buildZipScript(t.OS(), globs, remoteZip)
+		r, err := t.Exec(ctx, cmd)
 		if err != nil || r.ExitCode != 0 {
 			return out, []string{fmt.Sprintf("log zip on %s: err=%v %s", t.Host(), err, r.Stderr)}
 		}
@@ -57,16 +48,8 @@ exit 0`, strings.Join(items, ","), psq(remoteZip))
 		return out, warns
 	}
 	remoteTar := fmt.Sprintf("/tmp/labdeploy-logs-%s.tar.gz", stamp)
-	quoted := make([]string, len(globs))
-	for i, g := range globs {
-		quoted[i] = "'" + g + "'"
-	}
-	script := fmt.Sprintf(`set +e
-files=$(ls -1 %s 2>/dev/null)
-[ -z "$files" ] && { echo NOFILES; exit 0; }
-tar czf '%s' $files
-echo ZIPPED`, strings.Join(quoted, " "), remoteTar)
-	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 300})
+	cmd := buildZipScript(t.OS(), globs, remoteTar)
+	r, err := t.Exec(ctx, cmd)
 	if err != nil || r.ExitCode != 0 {
 		return out, []string{fmt.Sprintf("log tar on %s: err=%v %s", t.Host(), err, r.Stderr)}
 	}
@@ -77,8 +60,39 @@ echo ZIPPED`, strings.Join(quoted, " "), remoteTar)
 	if err := t.Download(ctx, remoteTar, local); err != nil {
 		return out, []string{fmt.Sprintf("log download from %s: %v", t.Host(), err)}
 	}
-	_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: "rm -f '" + remoteTar + "'", TimeoutSec: 30})
+	_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: "rm -f " + shq(remoteTar), TimeoutSec: 30})
 	return append(out, local), warns
+}
+
+// buildZipScript renders the glob-to-archive command executed ON THE TARGET
+// (DESIGN §8.5, T8 "glob→zip script golden"). Windows uses Compress-Archive
+// over Get-ChildItem matches; Linux uses tar over ls matches. Emits the sentinel
+// "NOFILES" (exit 0) when nothing matched. Pure function so it can be
+// golden-tested. globs and archive are quoted to prevent script breakage.
+func buildZipScript(os spec.OSKind, globs []string, archive string) transport.Cmd {
+	if os == spec.OSWindows {
+		items := make([]string, len(globs))
+		for i, g := range globs {
+			items[i] = psq(g)
+		}
+		return transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 300, Script: fmt.Sprintf(
+			`$ErrorActionPreference='Continue'
+$paths = @(%s) | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty FullName -Unique
+if(-not $paths){ Write-Output 'NOFILES'; exit 0 }
+Compress-Archive -Path $paths -DestinationPath %s -Force
+Write-Output 'ZIPPED'
+exit 0`, strings.Join(items, ","), psq(archive))}
+	}
+	quoted := make([]string, len(globs))
+	for i, g := range globs {
+		quoted[i] = shq(g)
+	}
+	return transport.Cmd{Shell: transport.ShellSh, TimeoutSec: 300, Script: fmt.Sprintf(
+		`set +e
+files=$(ls -1 %s 2>/dev/null)
+[ -z "$files" ] && { echo NOFILES; exit 0; }
+tar czf %s $files
+echo ZIPPED`, strings.Join(quoted, " "), shq(archive))}
 }
 
 // CollectEventLogs exports matching Windows events since `since` as JSON lines
@@ -228,3 +242,5 @@ var unsafeRe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 func sanitize(s string) string { return unsafeRe.ReplaceAllString(s, "_") }
 
 func psq(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+
+func shq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }

@@ -1,0 +1,5 @@
+set +e
+files=$(ls -1 '/var/log/app/*.log' '/opt/app/_results/*.xml' 2>/dev/null)
+[ -z "$files" ] && { echo NOFILES; exit 0; }
+tar czf '/tmp/labdeploy-logs.tar.gz' $files
+echo ZIPPED
