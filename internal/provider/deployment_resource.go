@@ -223,9 +223,15 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	}
 	eng := engine.New()
 	st, err := eng.ReadStatus(ctx, d)
+	for _, w := range eng.Warnings {
+		resp.Diagnostics.AddWarning("labdeploy", w)
+	}
 	if err != nil {
-		// Unreachable target ≠ deleted resource (DESIGN §10.4): keep state.
-		resp.Diagnostics.AddWarning("labdeploy read degraded", err.Error())
+		// DESIGN §10.4: refresh MUST fail loudly on transport errors (no silent
+		// drop). We surface an ERROR diagnostic but do NOT RemoveResource, so the
+		// prior state is retained — an unreachable target is not a deleted
+		// resource (evaluator item 4).
+		resp.Diagnostics.AddError("labdeploy read failed", err.Error())
 		return
 	}
 	if st == nil { // manifest absent ⇒ resource gone

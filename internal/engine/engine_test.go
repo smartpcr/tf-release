@@ -50,11 +50,28 @@ func (f *fakeHost) Host() string                      { return f.host }
 
 var reRead = regexp.MustCompile(`ReadAllBytes\('([^']+)'\)`)
 var reWrite = regexp.MustCompile(`WriteAllBytes\('([^']+)',\[Convert\]::FromBase64String\('([^']*)'\)\)`)
-var reLock = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)','CreateNew'\)`)
+var reLock = regexp.MustCompile(`\[IO\.File\]::Move\(\$tmp,'([^']+)'\)`)
 var reRmRecurse = regexp.MustCompile(`Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '([^']+)'`)
 var reRmOne = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
 var reMklink = regexp.MustCompile(`mklink /J "([^"]+)" "([^"]+)"`)
 var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
+
+// reCasDel captures the compare-and-delete used by casDelete. Under the shared
+// path-keyed mutex it reads the current bytes and removes the file only when they
+// match this owner's content, so no persistent gate is needed and nothing can be
+// stranded on crash. Keyed on the [IO.File]::Delete call (checked before reRead,
+// which the same script also contains via ReadAllBytes).
+var reCasDel = regexp.MustCompile(`\[IO\.File\]::Delete\('([^']+)'\)`)
+var reCurEq = regexp.MustCompile(`\$cur -eq '([^']*)'`)
+
+// reCasReplace captures the atomic crash-safe compare-and-replace used by
+// casReplace: a per-path Global mutex serializes the compare, then the successor
+// bytes are published by writing a private temp and swapping it in with an atomic
+// [IO.File]::Replace (NTFS transacted, write-through) — NO in-place mutation, so an
+// interruption leaves either the intact stale lock or the intact successor, never
+// a partial/mixed file. reCasReplace captures the destination from the Replace call.
+var reCasReplace = regexp.MustCompile(`\[IO\.File\]::Replace\(\$tmp,'([^']+)',`)
+var reCurNe = regexp.MustCompile(`\$cur -ne '([^']*)'`)
 
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
@@ -63,10 +80,42 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
-	case reLock.MatchString(s): // AcquireLock CreateNew
+	case reCasReplace.MatchString(s): // casReplace atomic crash-safe compare-and-replace
+		m := reCasReplace.FindStringSubmatch(s)
+		path := m[1]
+		cur, exists := f.files[path]
+		if !exists {
+			return transport.Result{ExitCode: 48}, nil // slot released
+		}
+		em := reCurNe.FindStringSubmatch(s)
+		if em == nil || base64.StdEncoding.EncodeToString(cur) != em[1] {
+			return transport.Result{ExitCode: 10}, nil // a fresh successor already installed
+		}
+		if nm := regexp.MustCompile(`FromBase64String\('([^']*)'\)`).FindStringSubmatch(s); nm != nil {
+			raw, _ := base64.StdEncoding.DecodeString(nm[1])
+			f.files[path] = raw // atomic replace: never absent/empty/partial
+		}
+		f.mark("LOCK")
+		return ok(""), nil
+
+	case reCasDel.MatchString(s): // casDelete compare-and-delete (shared mutex)
+		m := reCasDel.FindStringSubmatch(s)
+		path := m[1]
+		cur, exists := f.files[path]
+		if !exists {
+			return transport.Result{ExitCode: 48}, nil // absent or peer-locked
+		}
+		em := reCurEq.FindStringSubmatch(s)
+		if em == nil || base64.StdEncoding.EncodeToString(cur) != em[1] {
+			return transport.Result{ExitCode: 10}, nil // content changed: not ours
+		}
+		delete(f.files, path) // casDelete: compare-and-delete
+		return ok(""), nil
+
+	case reLock.MatchString(s): // AcquireLock atomic create (temp then Move publish)
 		p := reLock.FindStringSubmatch(s)[1]
 		if _, held := f.files[p]; held {
-			return transport.Result{ExitCode: 48}, nil
+			return transport.Result{ExitCode: 48}, nil // create-with-content: fail if exists
 		}
 		// content arrives via FromBase64String('<b64>')
 		if m := regexp.MustCompile(`FromBase64String\('([^']*)'\)`).FindStringSubmatch(s); m != nil {
@@ -158,6 +207,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "not_installed"): // Status probe
+		if f.fail["status"] {
+			return transport.Result{}, fmt.Errorf("simulated status probe transport failure")
+		}
 		if f.svc == "" {
 			return ok("not_installed"), nil
 		}
@@ -177,6 +229,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(b.String()), nil
 
 	case reRmRecurse.MatchString(s):
+		if f.fail["rmtree"] {
+			return transport.Result{}, fmt.Errorf("simulated recursive removal transport failure")
+		}
 		p := reRmRecurse.FindStringSubmatch(s)[1]
 		if f.fail["rm"] || (f.fail["rmRelease"] && strings.Contains(p, "releases")) {
 			return transport.Result{ExitCode: 1, Stderr: "remove failed"}, nil

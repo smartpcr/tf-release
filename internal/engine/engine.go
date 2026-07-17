@@ -75,14 +75,20 @@ func (e *Engine) deploySingle(ctx context.Context, s *spec.Deployment) (*Status,
 		return nil, err
 	}
 
-	warn, err := AcquireLock(ctx, t, p, lockOwner(), "deploy", s.Strategy.EffectiveLockTimeout())
+	lk, warn, err := AcquireLock(ctx, t, p, lockOwner(), "deploy", s.Strategy.EffectiveLockTimeout())
 	if err != nil {
 		return nil, err
 	}
 	if warn != "" {
 		e.warnf("%s", warn)
 	}
-	defer ReleaseLock(ctx, t, p)
+	defer func() {
+		rctx, cancel := lockCleanupContext(ctx)
+		defer cancel()
+		if rerr := ReleaseLock(rctx, lk); rerr != nil {
+			e.warnf("lock release failed on %s: %v", host, rerr)
+		}
+	}()
 
 	m, err := ReadManifest(ctx, t, p)
 	if err != nil {
@@ -861,16 +867,26 @@ func (e *Engine) ReadStatus(ctx context.Context, s *spec.Deployment) (*Status, e
 	if err != nil {
 		return nil, coded("ERR_CONNECT", host, "PREFLIGHT", err)
 	}
-	if m == nil {
+	present, deployedVer, warn := ReconcileManifest(m)
+	if !present {
 		return nil, nil
+	}
+	if warn != "" {
+		e.warnf("%s", warn)
 	}
 	pat, err := pattern.For(s.Pattern.Type)
 	if err != nil {
 		return nil, err
 	}
 	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
-	st, _ := pat.Status(ctx, t, releaseCtx(s, rp))
+	st, serr := pat.Status(ctx, t, releaseCtx(s, rp))
+	if serr != nil {
+		// A failed status probe is a loud refresh failure, not an empty/healthy
+		// service status (evaluator item 5 / DESIGN §10.4).
+		return nil, wrapTransportErr(serr, host, "READ")
+	}
 	out := statusFrom(m, host, st)
+	out.DeployedVersion = deployedVer
 	if s.Pattern.Type == spec.PatternClusterGeneric {
 		out.Hosts = lowerAll(s.Target.Hosts)
 	}
@@ -899,16 +915,26 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 	if err != nil {
 		return err
 	}
-	warn, err := AcquireLock(ctx, t, p, lockOwner(), "destroy", s.Strategy.EffectiveLockTimeout())
+	lk, warn, err := AcquireLock(ctx, t, p, lockOwner(), "destroy", s.Strategy.EffectiveLockTimeout())
 	if err != nil {
 		return err
 	}
 	if warn != "" {
 		e.warnf("%s", warn)
 	}
+	// Release the lock on EVERY post-lock return path — including a failed tree
+	// removal in purge mode, which previously left .lock behind (evaluator
+	// item 2). The detached cleanup context ensures release runs even if ctx is
+	// already canceled (item 3); release is ownership-safe (compare-and-delete).
+	defer func() {
+		rctx, cancel := lockCleanupContext(ctx)
+		defer cancel()
+		if rerr := ReleaseLock(rctx, lk); rerr != nil {
+			e.warnf("lock release failed on %s: %v", host, rerr)
+		}
+	}()
 	rc := releaseCtx(s, p)
 	if err := pat.Uninstall(ctx, t, rc, mode == "purge"); err != nil {
-		ReleaseLock(ctx, t, p)
 		return err
 	}
 	if mode == "purge" {
@@ -916,10 +942,8 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 	}
 	// unregister: keep releases/shared, drop manifest so Read sees absent.
 	if err := e.removePath(ctx, t, p.Manifest); err != nil {
-		ReleaseLock(ctx, t, p)
 		return err
 	}
-	ReleaseLock(ctx, t, p)
 	return nil
 }
 
