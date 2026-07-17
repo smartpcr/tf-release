@@ -1,0 +1,26 @@
+# golangci-lint config for terraform-provider-labdeploy.
+# DESIGN sec 20 requires `golangci-lint run` to be clean.
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - unconvert
+    - gosimple
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/smartpcr/terraform-provider-labdeploy

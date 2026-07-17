@@ -1,0 +1,48 @@
+# goreleaser config for terraform-provider-labdeploy (DESIGN sec 16.1 / sec 20).
+#
+# Produces `terraform-provider-labdeploy_v<version>_<os>_<arch>.zip` archives for
+# linux_amd64 and windows_amd64. The provider is a statically linked, cgo-free
+# binary (CGO_ENABLED=0) so runners need no external toolchain beyond terraform.
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: terraform-provider-labdeploy
+    binary: terraform-provider-labdeploy_v{{ .Version }}
+    main: .
+    env:
+      # Hard build invariant: no cgo (DESIGN sec 20).
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+      - windows
+    goarch:
+      - amd64
+
+archives:
+  - id: zip
+    formats:
+      - zip
+    # Matches the filesystem-mirror artifact name expected by runners.
+    name_template: 'terraform-provider-labdeploy_v{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+
+checksum:
+  name_template: 'terraform-provider-labdeploy_v{{ .Version }}_SHA256SUMS'
+  algorithm: sha256
+
+snapshot:
+  version_template: '{{ incpatch .Version }}-snapshot'
+
+changelog:
+  disable: true
+
+release:
+  # Draft the release so a human can review before publishing.
+  draft: true
