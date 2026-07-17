@@ -122,8 +122,8 @@ func (w *winrmTransport) Exec(ctx context.Context, c Cmd) (Result, error) {
 
 // uploadChunk describes one base64 write operation. Offset/Len are the byte
 // window of the source payload this chunk carries; First marks the chunk that
-// CREATES the remote file (FileMode CreateNew) vs. later chunks that APPEND via
-// a FileStream (DESIGN §8.1, implementation-plan Stage 2.2 step 4).
+// CREATES the remote file (via [IO.File]::WriteAllBytes) vs. later chunks that
+// APPEND via a FileStream (DESIGN §8.1).
 type uploadChunk struct {
 	Offset int
 	Len    int
@@ -150,25 +150,29 @@ func planUploadChunks(size int) []uploadChunk {
 	return chunks
 }
 
-// uploadChunkScript renders the PowerShell for one chunk. The first chunk opens
-// the file in CreateNew mode (fails if the destination already exists — the
-// caller pre-deletes any stale file so re-runs stay idempotent while never
-// silently overwriting a concurrent writer's file); subsequent chunks open a
-// FileStream in Append mode and Write (DESIGN §8.1, implementation-plan step 4).
+// uploadChunkScript renders the PowerShell for one chunk. The first chunk writes
+// the whole payload with [IO.File]::WriteAllBytes, which creates the destination
+// and atomically replaces any prior file in place — so re-runs stay idempotent
+// without a separate pre-delete, and a mid-upload failure leaves the previous
+// file intact until chunk 1 lands. Subsequent chunks open a FileStream in Append
+// mode and Write (DESIGN §8.1).
 func uploadChunkScript(remote, b64 string, first bool) string {
-	mode := "Append"
 	if first {
-		mode = "CreateNew"
+		return fmt.Sprintf(
+			`[IO.File]::WriteAllBytes(%s,[Convert]::FromBase64String(%s))`,
+			psq(remote), psq(b64))
 	}
 	return fmt.Sprintf(
-		`$b=[Convert]::FromBase64String(%s);$fs=[IO.File]::Open(%s,[IO.FileMode]::%s,[IO.FileAccess]::Write);$fs.Write($b,0,$b.Length);$fs.Close()`,
-		psq(b64), psq(remote), mode)
+		`$b=[Convert]::FromBase64String(%s);$fs=[IO.File]::Open(%s,[IO.FileMode]::Append,[IO.FileAccess]::Write);$fs.Write($b,0,$b.Length);$fs.Close()`,
+		psq(b64), psq(remote))
 }
 
-// emptyFileScript creates a zero-byte remote file via CreateNew.
+// emptyFileScript creates (or replaces) a zero-byte remote file via WriteAllBytes
+// with an empty buffer, mirroring the first-chunk WriteAllBytes so re-runs
+// overwrite in place without a pre-delete (DESIGN §8.1).
 func emptyFileScript(remote string) string {
 	return fmt.Sprintf(
-		`$fs=[IO.File]::Open(%s,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write);$fs.Close()`,
+		`[IO.File]::WriteAllBytes(%s,(New-Object byte[] 0))`,
 		psq(remote))
 }
 
@@ -190,13 +194,6 @@ func (w *winrmTransport) Upload(ctx context.Context, local io.Reader, size int64
 		if r, err := w.Exec(ctx, Cmd{Shell: ShellPowerShell, Script: mk}); err != nil || r.ExitCode != 0 {
 			return fmt.Errorf("mkdir %s: exit=%d err=%v stderr=%s", dir, r.ExitCode, err, r.Stderr)
 		}
-	}
-
-	// Pre-delete any stale destination so the CreateNew first chunk succeeds on
-	// re-run without ever overwriting mid-write.
-	rm := fmt.Sprintf(`if(Test-Path -LiteralPath %s){Remove-Item -LiteralPath %s -Force}`, psq(remote), psq(remote))
-	if r, err := w.Exec(ctx, Cmd{Shell: ShellPowerShell, Script: rm}); err != nil || r.ExitCode != 0 {
-		return fmt.Errorf("clear %s: exit=%d err=%v stderr=%s", remote, r.ExitCode, err, r.Stderr)
 	}
 
 	chunks := planUploadChunks(int(size))
