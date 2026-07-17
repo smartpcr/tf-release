@@ -1,0 +1,2 @@
+$c=New-Object Net.Sockets.TcpClient
+try { $c.Connect('localhost', 5432); if($c.Connected){exit 0} exit 1 } catch { exit 1 } finally { $c.Close() }

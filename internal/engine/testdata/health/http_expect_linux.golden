@@ -1,0 +1,1 @@
+code=$(curl -sS -o /tmp/.ld_hc_body -w '%{http_code}' --max-time 10 'http://localhost:8080/health') && [ "$code" = "503" ] && grep -Eq 'v=1\.2\.3' /tmp/.ld_hc_body

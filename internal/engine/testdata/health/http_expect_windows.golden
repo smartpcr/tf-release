@@ -1,0 +1,4 @@
+try { $r=Invoke-WebRequest -UseBasicParsing -Uri 'http://localhost:8080/health' -TimeoutSec 10 } catch { Write-Output $_.Exception.Message; exit 1 }
+if([int]$r.StatusCode -ne 503){ Write-Output ("status " + $r.StatusCode); exit 1 }
+if($r.Content -notmatch 'v=1\.2\.3'){ Write-Output "body mismatch"; exit 1 }
+exit 0
