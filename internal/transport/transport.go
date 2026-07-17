@@ -172,6 +172,11 @@ func withEnvPS(script string, env map[string]string) string {
 	return b.String()
 }
 
+// withEnvSh prepends POSIX `K='V' ` inline assignments in sorted key order so
+// the values scope only to the command that follows (DESIGN §8.1: `sh -c
+// '<script>'` with env prepended `K='V' `). Inline assignments — not `export`
+// lines — keep the contract a single command line and match the design's
+// golden shape. Deterministic ordering keeps golden tests stable (DESIGN §17).
 func withEnvSh(script string, env map[string]string) string {
 	if len(env) == 0 {
 		return script
@@ -183,7 +188,7 @@ func withEnvSh(script string, env map[string]string) string {
 	sort.Strings(keys)
 	var b strings.Builder
 	for _, k := range keys {
-		fmt.Fprintf(&b, "export %s=%s\n", k, shQuote(env[k]))
+		fmt.Fprintf(&b, "%s=%s ", k, shQuote(env[k]))
 	}
 	b.WriteString(script)
 	return b.String()
