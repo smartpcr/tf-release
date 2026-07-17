@@ -3,6 +3,8 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -34,52 +36,16 @@ func goldenEnv() map[string]string {
 	}
 }
 
-// winrmChunkRaw duplicates the impl's fixed raw-bytes-per-chunk window
-// (DESIGN §8.1) so this external suite can reproduce the golden chunk plan.
-const winrmChunkRaw = 48000
-
-// uploadChunk mirrors internal/transport.uploadChunk's JSON shape (no struct
-// tags → exported field names) so the marshaled plan is byte-identical to the
-// impl-generated golden.
-type uploadChunk struct {
-	Offset int
-	Len    int
-	First  bool
-}
-
-type chunkPlanEntry struct {
-	Size   int           `json:"size"`
-	Count  int           `json:"count"`
-	Chunks []uploadChunk `json:"chunks"`
-}
-
-func planUploadChunks(size int) []uploadChunk {
-	if size <= 0 {
-		return nil
-	}
-	chunks := make([]uploadChunk, 0, (size+winrmChunkRaw-1)/winrmChunkRaw)
-	for off := 0; off < size; off += winrmChunkRaw {
-		n := winrmChunkRaw
-		if off+n > size {
-			n = size - off
-		}
-		chunks = append(chunks, uploadChunk{Offset: off, Len: n, First: off == 0})
-	}
-	return chunks
-}
-
-// encState carries values between steps of the EncodedCommand scenario.
-type encState struct {
-	got string
-}
-
-// chunkState carries values between steps of the chunk-math scenario.
-type chunkState struct {
-	sizes []int
-}
-
 func readGolden(name string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(testdataDir, name))
+}
+
+// ---------------------------------------------------------------------------
+// EncodedCommand exact bytes — exercises production transport.EncodePS.
+// ---------------------------------------------------------------------------
+
+type encState struct {
+	got string
 }
 
 func (s *encState) givenKnownScriptAndEnv() error {
@@ -124,11 +90,7 @@ func (s *encState) thenEscapingIsCorrect() error {
 	if len(raw)%2 != 0 {
 		return fmt.Errorf("UTF-16LE payload has odd byte length %d", len(raw))
 	}
-	u16 := make([]uint16, len(raw)/2)
-	for i := range u16 {
-		u16[i] = uint16(raw[i*2]) | uint16(raw[i*2+1])<<8
-	}
-	decoded := string(utf16.Decode(u16))
+	decoded := decodeUTF16LE(raw)
 	if !strings.Contains(decoded, "$env:GREETING='O''Brien';") {
 		return fmt.Errorf("single-quote/semicolon escaping wrong; decoded payload:\n%s", decoded)
 	}
@@ -144,25 +106,139 @@ func (s *encState) thenEscapingIsCorrect() error {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Chunk math boundaries — drives the REAL production Upload path so the chunk
+// windows are those the production code (planUploadChunks + uploadChunkScript)
+// actually emits, not a duplicated local planner. The observed windows are then
+// asserted against the committed golden fixture.
+// ---------------------------------------------------------------------------
+
+// observedChunk is one data-write the production Upload emitted, reconstructed
+// from the PowerShell scripts it sent over the in-memory channel.
+type observedChunk struct {
+	Offset int  `json:"Offset"`
+	Len    int  `json:"Len"`
+	First  bool `json:"First"`
+}
+
+// chunkPlanEntry mirrors internal/transport's golden JSON view (see
+// encoding_test.go): size, count and the ordered chunk windows.
+type chunkPlanEntry struct {
+	Size   int             `json:"size"`
+	Count  int             `json:"count"`
+	Chunks []observedChunk `json:"chunks"`
+}
+
+type chunkState struct {
+	sizes []int
+	plan  []chunkPlanEntry
+}
+
+// captureChannel is a fake WinRM command channel that records the data-carrying
+// upload writes the production Upload emits, so the e2e suite can reconstruct
+// the exact chunk plan without a live server. It decodes the PowerShell
+// -EncodedCommand blobs the production Exec produces and extracts each chunk's
+// base64 payload length and whether it created (WriteAllBytes) or appended.
+type captureChannel struct {
+	writes []observedChunk
+	offset int
+}
+
+func decodeUTF16LE(raw []byte) string {
+	u16 := make([]uint16, len(raw)/2)
+	for i := range u16 {
+		u16[i] = uint16(raw[i*2]) | uint16(raw[i*2+1])<<8
+	}
+	return string(utf16.Decode(u16))
+}
+
+// run interprets exactly enough of the generated scripts to let Upload succeed
+// while recording the data chunk windows.
+func (c *captureChannel) run(_ context.Context, command, _ string) (string, string, int, error) {
+	const prefix = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
+	script := command
+	if strings.HasPrefix(command, prefix) {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(command, prefix))
+		if err != nil {
+			return "", "decode: " + err.Error(), 1, nil
+		}
+		script = decodeUTF16LE(raw)
+	}
+
+	switch {
+	case strings.Contains(script, "New-Item"): // mkdir — no data chunk
+		return "", "", 0, nil
+	case strings.Contains(script, "FromBase64String("):
+		// A data-carrying upload write. Extract the base64 payload to learn its
+		// length, and classify create-vs-append to derive the First flag.
+		b64 := extractSingleQuoted(script, "FromBase64String('")
+		payload, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return "", "chunk decode: " + err.Error(), 1, nil
+		}
+		first := strings.Contains(script, "WriteAllBytes")
+		c.writes = append(c.writes, observedChunk{Offset: c.offset, Len: len(payload), First: first})
+		c.offset += len(payload)
+		return "", "", 0, nil
+	default:
+		// Empty-file creation (New-Object byte[] 0) and any other control script
+		// carry no data chunk.
+		return "", "", 0, nil
+	}
+}
+
+// extractSingleQuoted returns the text between the first single quote following
+// marker and the next single quote. PowerShell base64 payloads never contain a
+// quote so simple matching is sufficient here.
+func extractSingleQuoted(s, marker string) string {
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(marker):]
+	end := strings.Index(rest, "'")
+	if end < 0 {
+		return rest
+	}
+	return rest[:end]
+}
+
 func (s *chunkState) givenPayloadSizes() error {
-	s.sizes = []int{0, 1, winrmChunkRaw, winrmChunkRaw + 1}
+	s.sizes = []int{0, 1, 48000, 48001}
 	return nil
 }
 
+// whenChunked drives the production transport.Upload for each payload size over
+// an in-memory channel and records the chunk windows it actually emits.
 func (s *chunkState) whenChunked() error {
 	if len(s.sizes) == 0 {
 		return fmt.Errorf("no payload sizes established")
+	}
+	ctx := context.Background()
+	remote := `C:\deploy\app\payload.bin`
+	s.plan = s.plan[:0]
+	for _, size := range s.sizes {
+		ch := &captureChannel{}
+		tr := transport.NewWinRMWithRunner("host", 5986, ch.run)
+		payload := make([]byte, size)
+		for i := range payload {
+			payload[i] = byte(i % 251)
+		}
+		if err := tr.Upload(ctx, bytes.NewReader(payload), int64(size), remote); err != nil {
+			return fmt.Errorf("production Upload(size=%d): %w", size, err)
+		}
+		// ch.writes stays nil for a zero-byte payload, which marshals to the
+		// golden's "chunks": null; non-empty payloads carry the observed windows.
+		s.plan = append(s.plan, chunkPlanEntry{Size: size, Count: len(ch.writes), Chunks: ch.writes})
 	}
 	return nil
 }
 
 func (s *chunkState) thenMatchesGolden(name string) error {
-	plan := make([]chunkPlanEntry, 0, len(s.sizes))
-	for _, sz := range s.sizes {
-		chunks := planUploadChunks(sz)
-		plan = append(plan, chunkPlanEntry{Size: sz, Count: len(chunks), Chunks: chunks})
+	if len(s.plan) == 0 {
+		return fmt.Errorf("chunk plan was not produced by the production Upload path")
 	}
-	got, err := json.MarshalIndent(plan, "", "  ")
+	got, err := json.MarshalIndent(s.plan, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal chunk plan: %w", err)
 	}
@@ -172,7 +248,7 @@ func (s *chunkState) thenMatchesGolden(name string) error {
 		return fmt.Errorf("read golden %s: %w", name, err)
 	}
 	if string(got) != string(want) {
-		return fmt.Errorf("chunk plan mismatch\n got:\n%s\nwant:\n%s", got, want)
+		return fmt.Errorf("production chunk plan mismatch\n got:\n%s\nwant:\n%s", got, want)
 	}
 	return nil
 }
