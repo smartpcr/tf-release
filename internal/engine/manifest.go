@@ -390,7 +390,14 @@ func AcquireLock(ctx context.Context, t transport.Transport, p layout.Paths, own
 		// file as recoverable is exactly what previously allowed dual ownership.
 		raw, ok, rerr := readSmallFile(actx, t, p.Lock)
 		if rerr != nil {
-			return nil, "", coded("ERR_LOCKED", t.Host(), "LOCK", fmt.Errorf("lock held (unreadable): %v", rerr))
+			// The metadata read FAILED, so the owner, age, and staleness could NOT
+			// be established. A transport/connectivity failure (or our own deadline
+			// firing without any prior gate contention) must therefore surface as
+			// ERR_CONNECT, not masquerade as a held-lock ERR_LOCKED result. acquireErr
+			// preserves ERR_LOCKED only when live gate contention (exit 49 /
+			// casContended) was already observed on an earlier attempt (evaluator
+			// iter-26 item 1).
+			return nil, "", acquireErr(rerr)
 		}
 		if !ok {
 			// The holder released between our create and our read — the slot is

@@ -1464,6 +1464,43 @@ func TestAcquireLockStaleTakeoverTimeoutIsConnect(t *testing.T) {
 	}
 }
 
+// TestAcquireLockMetadataReadFailureIsConnect is the regression for evaluator
+// iter-26 item 1: create observes a held lock (exit 48) but the FOLLOWING metadata
+// read fails with a transport error, so the owner/age/staleness can NOT be
+// established. Because nothing proved live gate contention, the failure must be
+// ERR_CONNECT (not a masqueraded held-lock ERR_LOCKED), and the existing lock file
+// must be left untouched.
+func TestAcquireLockMetadataReadFailureIsConnect(t *testing.T) {
+	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
+		osk := osk
+		t.Run(string(osk), func(t *testing.T) {
+			p := lockFakePaths(osk)
+			f := newLockFake(osk)
+			// A lock is present so create returns exit 48 (held); its content is
+			// irrelevant because the read never succeeds.
+			original := `{"owner":"holder","op":"deploy","started_utc":"` + nowRFC3339() + `","token":"held"}`
+			f.set(p.Lock, original)
+			// The metadata read fails at the transport layer (e.g. connection reset).
+			f.failOn = func(op, s string) (transport.Result, error, bool) {
+				if op == "read" {
+					return transport.Result{}, fmt.Errorf("winrm transport reset"), true
+				}
+				return transport.Result{}, nil, false
+			}
+
+			lk, warn, err := AcquireLock(context.Background(), f, p, "contender", "deploy", 900)
+			var ce *CodedError
+			if err == nil || lk != nil || warn != "" || !asCoded(err, &ce) || ce.Code != "ERR_CONNECT" {
+				t.Fatalf("a metadata-read transport failure must be ERR_CONNECT, got lk=%v warn=%q err=%v", lk, warn, err)
+			}
+			// No mutation: the held lock is untouched.
+			if got := f.get(p.Lock); got != original {
+				t.Fatalf("the held lock must not be mutated by a failed read, got %q", got)
+			}
+		})
+	}
+}
+
 
 func TestAcquireLockFastFailsOnLiveLock(t *testing.T) {
 	for _, osk := range []spec.OSKind{spec.OSWindows, spec.OSLinux} {
