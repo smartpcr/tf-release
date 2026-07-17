@@ -117,13 +117,13 @@ func (r *E2ETestResource) resolveSpec(ctx context.Context, m *e2eModel) (*spec.T
 	}
 	t, _, err := spec.ParseTestRunLenient(raw, vars)
 	if err != nil {
-		return nil, fmt.Errorf("[ERR_SPEC_INVALID] %w", err)
+		return nil, err // already [ERR_SPEC_INVALID]-coded by the spec package
 	}
 	if r.pd != nil && r.pd.DefaultTarget != nil {
 		spec.MergeTargetDefaults(&t.Target, r.pd.DefaultTarget)
 	}
 	if err := spec.ValidateTestRun(t); err != nil { // validate post-merge (DESIGN §6.2)
-		return nil, fmt.Errorf("[ERR_SPEC_INVALID] %w", err)
+		return nil, err // already [ERR_SPEC_INVALID]-coded
 	}
 	return t, nil
 }

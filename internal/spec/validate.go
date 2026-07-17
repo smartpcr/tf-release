@@ -7,13 +7,32 @@ import (
 	"strings"
 )
 
-// ValidationError carries the ERR_SPEC_INVALID contract (DESIGN §12).
+// ValidationError carries the ERR_SPEC_INVALID contract (DESIGN §12). Its
+// Error() text is `[ERR_SPEC_INVALID] <msg>`, where <msg> always names the
+// offending JSON path (e.g. `artifact.version: required ...`). This makes the
+// stable pipeline/test contract observable in-process without a provider layer.
 type ValidationError struct{ Msg string }
 
-func (e *ValidationError) Error() string { return e.Msg }
+func (e *ValidationError) Error() string { return "[ERR_SPEC_INVALID] " + e.Msg }
+
+// Code exposes the stable error code (DESIGN §12) for callers matching on it.
+func (e *ValidationError) Code() string { return "ERR_SPEC_INVALID" }
 
 func vErr(format string, a ...interface{}) error {
 	return &ValidationError{Msg: fmt.Sprintf(format, a...)}
+}
+
+// requireEnv enforces env-var NAME hygiene (DESIGN §11): a referenced-but-unset
+// env var yields ERR_SPEC_INVALID naming the exact JSON path that referenced it,
+// before any dial. Empty name means "not referenced" and is a no-op.
+func requireEnv(name, jsonPath string) error {
+	if name == "" {
+		return nil
+	}
+	if _, ok := os.LookupEnv(name); !ok {
+		return vErr("env var %s referenced by %s is not set", name, jsonPath)
+	}
+	return nil
 }
 
 var (
@@ -73,12 +92,12 @@ func validateTarget(t *Target, isCluster bool) error {
 		}
 	}
 	// env var NAMES must resolve on the runner (VAL-08 fires here, pre-dial).
-	for _, name := range []string{t.Credentials.PasswordEnv, t.Credentials.PrivateKeyEnv} {
-		if name != "" {
-			if _, ok := os.LookupEnv(name); !ok {
-				return vErr("env var %s referenced by target.credentials is not set", name)
-			}
-		}
+	// Each error names the precise JSON path that referenced the missing var.
+	if err := requireEnv(t.Credentials.PasswordEnv, "target.credentials.password_env"); err != nil {
+		return err
+	}
+	if err := requireEnv(t.Credentials.PrivateKeyEnv, "target.credentials.private_key_env"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -138,12 +157,11 @@ func validateArtifact(a *Artifact, p PatternType) error {
 	default:
 		return vErr("artifact.source.type: %q not one of http|file|nuget_feed|docker_registry", s.Type)
 	}
-	for _, name := range []string{s.Auth.TokenEnv, s.Auth.PasswordEnv} {
-		if name != "" {
-			if _, ok := os.LookupEnv(name); !ok {
-				return vErr("env var %s referenced by artifact.source.auth is not set", name)
-			}
-		}
+	if err := requireEnv(s.Auth.TokenEnv, "artifact.source.auth.token_env"); err != nil {
+		return err
+	}
+	if err := requireEnv(s.Auth.PasswordEnv, "artifact.source.auth.password_env"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -316,10 +334,8 @@ func ValidateDeployment(d *Deployment) error {
 			return err
 		}
 	}
-	if d.Pattern.Account.PasswordEnv != "" {
-		if _, ok := os.LookupEnv(d.Pattern.Account.PasswordEnv); !ok {
-			return vErr("env var %s referenced by pattern.account is not set", d.Pattern.Account.PasswordEnv)
-		}
+	if err := requireEnv(d.Pattern.Account.PasswordEnv, "pattern.account.password_env"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -393,8 +409,11 @@ func validateRelPath(p string, i int) error {
 	return nil
 }
 
-// isAbsPath reports whether p is absolute under either POSIX or Windows rules,
-// independent of the host OS running validation.
+// isAbsPath reports whether p is absolute or volume-qualified under either
+// POSIX or Windows rules, independent of the host OS running validation. Any
+// Windows drive qualifier ("C:\x", "C:/x", "C:x", "C:..\x") is treated as
+// non-relative: a drive-relative path still escapes the release dir's volume,
+// so it must be rejected.
 func isAbsPath(p string) bool {
 	if p == "" {
 		return false
@@ -403,8 +422,9 @@ func isAbsPath(p string) bool {
 	if p[0] == '/' || p[0] == '\\' {
 		return true
 	}
-	// Windows drive-letter absolute: "C:\x" or "C:/x".
-	if len(p) >= 3 && isDriveLetter(p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
+	// Windows drive/volume qualifier: "C:" followed by anything ("C:\x", "C:/x",
+	// "C:x", "C:..\x"). All are volume-anchored, not release-dir-relative.
+	if len(p) >= 2 && isDriveLetter(p[0]) && p[1] == ':' {
 		return true
 	}
 	return false

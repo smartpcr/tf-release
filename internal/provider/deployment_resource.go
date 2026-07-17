@@ -102,13 +102,13 @@ func (r *DeploymentResource) resolveSpec(ctx context.Context, m *deploymentModel
 	}
 	d, hash, err := spec.ParseDeploymentLenient(raw, vars, m.VersionOverride.ValueString())
 	if err != nil {
-		return nil, "", fmt.Errorf("[ERR_SPEC_INVALID] %w", err)
+		return nil, "", err // already [ERR_SPEC_INVALID]-coded by the spec package
 	}
 	if r.pd != nil && r.pd.DefaultTarget != nil {
 		spec.MergeTargetDefaults(&d.Target, r.pd.DefaultTarget)
 	}
 	if err := spec.ValidateDeployment(d); err != nil { // validate post-merge (DESIGN §6.2)
-		return nil, "", fmt.Errorf("[ERR_SPEC_INVALID] %w", err)
+		return nil, "", err // already [ERR_SPEC_INVALID]-coded
 	}
 	return d, hash, nil
 }

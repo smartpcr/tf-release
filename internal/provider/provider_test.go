@@ -2,10 +2,12 @@ package provider
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	fwprovider "github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 )
 
@@ -70,4 +72,24 @@ func keys(m map[string]*tfprotov6.Schema) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestVAL06ExactlyOneOfSpec covers DESIGN §14 VAL-06: setting both `spec` and
+// `spec_file` is rejected with an ERR_SPEC_INVALID "exactly one of" error,
+// before any spec parse or dial.
+func TestVAL06ExactlyOneOfSpec(t *testing.T) {
+	r := &DeploymentResource{}
+	m := &deploymentModel{
+		Spec:     types.StringValue("apiVersion: labdeploy/v1"),
+		SpecFile: types.StringValue("/tmp/spec.yaml"),
+	}
+	_, _, err := r.resolveSpec(context.Background(), m)
+	if err == nil {
+		t.Fatal("VAL-06: expected error when both spec and spec_file are set")
+	}
+	for _, frag := range []string{"ERR_SPEC_INVALID", "exactly one of"} {
+		if !strings.Contains(err.Error(), frag) {
+			t.Fatalf("VAL-06 error missing %q: got %v", frag, err)
+		}
+	}
 }
