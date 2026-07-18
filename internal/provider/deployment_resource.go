@@ -389,6 +389,24 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	// A failed last operation is reconciled by Read into a "<version>!failed"
+	// deployed_version (DESIGN §10.4 drift reconciliation). deployed_version is a
+	// computed attribute and nothing in config changed, so Terraform would otherwise
+	// plan NO changes and the failed deployment would never re-converge on the next
+	// apply. Force a non-empty, converging plan: mark the tainted computed outputs
+	// unknown ("known after apply") so Terraform schedules an Update, which redeploys
+	// and rewrites the manifest with a success marker. This runs regardless of the
+	// prior-snapshot comparison below (a replacement, if also required, subsumes it).
+	if strings.HasSuffix(state.DeployedVersion.ValueString(), engine.FailedMarker) {
+		plan.DeployedVersion = types.StringUnknown()
+		plan.ServiceStatus = types.StringUnknown()
+		plan.PreviousVersion = types.StringUnknown()
+		plan.ReleasePath = types.StringUnknown()
+		resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
 	// Compare against the PERSISTED prior spec, not a fresh re-read of spec_file
 	// (which by plan time already holds the NEW contents and would make old == new,
 	// hiding immutable-field changes).

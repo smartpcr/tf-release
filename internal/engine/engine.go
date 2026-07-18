@@ -58,19 +58,31 @@ func (e *Engine) warnOnce(msg string) {
 	e.Warnings = append(e.Warnings, msg)
 }
 
-// warnInsecureTransport emits the DESIGN §11 lab-insecure transport notices: an
-// unpinned SSH host_key (accepts any host key) and WinRM insecure_skip_verify
-// (disables TLS certificate verification). Both are permitted for lab targets but
-// MUST surface a WARN diagnostic EXACTLY ONCE per apply. The messages omit the host
-// so warnOnce dedups them to a single notice even though the cluster path preflights
-// every node; ReadStatus never calls preflight, so a plan/refresh stays silent.
-func (e *Engine) warnInsecureTransport(s *spec.Deployment) {
+// InsecureTransportWarnings returns the DESIGN §11 lab-insecure transport WARN
+// messages for a spec: an unpinned SSH host_key ("" ⇒ accept any host key) and/or
+// WinRM insecure_skip_verify=true (TLS certificate verification disabled). It is the
+// SINGLE SOURCE OF TRUTH for those message strings, consumed both by the apply-time
+// preflight (deduped to exactly one per apply via warnOnce) and by the provider surface
+// tests that assert the framework WARN diagnostic wording. A secure spec returns nil.
+func InsecureTransportWarnings(s *spec.Deployment) []string {
+	var out []string
 	if s.Target.Transport == spec.TransportSSH && s.Target.SSH.HostKey == "" {
-		e.warnOnce("ssh.host_key not pinned — accepting any host key (lab default; DESIGN §11)")
+		out = append(out, "ssh.host_key not pinned — accepting any host key (lab default; DESIGN §11)")
 	}
 	if s.Target.Transport == spec.TransportWinRM &&
 		s.Target.WinRM.InsecureSkipVerify != nil && *s.Target.WinRM.InsecureSkipVerify {
-		e.warnOnce("winrm.insecure_skip_verify=true — TLS certificate verification disabled (lab default; DESIGN §11)")
+		out = append(out, "winrm.insecure_skip_verify=true — TLS certificate verification disabled (lab default; DESIGN §11)")
+	}
+	return out
+}
+
+// warnInsecureTransport emits the DESIGN §11 lab-insecure transport notices EXACTLY
+// ONCE per apply. The messages omit the host so warnOnce dedups them to a single notice
+// even though the cluster path preflights every node; ReadStatus never calls preflight,
+// so a plan/refresh stays silent.
+func (e *Engine) warnInsecureTransport(s *spec.Deployment) {
+	for _, w := range InsecureTransportWarnings(s) {
+		e.warnOnce(w)
 	}
 }
 
