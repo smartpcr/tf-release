@@ -12,11 +12,14 @@ Feature: Deployment resource CRUD and plan modifiers
     Then the change forces RequiresReplace
 
     Examples:
-      | field        |
-      | pattern.type |
-      | service_name |
-      | target.hosts |
-      | target.os    |
+      | field                |
+      | pattern.type         |
+      | service_name         |
+      | target.hosts         |
+      | target.os            |
+      | metadata.name        |
+      | pattern.install_root |
+      | role_name            |
 
   Scenario: Host reorder is not a replacement
     Given a prior deployment snapshot with hosts "lab-01,lab-02"
