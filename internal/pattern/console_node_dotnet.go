@@ -214,7 +214,61 @@ exit 0`, psq(rc.P.Release), ExitSvcInstall, ExitSvcInstall)
 	return nil
 }
 
-// wrapped rewrites the node spec into a winsw WindowsService ReleaseCtx.
+// node_modules snapshot helpers make a Reconfigure `npm ci` rollback-safe.
+// `npm ci` DELETES and rebuilds node_modules in place (DESIGN §9.4), so a
+// mid-install failure would otherwise leave the ACTIVE release without a
+// runnable dependency tree — and the engine's config-only rollback cannot
+// restore files. BackupDeps snapshots the live tree BEFORE npm ci, RestoreDeps
+// puts it back if the reconfigure fails, and CommitDeps discards the snapshot
+// once the reconfigure has fully succeeded. All three no-op when install_deps
+// is false (npm ci never runs, so there is nothing to protect).
+func (n *NodeWebApp) BackupDeps(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
+	if !rc.Spec.Pattern.InstallDeps {
+		return nil
+	}
+	script := fmt.Sprintf(`Set-Location %s
+if(Test-Path 'node_modules.bak'){ Remove-Item -Recurse -Force 'node_modules.bak' }
+if(Test-Path 'node_modules'){ Rename-Item 'node_modules' 'node_modules.bak' }
+exit 0`, psq(rc.P.Release))
+	return n.runDepsMaint(ctx, t, script, 300)
+}
+
+// RestoreDeps rolls the node_modules snapshot back over any partial tree left by
+// a failed `npm ci`, so the prior application is runnable again.
+func (n *NodeWebApp) RestoreDeps(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
+	if !rc.Spec.Pattern.InstallDeps {
+		return nil
+	}
+	script := fmt.Sprintf(`Set-Location %s
+if(Test-Path 'node_modules.bak'){
+  if(Test-Path 'node_modules'){ Remove-Item -Recurse -Force 'node_modules' }
+  Rename-Item 'node_modules.bak' 'node_modules'
+}
+exit 0`, psq(rc.P.Release))
+	return n.runDepsMaint(ctx, t, script, 300)
+}
+
+// CommitDeps discards the node_modules snapshot after a successful reconfigure.
+func (n *NodeWebApp) CommitDeps(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
+	if !rc.Spec.Pattern.InstallDeps {
+		return nil
+	}
+	script := fmt.Sprintf(`Set-Location %s
+if(Test-Path 'node_modules.bak'){ Remove-Item -Recurse -Force 'node_modules.bak' }
+exit 0`, psq(rc.P.Release))
+	return n.runDepsMaint(ctx, t, script, 120)
+}
+
+func (n *NodeWebApp) runDepsMaint(ctx context.Context, t transport.Transport, script string, timeout int) error {
+	r, err := runPS(ctx, t, t.Host(), "STAGE", script, nil, timeout)
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return failFrom(t.Host(), "STAGE", r)
+	}
+	return nil
+}
 func (n *NodeWebApp) wrapped(rc ReleaseCtx) ReleaseCtx {
 	p := rc.Spec.Pattern
 	nodeExe := p.NodeExe

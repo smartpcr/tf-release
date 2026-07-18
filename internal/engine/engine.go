@@ -1449,6 +1449,10 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		okManifest *Manifest
 		okStatus   string
 	)
+	// node is non-nil for node_web_app; depsBackedUp tracks whether we snapshotted
+	// node_modules before `npm ci` so the rollback path can restore it.
+	node, _ := pat.(*pattern.NodeWebApp)
+	depsBackedUp := false
 	forward := func() error {
 		// Run post_install ONLY when the hook actually CHANGED for this same-artifact
 		// reconfigure, at the pre-activation point (after CONFIGURE, before START) so
@@ -1471,8 +1475,16 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		var preStart func() error
 		if isNode || postInstallChanged {
 			preStart = func() error {
-				if n, ok := pat.(*pattern.NodeWebApp); ok {
-					if derr := sl.timed(ctx, "STAGE", func() error { return n.InstallDeps(ctx, t, newRC) }); derr != nil {
+				if node != nil {
+					// Snapshot node_modules BEFORE npm ci so a partial install can be
+					// rolled back to a runnable tree (self-gates on install_deps).
+					if s.Pattern.InstallDeps {
+						if berr := sl.timed(ctx, "STAGE", func() error { return node.BackupDeps(ctx, t, newRC) }); berr != nil {
+							return berr
+						}
+						depsBackedUp = true
+					}
+					if derr := sl.timed(ctx, "STAGE", func() error { return node.InstallDeps(ctx, t, newRC) }); derr != nil {
 						return derr
 					}
 				}
@@ -1497,6 +1509,16 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		return nil
 	}
 	if ferr := forward(); ferr != nil {
+		// A partial `npm ci` may have left the ACTIVE release without a runnable
+		// dependency tree — restore the node_modules snapshot BEFORE we restore the
+		// prior service configuration, so activate(priorRC) starts the prior app
+		// against its original dependencies (best-effort: a restore failure is
+		// warned, then surfaced with the reconfigure error via the rollback below).
+		if depsBackedUp {
+			if drerr := node.RestoreDeps(ctx, t, newRC); drerr != nil {
+				e.warnf("node_modules restore failed on %s: %v", host, drerr)
+			}
+		}
 		// Any failure after we began mutating (STOP/CONFIGURE/START/HEALTH/FINALIZE/
 		// Status): restore the PRIOR configuration — the settings Terraform still
 		// holds in state — validated against the PRIOR health check, so the machine
@@ -1527,6 +1549,14 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		// Surface the original error so the apply fails and Terraform retains the
 		// (now accurate) prior state.
 		return nil, fmt.Errorf("%w; prior configuration restored (healthy)", ferr)
+	}
+	// Reconfigure succeeded end-to-end: discard the node_modules snapshot (the new
+	// dependency tree is live and healthy). Cleanup is best-effort — a leftover
+	// backup dir wastes disk but does not affect correctness.
+	if depsBackedUp {
+		if cerr := node.CommitDeps(ctx, t, newRC); cerr != nil {
+			e.warnf("node_modules backup cleanup failed on %s: %v", host, cerr)
+		}
 	}
 	out := statusFrom(okManifest, host, okStatus)
 	out.DeployedVersion = deployedVer

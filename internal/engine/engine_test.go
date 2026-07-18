@@ -257,6 +257,16 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
 		return transport.Result{}, fmt.Errorf("runner transport blew up")
 
+	case strings.Contains(s, "Rename-Item 'node_modules' 'node_modules.bak'"): // NodeWebApp.BackupDeps
+		f.mark("DEPBACKUP")
+		return ok(""), nil
+	case strings.Contains(s, "Rename-Item 'node_modules.bak' 'node_modules'"): // NodeWebApp.RestoreDeps
+		f.mark("DEPRESTORE")
+		return ok(""), nil
+	case strings.Contains(s, "node_modules.bak"): // NodeWebApp.CommitDeps (discard snapshot)
+		f.mark("DEPCOMMIT")
+		return ok(""), nil
+
 	case strings.Contains(s, "npm ci --omit=dev"): // node_web_app InstallDeps (STAGE)
 		if f.fail["npmci"] {
 			return transport.Result{ExitCode: 46, Stderr: "npm ci failed"}, nil

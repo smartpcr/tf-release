@@ -271,6 +271,69 @@ func TestUpdateToggleInstallDepsRunsNpmCi(t *testing.T) {
 	if !(iStop >= 0 && iStop < iNpm && iNpm < iStart) {
 		t.Fatalf("npm ci must run after STOP and before START; order=%v", f.log)
 	}
+	// The active node_modules is snapshotted before npm ci and, on success, the
+	// snapshot is discarded (rollback-safety, not a leak).
+	if !strings.Contains(order, "DEPBACKUP") {
+		t.Fatalf("npm ci must be preceded by a node_modules snapshot; log=%v", f.log)
+	}
+	if !strings.Contains(order, "DEPCOMMIT") {
+		t.Fatalf("successful reconfigure must discard the node_modules snapshot; log=%v", f.log)
+	}
+	if strings.Contains(order, "DEPRESTORE") {
+		t.Fatalf("successful reconfigure must NOT restore the snapshot; log=%v", f.log)
+	}
+}
+
+// Evaluator iter4 item 1: a failed `npm ci` during Node Reconfigure must NOT
+// corrupt the active release. The engine snapshots node_modules before npm ci
+// and, on failure, restores it BEFORE restoring the prior service configuration
+// so the prior app remains runnable.
+func TestReconfigureNpmCiFailureRestoresDeps(t *testing.T) {
+	payload := []byte("node zip npmfail")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	// Deploy with install_deps=true so a real dependency tree exists to protect.
+	prior := nodeWebSpec(t, url, sum, true)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v\nlog=%v", err, f.log)
+	}
+	f.log = nil
+	// Break npm ci, then push a same-artifact config change so Reconfigure runs
+	// and re-invokes npm ci (which now fails mid-install).
+	f.fail["npmci"] = true
+	next := nodeWebSpec(t, url, sum, true)
+	next.Pattern.NodeExe = `C:\node20\node.exe`
+	_, err := eng.Update(context.Background(), next, prior)
+	if err == nil {
+		t.Fatalf("Update must fail when npm ci fails; log=%v", f.log)
+	}
+	if !strings.Contains(err.Error(), "ERR_SERVICE_INSTALL") {
+		t.Fatalf("npm ci failure must surface ERR_SERVICE_INSTALL, got: %v", err)
+	}
+	order := strings.Join(f.log, ">")
+	if !strings.Contains(order, "DEPBACKUP") {
+		t.Fatalf("npm ci must be preceded by a node_modules snapshot; log=%v", f.log)
+	}
+	if !strings.Contains(order, "DEPRESTORE") {
+		t.Fatalf("failed npm ci must restore the node_modules snapshot; log=%v", f.log)
+	}
+	iBackup := strings.Index(order, "DEPBACKUP")
+	iRestore := strings.Index(order, "DEPRESTORE")
+	if !(iBackup >= 0 && iBackup < iRestore) {
+		t.Fatalf("snapshot must be taken before it is restored; order=%v", f.log)
+	}
+	// The prior app must be restarted only AFTER node_modules is restored, so it
+	// comes up against its original dependency tree.
+	iLastStart := strings.LastIndex(order, "START")
+	if !(iRestore < iLastStart) {
+		t.Fatalf("node_modules must be restored before the prior app restarts; order=%v", f.log)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("rollback must restore the prior configuration healthy; got: %v", err)
+	}
 }
 
 // Evaluator iter3 item 2: Reconfigure MUST run the pattern preflight before any
