@@ -32,6 +32,13 @@ func (c *ConsoleApp) Preflight(ctx context.Context, t transport.Transport, rc Re
 	return nil
 }
 
+// shq single-quotes s for POSIX sh, escaping any embedded single quote so an
+// UNVALIDATED install_root-derived path cannot break out of the quoted argument
+// (`install_root` is not constrained against quotes in spec/validate.go). This
+// is the linux analogue of psq for PowerShell; it mirrors engine/scripts.go's
+// shq so pattern scripts quote paths exactly as the engine does.
+func shq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
 // consoleScript renders the script that runs `cmd` in the CURRENT release dir
 // with the caller's env, propagating the command's exit code (DESIGN §9.3).
 // Deterministic output so Configure scripts can be golden-tested.
@@ -39,7 +46,7 @@ func consoleScript(os spec.OSKind, current, cmd string) string {
 	if os == spec.OSWindows {
 		return fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(current), cmd)
 	}
-	return fmt.Sprintf("cd '%s' && %s", current, cmd)
+	return fmt.Sprintf("cd %s && %s", shq(current), cmd)
 }
 
 // runInCurrent executes `cmd` in the current release dir, mapping a non-zero
@@ -127,7 +134,7 @@ func readMarker(ctx context.Context, t transport.Transport, path string) (string
 			psq(path), psq(path))
 	} else {
 		shell = transport.ShellSh
-		script = fmt.Sprintf(`[ -f '%s' ] || exit 3; base64 < '%s'`, path, path)
+		script = fmt.Sprintf(`[ -f %s ] || exit 3; base64 < %s`, shq(path), shq(path))
 	}
 	r, err := t.Exec(ctx, transport.Cmd{Shell: shell, Script: script, TimeoutSec: 60})
 	if err != nil {
