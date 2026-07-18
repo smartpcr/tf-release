@@ -13,6 +13,11 @@ import (
 // (registration parts) by ClusterGeneric / NodeWebApp.
 type WindowsService struct{}
 
+// stopNeedsForceKill is the private exit sentinel the graceful S1 STOP script
+// returns when the service is still running after stop_timeout_seconds, telling
+// Stop to escalate to the separate S2 FORCE_KILL step (DESIGN §9.2 WSV-07).
+const stopNeedsForceKill = 100
+
 func (w *WindowsService) svcName(rc ReleaseCtx) string { return rc.Spec.Pattern.ServiceName }
 
 func (w *WindowsService) Preflight(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
@@ -86,11 +91,18 @@ func (w *WindowsService) configureWithBinPath(ctx context.Context, t transport.T
 		}
 	}
 	recovery := ""
+	// S4 recovery actions: exit≠0 is a failed S4 configuration and MUST
+	// surface as ERR_SERVICE_INSTALL rather than being swallowed. When
+	// restart_on_failure is explicitly disabled we must CLEAR any recovery
+	// actions a prior version installed (reset= 0 actions= "") rather than
+	// leaving them in place.
 	if p.Recovery.RestartOnFailure == nil || *p.Recovery.RestartOnFailure {
-		// S4 recovery actions: exit≠0 is a failed S4 configuration and MUST
-		// surface as ERR_SERVICE_INSTALL rather than being swallowed.
 		recovery = fmt.Sprintf(
 			"& sc.exe failure \"%s\" reset= 86400 actions= restart/5000/restart/5000/restart/5000\nif($LASTEXITCODE -ne 0){ exit %d }",
+			svc, ExitSvcInstall)
+	} else {
+		recovery = fmt.Sprintf(
+			"& sc.exe failure \"%s\" reset= 0 actions= \"\"\nif($LASTEXITCODE -ne 0){ exit %d }",
 			svc, ExitSvcInstall)
 	}
 	// S0 + S4: create when 1060 (service does not exist), else config.
@@ -140,10 +152,11 @@ func (w *WindowsService) writeServiceEnv(ctx context.Context, t transport.Transp
 		return nil // winsw xml carries <env> instead
 	}
 	svc := w.svcName(rc)
-	script := fmt.Sprintf(`$k='HKLM:\SYSTEM\CurrentControlSet\Services\%s'
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+$k='HKLM:\SYSTEM\CurrentControlSet\Services\%s'
 if(-not (Test-Path $k)){ exit %d }
-Set-ItemProperty -Path $k -Name Environment -Type MultiString -Value %s
-exit 0`, svc, ExitSvcInstall, envMultiString(rc.Env))
+try{ Set-ItemProperty -Path $k -Name Environment -Type MultiString -Value %s -ErrorAction Stop }catch{ exit %d }
+exit 0`, svc, ExitSvcInstall, envMultiString(rc.Env), ExitSvcInstall)
 	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, nil, 60)
 	if err != nil {
 		return err
@@ -168,7 +181,7 @@ func (w *WindowsService) configureWinsw(ctx context.Context, t transport.Transpo
 	xmlPath := rc.P.Current + `\` + svc + `.winsw.xml`
 	wrapper := rc.P.Current + `\` + strings.TrimLeft(p.WinswExe, `\/`)
 	script := fmt.Sprintf(`$ErrorActionPreference='Continue'
-Set-Content -Path %s -Value %s -Encoding UTF8
+try{ Set-Content -Path %s -Value %s -Encoding UTF8 -ErrorAction Stop }catch{ exit %d }
 & sc.exe query %s *> $null
 if($LASTEXITCODE -eq 1060){
   & %s install %s
@@ -181,7 +194,7 @@ if($LASTEXITCODE -eq 1060){
     if($LASTEXITCODE -ne 0){ exit %d }
   }
 }
-exit 0`, psq(xmlPath), psq(xml),
+exit 0`, psq(xmlPath), psq(xml), ExitSvcInstall,
 		psq(svc),
 		psq(wrapper), psq(xmlPath), ExitSvcInstall,
 		psq(wrapper), psq(xmlPath),
@@ -197,11 +210,16 @@ exit 0`, psq(xmlPath), psq(xml),
 	return nil
 }
 
-// Stop = S1 + S2 (force-kill fallback). No-op when absent/stopped.
+// Stop = S1 graceful stop + S2 force-kill fallback (DESIGN §9.2). The two
+// phases run as DISTINCT steps so the force-kill surfaces as a structured
+// `FORCE_KILL` step in logs/errors (DESIGN WSV-07) rather than being hidden
+// inside the STOP step. No-op when the service is absent/already stopped.
 func (w *WindowsService) Stop(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
 	svc := w.svcName(rc)
 	timeout := rc.Spec.Pattern.EffectiveStopTimeout()
-	script := fmt.Sprintf(`$ErrorActionPreference='Continue'
+	// S1 STOP: graceful. exit 0 = stopped/absent, exit 100 = still running
+	// (⇒ escalate to FORCE_KILL), any other exit = a real STOP failure.
+	stopScript := fmt.Sprintf(`$ErrorActionPreference='Continue'
 $svc=%s
 $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
 if($null -eq $s -or $s.Status -eq 'Stopped'){ exit 0 }
@@ -211,7 +229,21 @@ while((Get-Date) -lt $deadline){
   if((Get-Service -Name $svc).Status -eq 'Stopped'){ exit 0 }
   Start-Sleep -Seconds 1
 }
-Write-Output 'FORCE_KILL'
+exit 100`, psq(svc), timeout)
+	r, err := runPS(ctx, t, t.Host(), "STOP", stopScript, nil, timeout+30)
+	if err != nil {
+		return err
+	}
+	if r.ExitCode == 0 {
+		return nil
+	}
+	if r.ExitCode != stopNeedsForceKill {
+		return failFrom(t.Host(), "STOP", r)
+	}
+	// S2 FORCE_KILL: taskkill the service process tree, re-wait 10s; still
+	// running ⇒ exit 43 (ERR_SERVICE_STOP). Emitted as its own step.
+	killScript := fmt.Sprintf(`$ErrorActionPreference='Continue'
+$svc=%s
 $svcPid=(Get-CimInstance Win32_Service -Filter "Name='$svc'").ProcessId
 if($svcPid -gt 0){ & taskkill /PID $svcPid /T /F | Out-Null }
 Start-Sleep -Seconds 2
@@ -220,13 +252,13 @@ while((Get-Date) -lt $deadline){
   if((Get-Service -Name $svc).Status -eq 'Stopped'){ exit 0 }
   Start-Sleep -Seconds 1
 }
-exit %d`, psq(svc), timeout, ExitServiceStop)
-	r, err := runPS(ctx, t, t.Host(), "STOP", script, nil, timeout+30)
+exit %d`, psq(svc), ExitServiceStop)
+	rk, err := runPS(ctx, t, t.Host(), "FORCE_KILL", killScript, nil, 60)
 	if err != nil {
 		return err
 	}
-	if r.ExitCode != 0 {
-		return failFrom(t.Host(), "STOP", r)
+	if rk.ExitCode != 0 {
+		return failFrom(t.Host(), "FORCE_KILL", rk)
 	}
 	return nil
 }
@@ -283,8 +315,15 @@ func (w *WindowsService) Uninstall(ctx context.Context, t transport.Transport, r
 		xmlPath := rc.P.Current + `\` + svc + `.winsw.xml`
 		script = fmt.Sprintf(`if(Test-Path %s){ & %s uninstall %s | Out-Null }
 & sc.exe query %s *> $null
-if($LASTEXITCODE -ne 1060){ & sc.exe delete %s | Out-Null }
-exit 0`, psq(wrapper), psq(wrapper), psq(xmlPath), psq(svc), psq(svc))
+if($LASTEXITCODE -ne 1060){
+  & sc.exe delete %s
+  if($LASTEXITCODE -ne 0){ exit %d }
+}
+& sc.exe query %s *> $null
+if($LASTEXITCODE -ne 1060){ exit %d }
+exit 0`, psq(wrapper), psq(wrapper), psq(xmlPath),
+			psq(svc), psq(svc), ExitSvcInstall,
+			psq(svc), ExitSvcInstall)
 	} else {
 		script = fmt.Sprintf(`& sc.exe query %s *> $null
 if($LASTEXITCODE -eq 1060){ exit 0 }
@@ -311,9 +350,7 @@ func WinswXML(id, name, desc, executable string, args []string, logPath string, 
 	fmt.Fprintf(&b, "  <name>%s</name>\n", xmlEsc(name))
 	fmt.Fprintf(&b, "  <description>%s</description>\n", xmlEsc(desc))
 	fmt.Fprintf(&b, "  <executable>%s</executable>\n", xmlEsc(executable))
-	for _, a := range args {
-		fmt.Fprintf(&b, "  <argument>%s</argument>\n", xmlEsc(a))
-	}
+	fmt.Fprintf(&b, "  <arguments>%s</arguments>\n", xmlEsc(winswArgs(args)))
 	fmt.Fprintf(&b, "  <logpath>%s</logpath>\n", xmlEsc(logPath))
 	fmt.Fprintf(&b, "  <stopwait>%dsec</stopwait>\n", stopWaitSec)
 	keys := make([]string, 0, len(env))
@@ -331,4 +368,20 @@ func WinswXML(id, name, desc, executable string, args []string, logPath string, 
 func xmlEsc(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
 	return r.Replace(s)
+}
+
+// winswArgs joins service arguments into the single space-separated command
+// line WinSW's <arguments> element expects (DESIGN §9.2 line 541). Tokens that
+// contain whitespace or quotes are wrapped in double quotes so they survive
+// WinSW's own re-parse; the result is XML-escaped by the caller.
+func winswArgs(args []string) string {
+	parts := make([]string, len(args))
+	for i, a := range args {
+		if strings.ContainsAny(a, " \t\"") {
+			parts[i] = `"` + strings.ReplaceAll(a, `"`, `""`) + `"`
+		} else {
+			parts[i] = a
+		}
+	}
+	return strings.Join(parts, " ")
 }

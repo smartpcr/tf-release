@@ -2,11 +2,13 @@ package pattern
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
 // winsvcRC builds a windows_service ReleaseCtx the same way engine.releaseCtx
@@ -98,6 +100,13 @@ func TestWindowsServiceWinswXMLGolden(t *testing.T) {
 	if strings.Contains(xml, "stoptimeout") {
 		t.Errorf("WinSW xml must NOT use <stoptimeout>, got:\n%s", xml)
 	}
+	// DESIGN §9.2 line 541: a SINGLE <arguments> element, not repeated <argument>.
+	if !strings.Contains(xml, "<arguments>--config appsettings.json</arguments>") {
+		t.Errorf("WinSW xml must use a single <arguments> element per DESIGN §9.2, got:\n%s", xml)
+	}
+	if strings.Contains(xml, "<argument>") {
+		t.Errorf("WinSW xml must NOT emit repeated <argument> elements, got:\n%s", xml)
+	}
 	// env entries are emitted in sorted key order: ASPNETCORE_ENVIRONMENT < LD_APP < LD_VERSION.
 	iAsp := strings.Index(xml, "ASPNETCORE_ENVIRONMENT")
 	iApp := strings.Index(xml, `name="LD_APP"`)
@@ -135,5 +144,130 @@ func TestWindowsServiceWinswConfigureGolden(t *testing.T) {
 	}
 	if !strings.Contains(f.scripts[0], "refresh") || !strings.Contains(f.scripts[0], "install") {
 		t.Errorf("winsw configure script must contain fresh install + update refresh:\n%s", f.scripts[0])
+	}
+}
+
+// Scenario: stop escalates to a STRUCTURED FORCE_KILL step (DESIGN §9.2 S2,
+// WSV-07). The graceful S1 STOP script and the S2 taskkill script must be
+// emitted as two distinct steps; when the kill still can't stop the service
+// the error must be tagged step=FORCE_KILL / code=ERR_SERVICE_STOP (43), NOT
+// hidden inside the STOP step.
+func TestWindowsServiceStopForceKill(t *testing.T) {
+	var w WindowsService
+	rc := winsvcRC(spec.Pattern{
+		Type:               spec.PatternWindowsService,
+		ServiceName:        "SlowSvc",
+		StopTimeoutSeconds: 10,
+	}, nil)
+
+	// graceful stop times out (sentinel 100) → force-kill succeeds (0).
+	fk := &scriptTransport{osKind: spec.OSWindows, queue: []transport.Result{{ExitCode: 100}, {ExitCode: 0}}}
+	if err := w.Stop(context.Background(), fk, rc); err != nil {
+		t.Fatalf("Stop with successful force-kill should succeed: %v", err)
+	}
+	if len(fk.scripts) != 2 {
+		t.Fatalf("Stop must emit a graceful STOP script then a separate FORCE_KILL script, got %d", len(fk.scripts))
+	}
+	if !strings.Contains(fk.scripts[0], "Stop-Service") || strings.Contains(fk.scripts[0], "taskkill") {
+		t.Errorf("first script must be the graceful STOP (no taskkill):\n%s", fk.scripts[0])
+	}
+	if !strings.Contains(fk.scripts[1], "taskkill /PID") || !strings.Contains(fk.scripts[1], "/T /F") {
+		t.Errorf("second script must be the FORCE_KILL taskkill step:\n%s", fk.scripts[1])
+	}
+	// The old defect emitted a bare `Write-Output 'FORCE_KILL'` inside the STOP
+	// step instead of a real step; guard against its return.
+	if strings.Contains(fk.scripts[0], "Write-Output 'FORCE_KILL'") {
+		t.Errorf("FORCE_KILL must be a structured step, not text inside STOP:\n%s", fk.scripts[0])
+	}
+
+	// graceful stop times out, force-kill also fails (exit 43) → structured error.
+	fkFail := &scriptTransport{osKind: spec.OSWindows, queue: []transport.Result{{ExitCode: 100}, {ExitCode: ExitServiceStop}}}
+	err := w.Stop(context.Background(), fkFail, rc)
+	if err == nil {
+		t.Fatal("Stop must fail when force-kill cannot stop the service")
+	}
+	var se *StepError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *StepError, got %T: %v", err, err)
+	}
+	if se.Step != "FORCE_KILL" {
+		t.Errorf("force-kill failure must be tagged step=FORCE_KILL, got %q", se.Step)
+	}
+	if se.Code != "ERR_SERVICE_STOP" {
+		t.Errorf("force-kill failure must map to ERR_SERVICE_STOP, got %q", se.Code)
+	}
+
+	// already stopped/absent → single graceful STOP, no force-kill step.
+	fkNoop := &scriptTransport{osKind: spec.OSWindows, queue: []transport.Result{{ExitCode: 0}}}
+	if err := w.Stop(context.Background(), fkNoop, rc); err != nil {
+		t.Fatalf("Stop no-op should succeed: %v", err)
+	}
+	if len(fkNoop.scripts) != 1 {
+		t.Errorf("stopped service must not run the FORCE_KILL step, got %d scripts", len(fkNoop.scripts))
+	}
+}
+
+// Scenario: start polls to Running and, on failure, captures the SCM System
+// event-log entries and returns ERR_SERVICE_START (exit 44) — DESIGN §9.2 S6.
+func TestWindowsServiceStartEventLog(t *testing.T) {
+	var w WindowsService
+	rc := winsvcRC(spec.Pattern{Type: spec.PatternWindowsService, ServiceName: "PaymentsSvc"}, nil)
+
+	fs := &scriptTransport{osKind: spec.OSWindows, queue: []transport.Result{{ExitCode: ExitServiceStart, Stderr: "start failed"}}}
+	err := w.Start(context.Background(), fs, rc)
+	if err == nil {
+		t.Fatal("Start must fail when the service never reaches Running")
+	}
+	var se *StepError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *StepError, got %T: %v", err, err)
+	}
+	if se.Code != "ERR_SERVICE_START" || se.Step != "START" {
+		t.Errorf("start failure must be step=START code=ERR_SERVICE_START, got step=%q code=%q", se.Step, se.Code)
+	}
+	if len(fs.scripts) != 1 {
+		t.Fatalf("Start should emit one script, got %d", len(fs.scripts))
+	}
+	if !strings.Contains(fs.scripts[0], "Get-WinEvent") {
+		t.Errorf("Start must capture System event-log on failure:\n%s", fs.scripts[0])
+	}
+	for _, id := range []string{"7000", "7009", "7031", "7034"} {
+		if !strings.Contains(fs.scripts[0], id) {
+			t.Errorf("Start event-log capture must include SCM event id %s:\n%s", id, fs.scripts[0])
+		}
+	}
+}
+
+// Scenario: when restart_on_failure is explicitly disabled the S4 script must
+// CLEAR any recovery actions a prior version installed (reset= 0 actions= "")
+// rather than emitting no command and leaving stale restart actions in place.
+func TestWindowsServiceRecoveryClear(t *testing.T) {
+	var w WindowsService
+	off := false
+	rc := winsvcRC(spec.Pattern{
+		Type:        spec.PatternWindowsService,
+		ServiceName: "NoRestartSvc",
+		Exe:         `bin\App.exe`,
+		StartType:   "auto",
+		Recovery:    spec.Recovery{RestartOnFailure: &off},
+	}, nil)
+
+	f := &scriptTransport{osKind: spec.OSWindows}
+	if err := w.Configure(context.Background(), f, rc); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if len(f.scripts) == 0 {
+		t.Fatal("Configure emitted no scripts")
+	}
+	s4 := f.scripts[0]
+	if !strings.Contains(s4, `reset= 0 actions= ""`) {
+		t.Errorf("disabled restart_on_failure must clear recovery actions (reset= 0 actions= \"\"):\n%s", s4)
+	}
+	if strings.Contains(s4, "restart/5000") {
+		t.Errorf("disabled restart_on_failure must NOT install restart actions:\n%s", s4)
+	}
+	// clearing recovery is still gated so a failed sc.exe failure surfaces.
+	if !strings.Contains(s4, "if($LASTEXITCODE -ne 0){ exit 46 }") {
+		t.Errorf("recovery-clear must be exit-code gated:\n%s", s4)
 	}
 }

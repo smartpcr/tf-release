@@ -3,8 +3,7 @@
   <name>Contoso Payments</name>
   <description>Handles payments</description>
   <executable>C:\deploy\payments-svc\current\bin\Payments.exe</executable>
-  <argument>--config</argument>
-  <argument>appsettings.json</argument>
+  <arguments>--config appsettings.json</arguments>
   <logpath>C:\deploy\payments-svc\shared\logs</logpath>
   <stopwait>45sec</stopwait>
   <env name="ASPNETCORE_ENVIRONMENT" value="Production"/>
