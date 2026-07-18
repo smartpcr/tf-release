@@ -45,6 +45,47 @@ func (e *Engine) warnf(format string, a ...interface{}) {
 	e.Warnings = append(e.Warnings, fmt.Sprintf(format, a...))
 }
 
+// warnOnce appends msg only if it is not already present. It exists so
+// per-host gates (e.g. the DESIGN §11 insecure-transport notices in preflight,
+// which the cluster path runs for every node) surface EXACTLY ONE WARN diag per
+// apply rather than one per host.
+func (e *Engine) warnOnce(msg string) {
+	for _, w := range e.Warnings {
+		if w == msg {
+			return
+		}
+	}
+	e.Warnings = append(e.Warnings, msg)
+}
+
+// InsecureTransportWarnings returns the DESIGN §11 lab-insecure transport WARN
+// messages for a spec: an unpinned SSH host_key ("" ⇒ accept any host key) and/or
+// WinRM insecure_skip_verify=true (TLS certificate verification disabled). It is the
+// SINGLE SOURCE OF TRUTH for those message strings, consumed both by the apply-time
+// preflight (deduped to exactly one per apply via warnOnce) and by the provider surface
+// tests that assert the framework WARN diagnostic wording. A secure spec returns nil.
+func InsecureTransportWarnings(s *spec.Deployment) []string {
+	var out []string
+	if s.Target.Transport == spec.TransportSSH && s.Target.SSH.HostKey == "" {
+		out = append(out, "ssh.host_key not pinned — accepting any host key (lab default; DESIGN §11)")
+	}
+	if s.Target.Transport == spec.TransportWinRM &&
+		s.Target.WinRM.InsecureSkipVerify != nil && *s.Target.WinRM.InsecureSkipVerify {
+		out = append(out, "winrm.insecure_skip_verify=true — TLS certificate verification disabled (lab default; DESIGN §11)")
+	}
+	return out
+}
+
+// warnInsecureTransport emits the DESIGN §11 lab-insecure transport notices EXACTLY
+// ONCE per apply. The messages omit the host so warnOnce dedups them to a single notice
+// even though the cluster path preflights every node; ReadStatus never calls preflight,
+// so a plan/refresh stays silent.
+func (e *Engine) warnInsecureTransport(s *spec.Deployment) {
+	for _, w := range InsecureTransportWarnings(s) {
+		e.warnOnce(w)
+	}
+}
+
 // stepLogger emits the DESIGN §8.5/§15 structured step record. EVERY fixed step
 // (VALIDATE CONNECT PREFLIGHT LOCK FETCH CHECKSUM STAGE EXTRACT RENDER CONFIGURE
 // STOP SWITCH START HEALTH FINALIZE PRUNE UNLOCK, plus ROLLBACK/FORCE_KILL/
@@ -719,9 +760,10 @@ avail=$(df -Pm "$(dirname %s)" | awk 'NR==2{print $4}')
 			return coded("ERR_PREFLIGHT", host, "PREFLIGHT", fmt.Errorf("%s", strings.TrimSpace(r.Stderr+r.Stdout)))
 		}
 	}
-	if s.Target.Transport == spec.TransportSSH && s.Target.SSH.HostKey == "" {
-		e.warnf("ssh.host_key not pinned for %s — accepting any host key (lab default)", host)
-	}
+	// DESIGN §11: lab-insecure transport settings are permitted but MUST emit
+	// exactly one WARN diag per apply — see warnInsecureTransport (dedups across
+	// the cluster path's per-host preflights).
+	e.warnInsecureTransport(s)
 	if err := pat.Preflight(ctx, t, rc); err != nil {
 		return err
 	}

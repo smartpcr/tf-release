@@ -1328,3 +1328,194 @@ func (f *fakeErrEngine) ReadStatus(_ context.Context, _ *spec.Deployment) (*engi
 }
 func (f *fakeErrEngine) Destroy(_ context.Context, _ *spec.Deployment, _ string) error { return f.err }
 func (f *fakeErrEngine) Warns() []string                                               { return nil }
+
+// readReqForModel builds a real resource.ReadRequest whose State carries the given
+// (verified inline-spec) model, using the resource's own schema, so Read can be driven
+// end-to-end and the resulting State inspected (e.g. RemoveResource nulls State.Raw).
+func readReqForModel(t *testing.T, r *DeploymentResource, m *deploymentModel) (resource.ReadRequest, *resource.ReadResponse) {
+	t.Helper()
+	sr := resource.SchemaResponse{}
+	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)
+	st := tfsdk.State{Schema: sr.Schema}
+	m.Timeouts = nullTimeouts()
+	if diags := st.Set(context.Background(), m); diags.HasError() {
+		t.Fatalf("build state: %v", diags)
+	}
+	return resource.ReadRequest{State: st}, &resource.ReadResponse{State: st}
+}
+
+// verifiedReadModel returns a Read-ready model whose inline `spec` makes stateSpec
+// VERIFIED (faithful verbatim), so Read is allowed to treat a missing manifest as a
+// genuine absence rather than the unverifiable-legacy migration guard.
+func verifiedReadModel(version string) *deploymentModel {
+	return &deploymentModel{
+		Spec: types.StringValue(wsSpecYAML(version)), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		DestroyMode: types.StringNull(),
+		Hosts:       types.ListNull(types.StringType), Variables: types.MapNull(types.StringType),
+	}
+}
+
+// TestReadAbsentManifestRemovesResource covers Stage 5.3 scenario 1: a verified state
+// whose target manifest is absent (ReadStatus returns nil,nil) must be removed from
+// state so the next plan is a fresh create. RemoveResource nulls State.Raw.
+func TestReadAbsentManifestRemovesResource(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeDeployEngine{status: nil} // nil status ⇒ absent manifest
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	req, resp := readReqForModel(t, r, verifiedReadModel("1.0.0"))
+	r.Read(context.Background(), req, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("absent manifest Read must not error, got %v", resp.Diagnostics.Errors())
+	}
+	if !resp.State.Raw.IsNull() {
+		t.Fatal("absent manifest must RemoveResource (State.Raw null) so next plan = create")
+	}
+}
+
+// TestReadFailedMarkerForcesPlanChange covers Stage 5.3 scenario 2 end-to-end: a manifest
+// whose last_operation.result==failed reconciles to a "<version>!failed" deployed_version,
+// which Read persists, and — crucially — the SUBSEQUENT plan is non-empty and converging.
+// Because deployed_version is computed and config is unchanged, the marker only forces a
+// re-apply if ModifyPlan acts on it: this test proves ModifyPlan marks the tainted computed
+// outputs unknown ("known after apply"), so Terraform schedules an Update to redeploy.
+func TestReadFailedMarkerForcesPlanChange(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeDeployEngine{status: &engine.Status{
+		DeployedVersion: "1.0.0!failed", ServiceStatus: "stopped", Hosts: []string{"lab-01"},
+	}}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	req, resp := readReqForModel(t, r, verifiedReadModel("1.0.0"))
+	r.Read(context.Background(), req, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("failed-marker Read must not error, got %v", resp.Diagnostics.Errors())
+	}
+	if resp.State.Raw.IsNull() {
+		t.Fatal("failed-marker Read must retain state, not remove the resource")
+	}
+	var refreshed deploymentModel
+	if d := resp.State.Get(context.Background(), &refreshed); d.HasError() {
+		t.Fatalf("read refreshed state: %v", d)
+	}
+	if refreshed.DeployedVersion.ValueString() != "1.0.0!failed" {
+		t.Fatalf("deployed_version must carry the !failed marker, got %q", refreshed.DeployedVersion.ValueString())
+	}
+
+	// Next plan: same (unchanged) config against the failed-marked prior state. Without the
+	// forcing behavior Terraform would plan no changes; ModifyPlan must instead produce a
+	// non-empty, converging plan by marking the tainted computed outputs unknown.
+	plan := verifiedReadModel("1.0.0")
+	planResp := runModifyPlan(t, r, plan, &refreshed)
+	if planResp.Diagnostics.HasError() {
+		t.Fatalf("ModifyPlan on failed-marked state must not error, got %v", planResp.Diagnostics.Errors())
+	}
+	var planned deploymentModel
+	if d := planResp.Plan.Get(context.Background(), &planned); d.HasError() {
+		t.Fatalf("read planned model: %v", d)
+	}
+	if !planned.DeployedVersion.IsUnknown() {
+		t.Fatalf("failed marker must force deployed_version unknown (non-empty converging plan), got %q",
+			planned.DeployedVersion.ValueString())
+	}
+	if !planned.ServiceStatus.IsUnknown() {
+		t.Fatal("failed marker must force service_status unknown so the plan re-applies")
+	}
+}
+
+// TestReadUnreachableTargetIsLoudError covers Stage 5.3 scenario 3 / DESIGN §10.4: a
+// transport error from ReadStatus (e.g. failed dial) must surface a Read ERROR diagnostic
+// — NEVER a silent warning — and MUST leave the prior state intact (the resource is not
+// removed), because an unreachable target is not a deleted resource.
+func TestReadUnreachableTargetIsLoudError(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeErrEngine{err: fmt.Errorf("[ERR_CONNECT] dial tcp lab-01:5986: connect: no route to host")}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	req, resp := readReqForModel(t, r, verifiedReadModel("1.0.0"))
+	r.Read(context.Background(), req, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("unreachable target must produce a Read ERROR diagnostic, not a warning")
+	}
+	if resp.Diagnostics.WarningsCount() != 0 {
+		t.Fatalf("unreachable target must not be downgraded to a WARN, got %d warnings", resp.Diagnostics.WarningsCount())
+	}
+	if resp.State.Raw.IsNull() {
+		t.Fatal("unreachable target must LEAVE prior state intact — the resource must NOT be removed")
+	}
+}
+
+// warnEngine is a deployEngine that succeeds and surfaces a fixed set of engine
+// warnings, so an apply-path resource test can assert how those warnings are turned
+// into terraform-plugin-framework diagnostics at the provider surface.
+type warnEngine struct {
+	status *engine.Status
+	warns  []string
+}
+
+func (w *warnEngine) Update(_ context.Context, _, _ *spec.Deployment) (*engine.Status, error) {
+	return w.status, nil
+}
+func (w *warnEngine) ReadStatus(_ context.Context, _ *spec.Deployment) (*engine.Status, error) {
+	return w.status, nil
+}
+func (w *warnEngine) Destroy(_ context.Context, _ *spec.Deployment, _ string) error { return nil }
+func (w *warnEngine) Warns() []string                                               { return w.warns }
+
+// applyWarnDiags drives a Create (apply path) with a warnEngine seeded from the REAL
+// engine.InsecureTransportWarnings for the given target, and returns the framework
+// diagnostics the provider produced. Using the engine's own message source keeps the
+// assertion honest — the wording is not duplicated in the test.
+func applyWarnDiags(t *testing.T, target spec.Target) *resource.CreateResponse {
+	t.Helper()
+	warns := engine.InsecureTransportWarnings(&spec.Deployment{Target: target})
+	if len(warns) != 1 {
+		t.Fatalf("test precondition: expected exactly one engine insecure warning, got %v", warns)
+	}
+	fake := &warnEngine{status: &engine.Status{
+		DeployedVersion: "1.0.0", ServiceStatus: "running", Hosts: []string{"lab-01"},
+	}, warns: warns}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	plan := &deploymentModel{Spec: types.StringValue(wsSpecYAML("1.0.0")), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	return runCreate(t, r, plan)
+}
+
+// TestApplyWinRMInsecureEmitsExactlyOneWarnDiag covers Stage 5.3 scenario 4 (WinRM) at
+// the PROVIDER surface: an apply with winrm.insecure_skip_verify=true must emit EXACTLY
+// ONE terraform-plugin-framework WARN diagnostic naming the insecure setting (and no
+// error), not merely populate Engine.Warnings.
+func TestApplyWinRMInsecureEmitsExactlyOneWarnDiag(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	insecure := true
+	resp := applyWarnDiags(t, spec.Target{
+		Transport: spec.TransportWinRM, WinRM: spec.WinRMOpts{InsecureSkipVerify: &insecure}})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("insecure apply must not error, got %v", resp.Diagnostics.Errors())
+	}
+	if got := resp.Diagnostics.WarningsCount(); got != 1 {
+		t.Fatalf("apply must emit exactly one WARN diagnostic, got %d (%v)", got, resp.Diagnostics.Warnings())
+	}
+	w := resp.Diagnostics.Warnings()[0]
+	if !strings.Contains(w.Detail(), "insecure_skip_verify") {
+		t.Fatalf("WARN diagnostic must name the insecure setting, got detail %q", w.Detail())
+	}
+}
+
+// TestApplySSHUnpinnedHostKeyEmitsExactlyOneWarnDiag covers Stage 5.3 scenario 4 (SSH) at
+// the PROVIDER surface: an apply with ssh.host_key="" must emit EXACTLY ONE framework WARN
+// diagnostic naming the unpinned host key.
+func TestApplySSHUnpinnedHostKeyEmitsExactlyOneWarnDiag(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	resp := applyWarnDiags(t, spec.Target{
+		Transport: spec.TransportSSH, SSH: spec.SSHOpts{HostKey: ""}})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("insecure apply must not error, got %v", resp.Diagnostics.Errors())
+	}
+	if got := resp.Diagnostics.WarningsCount(); got != 1 {
+		t.Fatalf("apply must emit exactly one WARN diagnostic, got %d (%v)", got, resp.Diagnostics.Warnings())
+	}
+	w := resp.Diagnostics.Warnings()[0]
+	if !strings.Contains(w.Detail(), "host_key") {
+		t.Fatalf("WARN diagnostic must name the unpinned host key, got detail %q", w.Detail())
+	}
+}
