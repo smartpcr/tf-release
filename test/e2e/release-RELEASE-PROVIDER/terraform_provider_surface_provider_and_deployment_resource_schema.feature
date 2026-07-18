@@ -31,6 +31,11 @@ Feature: Provider and Deployment Resource Schema
     When the deployment resource config validators run
     Then validation succeeds
 
+  Scenario: One-of validation defers when spec is unknown (interpolated)
+    Given a deployment resource config with spec unknown and spec_file null
+    When the deployment resource config validators run
+    Then validation succeeds
+
   Scenario: Schema round-trip preserves the deployment state
     Given a fully-populated deployment state
     When the state is written then read back through the schema
