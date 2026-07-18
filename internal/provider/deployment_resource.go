@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -44,6 +45,7 @@ type deploymentModel struct {
 	VersionOverride types.String `tfsdk:"version_override"`
 	DestroyMode     types.String `tfsdk:"destroy_mode"`
 	SpecHash        types.String `tfsdk:"spec_hash"`
+	ResolvedSpec    types.String `tfsdk:"resolved_spec"`
 	DeployedVersion types.String `tfsdk:"deployed_version"`
 	PreviousVersion types.String `tfsdk:"previous_version"`
 	Hosts           types.List   `tfsdk:"hosts"`
@@ -68,8 +70,10 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 			"destroy_mode": schema.StringAttribute{Optional: true, Computed: true,
 				Default:             stringdefault.StaticString("purge"),
 				MarkdownDescription: "purge | unregister | abandon (DESIGN §10.6)."},
-			"id":               schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
-			"spec_hash":        schema.StringAttribute{Computed: true},
+			"id":        schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
+			"spec_hash": schema.StringAttribute{Computed: true},
+			"resolved_spec": schema.StringAttribute{Computed: true,
+				MarkdownDescription: "Internal: the fully-resolved deployment spec (post-substitution/version_override) as of the last apply, persisted so an Update can faithfully compare against the prior artifact and configuration even when spec_file contents have since changed on the runner."},
 			"deployed_version": schema.StringAttribute{Computed: true},
 			"previous_version": schema.StringAttribute{Computed: true},
 			"hosts":            schema.ListAttribute{Computed: true, ElementType: types.StringType},
@@ -147,6 +151,10 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 		return
 	}
 	plan.SpecHash = types.StringValue(newHash)
+	// Persist the fully-resolved spec at plan time so it is known (no perpetual
+	// "known after apply" diff) and so a later Update can compare against it even
+	// after spec_file contents change on disk.
+	plan.ResolvedSpec = marshalResolvedSpec(newSpec)
 	resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
 
 	if req.State.Raw.IsNull() { // create
@@ -157,13 +165,38 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	oldSpec, _, err := r.resolveSpec(ctx, &state)
-	if err != nil {
-		return // stored spec no longer parses; let Update surface it
+	// Compare against the PERSISTED prior spec, not a fresh re-read of spec_file
+	// (which by plan time already holds the NEW contents and would make old == new,
+	// hiding immutable-field changes).
+	oldSpec := r.priorFromState(ctx, &state)
+	if oldSpec == nil {
+		return // no faithful prior recorded; let Update/Deploy proceed
 	}
 	if immutableKey(oldSpec) != immutableKey(newSpec) {
-		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("spec"))
+		resp.RequiresReplace = append(resp.RequiresReplace, configuredSpecPath(&plan))
 	}
+}
+
+// configuredSpecPath returns the schema path of whichever spec attribute the
+// configuration actually sets, so a forced replacement is attributed to spec_file
+// when that is the source rather than always to spec.
+func configuredSpecPath(m *deploymentModel) path.Path {
+	if !m.SpecFile.IsNull() && m.SpecFile.ValueString() != "" {
+		return path.Root("spec_file")
+	}
+	return path.Root("spec")
+}
+
+// marshalResolvedSpec serializes a resolved deployment to canonical JSON for
+// persistence in the resolved_spec computed attribute. password_env and other
+// secret references are stored by NAME (never resolved values), so no secret is
+// persisted. Returns null on the (practically impossible) marshal error.
+func marshalResolvedSpec(d *spec.Deployment) types.String {
+	b, err := json.Marshal(d)
+	if err != nil {
+		return types.StringNull()
+	}
+	return types.StringValue(string(b))
 }
 
 func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -193,29 +226,36 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	prior := r.faithfulPriorSpec(ctx, &state)
+	prior := r.priorFromState(ctx, &state)
 	r.apply(ctx, &plan, prior, &resp.Diagnostics, func(m *deploymentModel) {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 	})
 }
 
-// faithfulPriorSpec returns the prior deployment ONLY when the prior state can be
-// reconstructed faithfully — i.e. the spec was stored INLINE (persisted verbatim in
-// state). When the prior state used spec_file, the file on the runner may already
-// hold the NEW contents by Update time, so rereading it would make the prior look
-// identical to the desired spec: an artifact upgrade would be misrouted through
-// Reconfigure (skipping the fetch of the new artifact), a changed post_install hook
-// would look unchanged, and rollback would restore the wrong configuration. In that
-// case we return nil so Engine.Update falls back to a safe, always-correct Deploy.
-func (r *DeploymentResource) faithfulPriorSpec(ctx context.Context, state *deploymentModel) *spec.Deployment {
-	if state.Spec.IsNull() || state.Spec.ValueString() == "" {
-		return nil // spec_file (or empty) prior — historical contents unavailable
+// priorFromState reconstructs the prior deployment from the PERSISTED resolved_spec
+// (written verbatim on the last apply/plan), so it is faithful regardless of whether
+// the prior spec came from inline `spec` or from a `spec_file` whose contents have
+// since changed on the runner. This is what lets a same-artifact spec_file
+// configuration change route correctly through Reconfigure (applying CONFIGURE and a
+// changed post_install) while a real artifact upgrade still routes to Deploy, and it
+// gives rollback the ACTUAL prior configuration to restore. Falls back to re-parsing
+// inline spec for state written before resolved_spec existed; returns nil (→ safe
+// Deploy) only when no faithful prior is available.
+func (r *DeploymentResource) priorFromState(ctx context.Context, state *deploymentModel) *spec.Deployment {
+	if rs := state.ResolvedSpec.ValueString(); rs != "" {
+		var d spec.Deployment
+		if err := json.Unmarshal([]byte(rs), &d); err == nil {
+			return &d
+		}
 	}
-	d, _, err := r.resolveSpec(ctx, state)
-	if err != nil {
-		return nil // unparseable prior state — force a safe Deploy
+	// Back-compat: state persisted before resolved_spec existed. Inline spec is still
+	// faithful; a mutated spec_file is not, so decline rather than misroute.
+	if !state.Spec.IsNull() && state.Spec.ValueString() != "" {
+		if d, _, err := r.resolveSpec(ctx, state); err == nil {
+			return d
+		}
 	}
-	return d
+	return nil
 }
 
 func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
@@ -236,6 +276,7 @@ func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
 	}
 	plan.ID = types.StringValue(deploymentID(d))
 	plan.SpecHash = types.StringValue(hash)
+	plan.ResolvedSpec = marshalResolvedSpec(d)
 	fillStatus(ctx, plan, st, diags)
 	setState(plan)
 }
