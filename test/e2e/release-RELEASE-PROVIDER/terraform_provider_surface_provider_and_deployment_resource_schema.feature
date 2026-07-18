@@ -6,7 +6,7 @@ Feature: Provider and Deployment Resource Schema
   (DESIGN §5.2, §14, T9). These scenarios drive the REAL provider schema and
   config validators — no provider server, in-process (terraform-plugin-framework).
 
-  Scenario: One-of validation rejects both spec and spec_file set
+  Scenario: VAL-06 One-of validation rejects both spec and spec_file set
     Given a deployment resource config with both spec and spec_file set
     When the deployment resource config validators run
     Then validation fails with an "exactly one of" error
