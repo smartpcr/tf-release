@@ -335,7 +335,19 @@ func (f *dsmHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, 
 
 	case strings.Contains(s, "SCM") || strings.Contains(s, "Get-WinEvent"):
 		return dsmOK("[]"), nil
+
+	case strings.Contains(s, `CurrentControlSet\Services`) && strings.Contains(s, "Set-ItemProperty"):
+		// writeServiceEnv (DESIGN §S5): the engine writes the service's Environment
+		// value under HKLM\SYSTEM\CurrentControlSet\Services\<svc> during CONFIGURE.
+		// Modeled explicitly so it can never reach the default fall-through below.
+		f.mark("SVCENV")
+		return dsmOK(""), nil
 	}
+	// No dispatch case modeled this script. Record it as UNMATCHED and return a
+	// benign success so the scenario still runs to completion, but the After hook
+	// (dsmWorld.unmatchedScripts) fails the scenario on any UNMATCHED entry: an
+	// engine script this hand-ported fake does not understand must never
+	// masquerade as success and let a stale scenario keep "passing".
 	f.mark("UNMATCHED<<" + dsmFirstLine(s) + ">>")
 	return transport.Result{ExitCode: 0}, nil
 }
@@ -616,6 +628,7 @@ func dsmCountStep(steps []dsmStep, name string) int {
 
 type dsmWorld struct {
 	closers []func()
+	hosts   []*dsmHost // every fake host built this scenario (UNMATCHED drift guard)
 
 	// matrix scenario
 	mode    string
@@ -640,6 +653,30 @@ func (w *dsmWorld) reset() {
 	*w = dsmWorld{}
 }
 
+// newHost builds a fake target and registers it so the After hook can verify the
+// fake modeled every script the engine emitted (no UNMATCHED default fall-through).
+func (w *dsmWorld) newHost(name string) *dsmHost {
+	f := dsmNewHost(name)
+	w.hosts = append(w.hosts, f)
+	return f
+}
+
+// unmatchedScripts returns the UNMATCHED marks recorded by any fake host this
+// scenario. Non-empty means the engine emitted a script no dispatch case models,
+// so the fake fell through to its default success and the scenario is no longer
+// exercising that real engine step.
+func (w *dsmWorld) unmatchedScripts() []string {
+	var out []string
+	for _, f := range w.hosts {
+		for _, entry := range f.log {
+			if strings.HasPrefix(entry, "UNMATCHED<<") {
+				out = append(out, "host "+f.host+" ran "+entry)
+			}
+		}
+	}
+	return out
+}
+
 func dsmManifestOf(f *dsmHost) string { return string(f.files[dsmManifestPath]) }
 
 func dsmIsPreSwitch(step string) bool {
@@ -659,7 +696,7 @@ func (w *dsmWorld) matrixFailureAtStep(step, mode string) error {
 	url, sum, closeFn := dsmArtifactServer(payload)
 	w.addCloser(closeFn)
 
-	f := dsmNewHost("lab-01")
+	f := w.newHost("lab-01")
 	w.host = f
 	w.eng = engine.New()
 	w.eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return f, nil }
@@ -809,7 +846,7 @@ func (w *dsmWorld) targetAlreadyAtSpecVersion() error {
 	payload := []byte("idempotent zip")
 	url, sum, closeFn := dsmArtifactServer(payload)
 	w.addCloser(closeFn)
-	f := dsmNewHost("lab-01")
+	f := w.newHost("lab-01")
 	f.svc = "Running"
 	if err := dsmSeedManifest(f, &engine.Manifest{
 		Schema: 1, App: "sample-svc", Pattern: "windows_service",
@@ -879,7 +916,7 @@ func (w *dsmWorld) successfulSingleHostDeploy() error {
 	payload := []byte("fresh order zip")
 	url, sum, closeFn := dsmArtifactServer(payload)
 	w.addCloser(closeFn)
-	f := dsmNewHost("lab-01")
+	f := w.newHost("lab-01")
 	w.host = f
 	w.eng = engine.New()
 	w.eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return f, nil }
@@ -949,7 +986,7 @@ func (w *dsmWorld) multiHostUpdateWithCacheAndRollback() error {
 		role:  true, svc: "SampleSvc", owner: "lab-01", state: "Online",
 	}
 	newNode := func(host string) (*dsmClusterNode, error) {
-		f := dsmNewHost(host)
+		f := w.newHost(host)
 		f.svc = "Running"
 		if err := dsmSeedManifest(f, &engine.Manifest{
 			Schema: 1, App: "sample-svc", Pattern: "cluster_generic_service",
@@ -1073,9 +1110,23 @@ func InitializeScenario_engine_core_and_manifest_state_deploy_state_machine_and_
 		w.reset()
 		return c, nil
 	})
-	ctx.After(func(c context.Context, _ *godog.Scenario, _ error) (context.Context, error) {
+	ctx.After(func(c context.Context, _ *godog.Scenario, scErr error) (context.Context, error) {
+		// Drift guard: fail the scenario if the fake fell through to its default
+		// success case for any engine script it does not model. Without this, a
+		// renamed marker or new step in the engine's real PowerShell surface would
+		// silently no-op here and the scenario would keep passing while no longer
+		// exercising the real engine step.
+		unmatched := w.unmatchedScripts()
 		w.reset()
-		return c, nil
+		if len(unmatched) > 0 {
+			drift := fmt.Errorf("fake transport silently treated %d unmodeled engine script(s) as success — model them explicitly or the scenario stops exercising the real engine step: %s",
+				len(unmatched), strings.Join(unmatched, "; "))
+			if scErr != nil {
+				return c, fmt.Errorf("%v [and] %w", drift, scErr)
+			}
+			return c, drift
+		}
+		return c, scErr
 	})
 
 	// Rollback matrix row.
