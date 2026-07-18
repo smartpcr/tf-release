@@ -87,9 +87,35 @@ func TestPriorFromStateBackCompat(t *testing.T) {
 		t.Fatalf("inline back-compat prior must reconstruct 1.0.0, got %+v", prior)
 	}
 	fileState := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue("/nonexistent/spec.yaml"),
-		ResolvedSpec: types.StringNull()}
+		ResolvedSpec: types.StringNull(), DeployedVersion: types.StringNull()}
 	if prior := r.priorFromState(context.Background(), fileState); prior != nil {
-		t.Fatalf("spec_file back-compat prior must decline (nil), got version %q", prior.Artifact.Version)
+		t.Fatalf("spec_file back-compat prior with no deployed_version must decline (nil), got version %q", prior.Artifact.Version)
+	}
+}
+
+// TestPriorFromStateLegacySpecFilePinsDeployedVersion covers item 2: legacy
+// spec_file state (no resolved_spec) that DOES record a deployed_version must
+// reconstruct a best-effort prior pinned to that version, so a same-version
+// configuration change routes through Reconfigure (which re-runs CONFIGURE)
+// instead of no-op'ing on Deploy's version/checksum short-circuit.
+func TestPriorFromStateLegacySpecFilePinsDeployedVersion(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.yaml")
+	// The file on disk now holds 2.0.0 (a config edit may have bumped it), but the
+	// version actually deployed and recorded in state is 1.0.0.
+	if err := os.WriteFile(path, []byte(wsSpecYAML("2.0.0")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	state := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue(path),
+		ResolvedSpec: types.StringNull(), DeployedVersion: types.StringValue("1.0.0")}
+	prior := r.priorFromState(context.Background(), state)
+	if prior == nil {
+		t.Fatalf("legacy spec_file with deployed_version must reconstruct a prior, got nil")
+	}
+	if prior.Artifact.Version != "1.0.0" {
+		t.Fatalf("legacy prior must pin to recorded deployed_version 1.0.0, got %q", prior.Artifact.Version)
 	}
 }
 

@@ -72,8 +72,8 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 				MarkdownDescription: "purge | unregister | abandon (DESIGN §10.6)."},
 			"id":        schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 			"spec_hash": schema.StringAttribute{Computed: true},
-			"resolved_spec": schema.StringAttribute{Computed: true,
-				MarkdownDescription: "Internal: the fully-resolved deployment spec (post-substitution/version_override) as of the last apply, persisted so an Update can faithfully compare against the prior artifact and configuration even when spec_file contents have since changed on the runner."},
+			"resolved_spec": schema.StringAttribute{Computed: true, Sensitive: true,
+				MarkdownDescription: "Internal: the fully-resolved deployment spec (post-substitution/version_override) as of the last apply, persisted so an Update can faithfully compare against the prior artifact and configuration even when spec_file contents have since changed on the runner. Marked sensitive because ${var:...} substitutions may embed secret values into the resolved spec."},
 			"deployed_version": schema.StringAttribute{Computed: true},
 			"previous_version": schema.StringAttribute{Computed: true},
 			"hosts":            schema.ListAttribute{Computed: true, ElementType: types.StringType},
@@ -189,8 +189,10 @@ func configuredSpecPath(m *deploymentModel) path.Path {
 
 // marshalResolvedSpec serializes a resolved deployment to canonical JSON for
 // persistence in the resolved_spec computed attribute. password_env and other
-// secret references are stored by NAME (never resolved values), so no secret is
-// persisted. Returns null on the (practically impossible) marshal error.
+// secret references are stored by NAME, but ${var:...} substitutions may embed
+// secret values into other fields, so the snapshot can contain sensitive data —
+// it is persisted only in the Sensitive resolved_spec attribute. Returns null on
+// the (practically impossible) marshal error.
 func marshalResolvedSpec(d *spec.Deployment) types.String {
 	b, err := json.Marshal(d)
 	if err != nil {
@@ -239,8 +241,10 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 // configuration change route correctly through Reconfigure (applying CONFIGURE and a
 // changed post_install) while a real artifact upgrade still routes to Deploy, and it
 // gives rollback the ACTUAL prior configuration to restore. Falls back to re-parsing
-// inline spec for state written before resolved_spec existed; returns nil (→ safe
-// Deploy) only when no faithful prior is available.
+// inline spec for state written before resolved_spec existed, and for legacy
+// spec_file state pins a best-effort prior to the recorded deployed_version so a
+// same-version configuration change still reconfigures rather than no-op'ing;
+// returns nil (→ safe Deploy) only when no prior at all can be reconstructed.
 func (r *DeploymentResource) priorFromState(ctx context.Context, state *deploymentModel) *spec.Deployment {
 	if rs := state.ResolvedSpec.ValueString(); rs != "" {
 		var d spec.Deployment
@@ -248,10 +252,27 @@ func (r *DeploymentResource) priorFromState(ctx context.Context, state *deployme
 			return &d
 		}
 	}
-	// Back-compat: state persisted before resolved_spec existed. Inline spec is still
-	// faithful; a mutated spec_file is not, so decline rather than misroute.
+	// Back-compat: state persisted before resolved_spec existed. Inline spec is
+	// still faithful verbatim.
 	if !state.Spec.IsNull() && state.Spec.ValueString() != "" {
 		if d, _, err := r.resolveSpec(ctx, state); err == nil {
+			return d
+		}
+		return nil
+	}
+	// Legacy spec_file state: re-reading the file at Update time yields the CURRENT
+	// (possibly already-changed) contents, so the configuration cannot be trusted as
+	// the prior. But the artifact version that was actually deployed IS recorded in
+	// state (deployed_version). Reconstruct a best-effort prior pinned to that
+	// version so a SAME-version configuration change still routes through Reconfigure
+	// — which re-runs CONFIGURE — instead of falling to Deploy's version/checksum
+	// idempotency short-circuit and silently no-op'ing the change. A genuine version
+	// upgrade (deployed_version != desired) still compares unequal and routes to
+	// Deploy. Returns nil only when no deployed version is recorded (nothing to
+	// reconfigure against).
+	if dv := state.DeployedVersion.ValueString(); dv != "" {
+		if d, _, err := r.resolveSpec(ctx, state); err == nil {
+			d.Artifact.Version = dv
 			return d
 		}
 	}
