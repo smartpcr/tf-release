@@ -114,3 +114,18 @@ func NewDeploymentResourceWithDeadlineCapture() (*DeploymentResource, *DeadlineC
 	r := &DeploymentResource{newEngine: func() deployEngine { return e2eDeadlineEngine{cap: cap} }}
 	return r, cap
 }
+
+// NewDeploymentResourceWithTransport returns a DeploymentResource wired to the REAL
+// engine.New() whose per-host transport factory is the caller-supplied newT. Driving
+// Read/Create against it runs the GENUINE engine reconciliation and deploy paths
+// (ReadStatus → Connect → ReadManifest → ReconcileManifest → pattern.Status; apply →
+// Update → Deploy → preflight/warnInsecureTransport → …) against a scripted fake
+// transport, so the drift outcome (RemoveResource on an absent manifest, the "!failed"
+// deployed_version marker, a loud Read ERROR on a failed dial) and the insecure-transport
+// WARN are produced by the impl reading scripted Result values — nothing is injected at
+// the engine boundary (DESIGN §10.4, §11, §17). This is the Stage 5.3 acceptance seam.
+func NewDeploymentResourceWithTransport(newT func(*spec.Target, string) (transport.Transport, error)) *DeploymentResource {
+	eng := engine.New()
+	eng.NewTransport = newT
+	return &DeploymentResource{newEngine: func() deployEngine { return realEngine{eng} }}
+}
