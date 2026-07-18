@@ -316,6 +316,8 @@ func TestDeleteRejectsUnverifiedLegacyState(t *testing.T) {
 
 // runModifyPlan drives ModifyPlan end-to-end with a real plan+state built from the
 // resource schema, returning the response so tests can assert RequiresReplace / errors.
+// A nil state builds a create-shaped request (State.Raw null), so tests can exercise the
+// post-`state rm` re-adopt path that flows through Create.
 func runModifyPlan(t *testing.T, r *DeploymentResource, plan, state *deploymentModel) *resource.ModifyPlanResponse {
 	t.Helper()
 	ctx := context.Background()
@@ -325,9 +327,11 @@ func runModifyPlan(t *testing.T, r *DeploymentResource, plan, state *deploymentM
 	if d := p.Set(ctx, plan); d.HasError() {
 		t.Fatalf("build plan: %v", d)
 	}
-	st := tfsdk.State{Schema: sr.Schema}
-	if d := st.Set(ctx, state); d.HasError() {
-		t.Fatalf("build state: %v", d)
+	st := tfsdk.State{Schema: sr.Schema} // nil state ⇒ Raw stays null ⇒ create path
+	if state != nil {
+		if d := st.Set(ctx, state); d.HasError() {
+			t.Fatalf("build state: %v", d)
+		}
 	}
 	resp := &resource.ModifyPlanResponse{Plan: p}
 	r.ModifyPlan(ctx, resource.ModifyPlanRequest{
@@ -372,8 +376,43 @@ func TestModifyPlanBlocksDefaultContributedHostAdoption(t *testing.T) {
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("ModifyPlan must block adoption of a default-contributed identity on unverifiable state")
 	}
-	if !strings.Contains(resp.Diagnostics.Errors()[0].Detail(), "terraform apply") {
-		t.Fatalf("block must carry an executable recovery, got %q", resp.Diagnostics.Errors()[0].Detail())
+	detail := resp.Diagnostics.Errors()[0].Detail()
+	if !strings.Contains(detail, "terraform state rm") || !strings.Contains(detail, "terraform apply") {
+		t.Fatalf("block must carry the executable state-rm + apply recovery, got %q", detail)
+	}
+}
+
+// TestModifyPlanRecoveryCreateProceeds covers items 1+2 (iter-33 review): the documented
+// recovery for unverifiable default-dependent state is `terraform state rm` + `terraform
+// apply`. After state rm there is NO prior state, so the apply flows through Create. This
+// test proves that create-path planning is NOT blocked (unlike the update path) and that it
+// carries a resolved_spec snapshot for Create to persist — i.e. the recovery can actually
+// proceed through planning rather than being rejected by the replacement/Delete guard.
+func TestModifyPlanRecoveryCreateProceeds(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(specPath, []byte(wsSpecYAMLNoHost("1.0.0")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	// Same default-contributes-host setup that BLOCKS on update...
+	r := &DeploymentResource{pd: &providerData{DefaultTarget: &spec.Target{Hosts: []string{"lab-99"}}}}
+	plan := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	// ...but with NO prior state (post `terraform state rm`), planning is the create path.
+	resp := runModifyPlan(t, r, plan, nil)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("recovery create-path planning must NOT be blocked, got %v", resp.Diagnostics.Errors())
+	}
+	// The plan must carry a resolved_spec so Create persists a VERIFIED snapshot on apply,
+	// reaching verified state without a replacement or the guarded Delete.
+	var planned deploymentModel
+	if d := resp.Plan.Get(context.Background(), &planned); d.HasError() {
+		t.Fatalf("read planned model: %v", d)
+	}
+	if planned.ResolvedSpec.IsNull() || planned.ResolvedSpec.ValueString() == "" {
+		t.Fatal("recovery create plan must carry a resolved_spec for Create to persist a verified snapshot")
 	}
 }
 

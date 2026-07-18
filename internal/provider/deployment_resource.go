@@ -248,41 +248,52 @@ func immutableKey(d *spec.Deployment) string {
 }
 
 // Recovery procedures surfaced in migration/corruption diagnostics. These are
-// EXECUTABLE (not the dead-end `terraform apply -replace`, which the Read/Delete guards
-// intentionally block for unverifiable state): they either make the deployed identity
-// verifiable in place, or remove the untrustworthy state so a clean re-adopt can proceed.
+// EXECUTABLE and reach VERIFIED state without the dead-ends the guards block: neither
+// `terraform apply -replace` (whose Delete half is refused for unverifiable/corrupt
+// state) nor "pin the defaulted fields then apply" (which changes the pre-merge hash and
+// so forces the same blocked replacement). The escape hatch is `terraform state rm`
+// followed by `terraform apply`: state rm is a state-only operation (it never touches the
+// live service or invokes Delete), and the subsequent apply recreates the resource via
+// Create, which deploys IDEMPOTENTLY (adopting the already-running service when the spec
+// matches it) and persists a verified resolved_spec snapshot. ModifyPlan's create branch
+// returns before the update guards, so this path is never blocked.
 const (
 	// recoveryUnverifiableDefaults applies when the deployed identity cannot be verified
 	// from state AND provider default_target contributes immutable fields the pre-merge
-	// spec_hash does not cover. Pinning the defaulted fields into the spec makes them
-	// hash-covered, so the next apply persists a faithful resolved_spec snapshot.
+	// spec_hash does not cover.
 	recoveryUnverifiableDefaults = "the deployed identity cannot be verified from state and " +
 		"the provider default_target contributes one or more target fields (transport/os/port/" +
 		"hosts/credentials/winrm) that spec_hash — computed before defaults are merged — does not " +
 		"cover, so planning an update could deploy to a newly-defaulted target and orphan the " +
-		"original deployment. Recovery: copy the provider default_target values into this spec's " +
-		"target block explicitly (so spec_hash covers them), then run `terraform apply`; the apply " +
-		"persists a verified resolved_spec snapshot matching the deployed identity, after which " +
-		"update and destroy operate on the verified snapshot."
+		"original deployment. Recovery: first make this spec (or default_target) describe the " +
+		"ACTUALLY deployed identity, then run `terraform state rm <address>` followed by " +
+		"`terraform apply`. state rm is state-only (it never destroys the live service or invokes " +
+		"the guarded Delete); the apply then recreates via Create, which deploys idempotently " +
+		"(adopting the existing service when the spec matches) and persists a verified resolved_spec " +
+		"snapshot. Do NOT instead pin the defaults and re-apply in place: that changes the pre-merge " +
+		"hash and forces a replacement whose Delete half is refused for this unverifiable state."
 
 	// recoveryUnverifiableLegacy applies to legacy spec_file state with no snapshot and no
-	// contributing defaults: a plain re-apply persists the snapshot from the unchanged file.
+	// contributing defaults.
 	recoveryUnverifiableLegacy = "this resource predates resolved_spec and is configured via " +
-		"spec_file, so its deployed identity cannot be verified from state. Recovery: without editing " +
-		"the spec_file, run `terraform apply`; the apply persists a resolved_spec snapshot from the " +
-		"currently-deployed spec, after which refresh, update, and destroy operate on the verified " +
-		"snapshot. (Do NOT use `terraform apply -replace` — the destroy half is blocked for " +
-		"unverifiable state precisely so it cannot orphan the live service.)"
+		"spec_file, so its deployed identity cannot be verified from state. Recovery: run " +
+		"`terraform apply` WITHOUT editing the spec_file — with no immutable change pending, planning " +
+		"does not force a replacement, so the apply flows through Update and persists a resolved_spec " +
+		"snapshot from the currently-deployed spec. If planning instead forces a replacement (e.g. the " +
+		"spec must change), run `terraform state rm <address>` then `terraform apply` to re-adopt via a " +
+		"fresh Create. Both reach verified state without the guarded Delete destroying an unverifiable " +
+		"identity. (Do NOT use `terraform apply -replace` — its destroy half is blocked for exactly " +
+		"this reason.)"
 
 	// recoveryCorruptSnapshot applies when a non-empty resolved_spec cannot be decoded. It
 	// cannot be repaired in place; the state entry must be removed so the resource can be
 	// re-adopted against the live service.
 	recoveryCorruptSnapshot = "the persisted resolved_spec snapshot is corrupt and cannot be " +
 		"decoded, so the deployed identity is unknown; the Read/Delete guards refuse to act on it to " +
-		"avoid querying or destroying the wrong identity. Recovery: remove the resource from state " +
-		"with `terraform state rm <address>` and re-adopt it (re-apply to recreate, or import once an " +
-		"importer exists), or restore a known-good state backup — the corrupt snapshot cannot be " +
-		"repaired in place."
+		"avoid querying or destroying the wrong identity. Recovery: run `terraform state rm <address>` " +
+		"then `terraform apply` to re-adopt via a fresh Create (which deploys idempotently and persists " +
+		"a verified snapshot), or restore a known-good state backup — the corrupt snapshot cannot be " +
+		"repaired in place, and state rm never invokes the guarded Delete."
 )
 
 // ModifyPlan computes spec_hash drift and RequiresReplace on immutable paths.
