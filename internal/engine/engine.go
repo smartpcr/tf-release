@@ -268,6 +268,16 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 		if err := e.removeJunction(ctx, t, p); err != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("junction: %w", err))
 		}
+		// Remove the release tree THIS op created. For patterns whose hooks run
+		// PRE-switch (windows_service post_install), stageOnHost's incomplete-
+		// release cleanup already did this; but console_app runs post_install and
+		// verify_command POST-switch (DESIGN §9.3), so a fresh console failure
+		// reaches here with the release still on disk. Deleting it honors the
+		// §10.2 fresh-install contract ("machine clean") for every pattern
+		// (evaluator iter2 item 2). Idempotent: removePath no-ops when absent.
+		if err := e.removePath(ctx, t, p.Release); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("release: %w", err))
+		}
 		if err := e.removePath(ctx, t, p.Manifest); err != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("manifest: %w", err))
 		}
@@ -1185,7 +1195,13 @@ func (e *Engine) ReadStatus(ctx context.Context, s *spec.Deployment) (*Status, e
 		return nil, err
 	}
 	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
-	st, serr := pat.Status(ctx, t, releaseCtx(s, rp))
+	// Read reports the CURRENT deployed state, so the pattern context's version
+	// MUST be the manifest's current_version — NOT s.Artifact.Version (the desired
+	// version). Otherwise console_app.Status, which compares the on-host
+	// `.labdeploy-release.json` marker version against ReleaseCtx.Version, would
+	// falsely report drift whenever a plan desires a version different from what
+	// is deployed (evaluator iter2 item 1). Marker/manifest agreement ⇒ n/a.
+	st, serr := pat.Status(ctx, t, releaseCtxVersion(s, rp, m.CurrentVersion))
 	if serr != nil {
 		// A failed status probe is a loud refresh failure, not an empty/healthy
 		// service status (evaluator item 5 / DESIGN §10.4).
