@@ -1385,11 +1385,21 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 	// post_install hook — the restore path passes nil so the PRIOR hook is never
 	// re-executed while rolling back.
 	activate := func(rc pattern.ReleaseCtx, hc *spec.HealthCheck, preStart func() error) error {
+		// STOP and CONFIGURE return the pattern error UNWRAPPED — exactly as the
+		// Deploy path (switchOn) and the START/HEALTH steps below already do.
+		// pat.Stop / pat.Configure yield a correctly-coded *pattern.StepError:
+		// ERR_SERVICE_STOP / ERR_SERVICE_INSTALL for a remote exit-code failure, but
+		// ERR_CONNECT when the transport drops mid-step. Re-coding them here with a
+		// blanket coded(...) would override that ERR_CONNECT — diverging from the
+		// DESIGN §12 taxonomy (a stable contract for pipelines & tests) and from the
+		// Deploy path, where the identical failure keeps its original code — and would
+		// double the "[ERR_SERVICE_STOP] [ERR_SERVICE_STOP]" prefix on a genuine
+		// service failure.
 		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
-			return coded("ERR_SERVICE_STOP", host, "STOP", err)
+			return err
 		}
 		if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
-			return coded("ERR_SERVICE_INSTALL", host, "CONFIGURE", err)
+			return err
 		}
 		if preStart != nil {
 			if err := preStart(); err != nil {
