@@ -750,18 +750,16 @@ type diagAppender = interface {
 	AddWarning(summary, detail string)
 }
 
-// deploymentID computes the stable, host-order-independent resource id
-// (DESIGN §5.2 / architecture.md line 78): sha1(sorted(hosts)+"/"+name)[0:12] +
-// ":" + name. Hosts are lower-cased and sorted before hashing so the id is
-// byte-identical whenever the same host set is supplied in a different order OR a
-// different case. Case-folding is REQUIRED to stay consistent with immutableKey
-// (which lower-cases hosts) and the case-insensitive host semantics of DESIGN §9.5:
-// a case-only host edit ("LAB-01" -> "lab-01") leaves immutableKey unchanged (so it
-// is planned as an in-place Update, not a replacement) yet still changes the
-// canonical JSON, so spec_hash changes and Update runs. If this function preserved
-// case the Update would recompute a new id while the id attribute's
-// UseStateForUnknown plan modifier carried the prior id forward, and Terraform would
-// reject the apply with "Provider produced inconsistent result after apply: .id".
+// deploymentID computes the stable, host-order- AND host-case-independent resource
+// id (DESIGN §5.2 / architecture.md line 78): sha1(sorted(lower(hosts))+"/"+name)
+// [0:12] + ":" + name. Hosts are lower-cased and sorted before hashing — matching
+// immutableKey and the case-insensitive host semantics of DESIGN §9.5 — so the id is
+// byte-identical when the same hosts are supplied in a different order OR a different
+// case. This alignment is load-bearing: immutableKey treats a case-only host edit
+// (e.g. "LAB-01" → "lab-01") as an in-place Update, not a replacement, so were the id
+// case-sensitive that Update would recompute plan.ID to a new value while the id
+// attribute's UseStateForUnknown modifier carried the old value forward, tripping
+// Terraform's "Provider produced inconsistent result after apply" guard.
 func deploymentID(d *spec.Deployment) string {
 	hosts := make([]string, len(d.Target.Hosts))
 	for i, h := range d.Target.Hosts {
