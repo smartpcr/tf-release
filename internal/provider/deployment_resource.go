@@ -752,10 +752,21 @@ type diagAppender = interface {
 
 // deploymentID computes the stable, host-order-independent resource id
 // (DESIGN §5.2 / architecture.md line 78): sha1(sorted(hosts)+"/"+name)[0:12] +
-// ":" + name. Sorting the hosts before hashing makes the id byte-identical when
-// the same hosts are supplied in a different order.
+// ":" + name. Hosts are lower-cased and sorted before hashing so the id is
+// byte-identical whenever the same host set is supplied in a different order OR a
+// different case. Case-folding is REQUIRED to stay consistent with immutableKey
+// (which lower-cases hosts) and the case-insensitive host semantics of DESIGN §9.5:
+// a case-only host edit ("LAB-01" -> "lab-01") leaves immutableKey unchanged (so it
+// is planned as an in-place Update, not a replacement) yet still changes the
+// canonical JSON, so spec_hash changes and Update runs. If this function preserved
+// case the Update would recompute a new id while the id attribute's
+// UseStateForUnknown plan modifier carried the prior id forward, and Terraform would
+// reject the apply with "Provider produced inconsistent result after apply: .id".
 func deploymentID(d *spec.Deployment) string {
-	hosts := append([]string(nil), d.Target.Hosts...)
+	hosts := make([]string, len(d.Target.Hosts))
+	for i, h := range d.Target.Hosts {
+		hosts[i] = strings.ToLower(h)
+	}
 	sort.Strings(hosts)
 	sum := sha1.Sum([]byte(strings.Join(hosts, ",") + "/" + d.Metadata.Name))
 	return hex.EncodeToString(sum[:])[:12] + ":" + d.Metadata.Name
