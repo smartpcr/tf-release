@@ -70,6 +70,7 @@ func (r *DeploymentResource) ConfigValidators(_ context.Context) []resource.Conf
 
 type deploymentModel struct {
 	ID              types.String `tfsdk:"id"`
+	Name            types.String `tfsdk:"name"`
 	Spec            types.String `tfsdk:"spec"`
 	SpecFile        types.String `tfsdk:"spec_file"`
 	Variables       types.Map    `tfsdk:"variables"`
@@ -111,7 +112,9 @@ func deploymentSchema(version int64) schema.Schema {
 			"destroy_mode": schema.StringAttribute{Optional: true, Computed: true,
 				Default:             stringdefault.StaticString("purge"),
 				MarkdownDescription: "purge | unregister | abandon (DESIGN §10.6)."},
-			"id":        schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
+			"id": schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
+			"name": schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+				MarkdownDescription: "Deployment name, from spec metadata.name (DESIGN §5.2). Immutable, so it uses the prior state value across in-place updates."},
 			"spec_hash": schema.StringAttribute{Computed: true},
 			"resolved_spec": schema.StringAttribute{Computed: true, Sensitive: true,
 				MarkdownDescription: "Internal: the fully-resolved deployment spec (post-substitution/version_override) as of the last apply, persisted so an Update can faithfully compare against the prior artifact and configuration even when spec_file contents have since changed on the runner. Marked sensitive because ${var:...} substitutions may embed secret values into the resolved spec."},
@@ -551,6 +554,7 @@ func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
 		return
 	}
 	plan.ID = types.StringValue(deploymentID(d))
+	plan.Name = types.StringValue(d.Metadata.Name)
 	plan.SpecHash = types.StringValue(hash)
 	plan.ResolvedSpec = marshalResolvedSpec(d)
 	fillStatus(ctx, plan, st, diags)
@@ -597,6 +601,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 		resp.State.RemoveResource(ctx) // verified snapshot ⇒ genuine absence
 		return
 	}
+	state.Name = types.StringValue(d.Metadata.Name)
 	fillStatus(ctx, &state, st, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }

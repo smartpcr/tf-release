@@ -283,15 +283,15 @@ storyId: "release:RELEASE-PROVIDER"
 ### Implementation Steps
 - [x] Implement `provider.go` with the optional `default_target` block and `Configure` passing defaults into resources.
 - [x] `labdeploy_deployment` schema (arguments + computed attributes per DESIGN sec 5.2) is defined in `deployment_resource.go` `Schema`.
-- [ ] Add a schema-level `spec`/`spec_file` exactly-one-of validator: `Schema` (lines 50-71) declares both as plain optional attributes with NO attribute validator; the one-of check exists only at runtime in `resolveSpec` (lines 83-86). Move it to a schema `Validators`/`ConfigValidators` so `terraform validate` fails before apply.
+- [x] Add a schema-level `spec`/`spec_file` exactly-one-of validator: the check is enforced at the Terraform config layer via `DeploymentResource.ConfigValidators` returning `exactlyOneOfSpecValidator{}` (`internal/provider/config_validators.go`), so `terraform validate` fails before apply rather than relying solely on the runtime `resolveSpecDetail` fallback.
 - [x] Implement `spec_file` content hashing into the plan so file edits produce a diff.
 
 ### Dependencies
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: One-of validation -- Given both `spec` and `spec_file` set (and separately neither), When the schema is validated, Then the framework returns an `exactly one of` error (T9) [proof: in-process; deps: none -- terraform-plugin-framework schema unit test, no provider server]
-- [ ] Scenario: Schema round-trip -- Given a deployment state, When read then written through the schema, Then the state round-trips without attribute loss [proof: in-process; deps: none -- terraform-plugin-framework schema unit test]
+- [x] Scenario: One-of validation -- Given both `spec` and `spec_file` set (and separately neither), When the schema is validated, Then the framework returns an `exactly one of` error (T9) [proof: in-process; deps: none -- `TestExactlyOneOfSpecValidator` in `internal/provider/config_validators_test.go`]
+- [x] Scenario: Schema round-trip -- Given a deployment state, When read then written through the schema, Then the state round-trips without attribute loss [proof: in-process; deps: none -- `TestDeploymentSchemaRoundTrip` in `internal/provider/config_validators_test.go`]
 
 ## Stage 5.2: Deployment Resource CRUD and Plan Modifiers
 
