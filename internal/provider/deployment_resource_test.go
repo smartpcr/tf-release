@@ -17,12 +17,18 @@ import (
 // given artifact version. The checksum is a well-formed sha256:<64 hex> so the
 // spec passes validation without a real artifact.
 func wsSpecYAML(version string) string {
+	return wsSpecYAMLHost(version, "lab-01")
+}
+
+// wsSpecYAMLHost is wsSpecYAML with a configurable single host, for exercising
+// immutable-field (host) edits between the deployed snapshot and the on-disk file.
+func wsSpecYAMLHost(version, host string) string {
 	return fmt.Sprintf(`apiVersion: labdeploy/v1
 kind: Deployment
 metadata: { name: sample-svc }
 target:
   transport: winrm
-  hosts: ["lab-01"]
+  hosts: ["%s"]
   os: windows
   credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
 artifact:
@@ -38,7 +44,7 @@ health_check:
   type: http
   http: { url: "http://localhost:8080/health" }
 strategy: { keep_releases: 2, rollback_on_failure: true }
-`, version, 0)
+`, host, version, 0)
 }
 
 // TestUpdatePriorFromPersistedResolvedSpec is the item-2/3 regression: the prior
@@ -128,6 +134,49 @@ func TestLegacyReplaceRequired(t *testing.T) {
 	}
 	if legacyReplaceRequired(&spec.Deployment{}, "new", stateHash) {
 		t.Fatal("faithful prior must never take the legacy replacement path")
+	}
+}
+
+// TestStateSpecUsesPersistedSnapshot covers items 2+3: Read/Delete must operate on the
+// DEPLOYED identity from resolved_spec, never a fresh re-read of a mutated spec_file. An
+// immutable-field edit on disk (here the host) must NOT change what stateSpec returns
+// while a snapshot exists; only legacy state without a snapshot falls back to the file.
+func TestStateSpecUsesPersistedSnapshot(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.yaml")
+	// Deployed against host lab-01; snapshot captured from that resolve.
+	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-01")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	state := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue(path)}
+	deployed, _, err := r.resolveSpec(context.Background(), state)
+	if err != nil {
+		t.Fatalf("resolve deployed: %v", err)
+	}
+	state.ResolvedSpec = marshalResolvedSpec(deployed)
+
+	// The spec_file is then edited to point at a DIFFERENT host (immutable field).
+	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-99")), 0o600); err != nil {
+		t.Fatalf("rewrite spec: %v", err)
+	}
+	got, _, err := r.stateSpec(context.Background(), state)
+	if err != nil {
+		t.Fatalf("stateSpec: %v", err)
+	}
+	if len(got.Target.Hosts) != 1 || got.Target.Hosts[0] != "lab-01" {
+		t.Fatalf("stateSpec must return DEPLOYED host lab-01 from snapshot, got %v", got.Target.Hosts)
+	}
+	// Legacy state with no snapshot falls back to the on-disk file (only source).
+	legacy := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue(path),
+		ResolvedSpec: types.StringNull()}
+	lg, _, err := r.stateSpec(context.Background(), legacy)
+	if err != nil {
+		t.Fatalf("stateSpec legacy: %v", err)
+	}
+	if lg.Target.Hosts[0] != "lab-99" {
+		t.Fatalf("legacy stateSpec must fall back to on-disk host lab-99, got %v", lg.Target.Hosts)
 	}
 }
 

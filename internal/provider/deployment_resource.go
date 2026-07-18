@@ -292,6 +292,25 @@ func (r *DeploymentResource) priorFromState(ctx context.Context, state *deployme
 	return nil
 }
 
+// stateSpec returns the deployment that Read and Delete must operate on: the ACTUAL
+// deployed identity captured in the PERSISTED resolved_spec snapshot, never a fresh
+// re-read of a mutable spec_file. Re-reading spec_file in these lifecycle operations is
+// unsafe — an edit to an immutable field (target.hosts, service_name, install_root)
+// would make Read query, and Delete destroy, the DESIRED target instead of the DEPLOYED
+// one, removing state while orphaning the live service (Read) or destroying the wrong
+// identity and leaving the original service installed (Delete). Falls back to
+// re-resolving only for legacy state written before resolved_spec existed, where no
+// snapshot is available and the state input is the only source.
+func (r *DeploymentResource) stateSpec(ctx context.Context, state *deploymentModel) (*spec.Deployment, string, error) {
+	if rs := state.ResolvedSpec.ValueString(); rs != "" {
+		var d spec.Deployment
+		if err := json.Unmarshal([]byte(rs), &d); err == nil {
+			return &d, state.SpecHash.ValueString(), nil
+		}
+	}
+	return r.resolveSpec(ctx, state)
+}
+
 func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
 	prior *spec.Deployment, diags diagAppender, setState func(*deploymentModel)) {
 	d, hash, err := r.resolveSpec(ctx, plan)
@@ -321,7 +340,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	d, _, err := r.resolveSpec(ctx, &state)
+	d, _, err := r.stateSpec(ctx, &state)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid spec in state", err.Error())
 		return
@@ -353,7 +372,7 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	d, _, err := r.resolveSpec(ctx, &state)
+	d, _, err := r.stateSpec(ctx, &state)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid spec in state", err.Error())
 		return
