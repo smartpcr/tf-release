@@ -317,12 +317,26 @@ func (d *DotnetAPI) wrapped(rc ReleaseCtx) ReleaseCtx {
 	return out
 }
 
+// dllBinPath renders the launcher=dotnet_dll service binPath in the normative
+// DESIGN §9.4 form `\"<dotnet_exe>\" \"<cur>\<dll>\" <args>`. The dll path is
+// ALWAYS quoted (independent of whether it contains spaces) so the SCM parses
+// `<dotnet_exe> <dll>` as two distinct tokens; user args keep the standard
+// quote-only-when-needed rendering via quoteArgs.
+func (d *DotnetAPI) dllBinPath(rc ReleaseCtx) string {
+	p := rc.Spec.Pattern
+	dotnet := p.DotnetExe
+	if dotnet == "" {
+		dotnet = "dotnet"
+	}
+	dll := rc.P.Current + `\` + strings.TrimLeft(p.DLL, `\/`)
+	return `\"` + dotnet + `\" \"` + dll + `\"` + quoteArgs(p.Args)
+}
+
 func (d *DotnetAPI) Configure(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
 	w := d.wrapped(rc)
 	p := rc.Spec.Pattern
 	if p.Launcher == "dotnet_dll" && w.Spec.Pattern.Wrapper == "none" {
-		return d.ws.configureWithBinPath(ctx, t, w,
-			`\"`+w.Spec.Pattern.Exe+`\"`+quoteArgs(w.Spec.Pattern.Args), "")
+		return d.ws.configureWithBinPath(ctx, t, w, d.dllBinPath(rc), "")
 	}
 	if w.Spec.Pattern.Wrapper == "winsw" {
 		return d.ws.configureWinsw(ctx, t, w)
