@@ -411,22 +411,89 @@ func (s *crudState) thenIDByteIdenticalReordered() error {
 
 func (s *crudState) givenConfigNoTimeouts() error { return nil }
 
+// whenTimeoutDefaultsRead drives the REAL Create/Update/Delete CRUD methods, each
+// built from the REAL resource schema with NO explicit timeouts, and captures the
+// context deadline the resource hands to the engine. Because the deadline is observed
+// AFTER the framework's plan.Timeouts.Create(ctx, defaultCreateTimeout) resolution and
+// context.WithTimeout wrapping, this proves the schema's timeout DEFAULTS behaviourally
+// (30m/30m/15m) rather than echoing package constants (DESIGN §5.2).
 func (s *crudState) whenTimeoutDefaultsRead() error {
-	s.tCreate, s.tUpdate, s.tDelete = provider.DefaultTimeoutsForE2E()
+	ctx := context.Background()
+	r, cap := provider.NewDeploymentResourceWithDeadlineCapture()
+	sr := resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, &sr)
+
+	specYAML := e2eWSSpecYAMLHost("1.0.0", "lab-01")
+	model := func() *e2eCrudDeploymentModel {
+		return &e2eCrudDeploymentModel{
+			Spec:         types.StringValue(specYAML),
+			SpecFile:     types.StringNull(),
+			Variables:    types.MapNull(types.StringType),
+			ResolvedSpec: types.StringNull(),
+			SpecHash:     types.StringNull(),
+			Hosts:        types.ListNull(types.StringType),
+			Timeouts:     e2eNullTimeouts(),
+		}
+	}
+
+	// Create → observe the applied create deadline (~30m).
+	cp := tfsdk.Plan{Schema: sr.Schema}
+	if d := cp.Set(ctx, model()); d.HasError() {
+		return fmt.Errorf("build create plan: %v", d)
+	}
+	cresp := &resource.CreateResponse{State: tfsdk.State{Schema: sr.Schema}}
+	r.Create(ctx, resource.CreateRequest{Plan: cp}, cresp)
+	if cresp.Diagnostics.HasError() {
+		return fmt.Errorf("Create errored: %v", cresp.Diagnostics.Errors())
+	}
+	s.tCreate = cap.CreateOrUpdateRemaining
+
+	// Update → observe the applied update deadline (~30m).
+	up := tfsdk.Plan{Schema: sr.Schema}
+	if d := up.Set(ctx, model()); d.HasError() {
+		return fmt.Errorf("build update plan: %v", d)
+	}
+	us := tfsdk.State{Schema: sr.Schema}
+	if d := us.Set(ctx, model()); d.HasError() {
+		return fmt.Errorf("build update state: %v", d)
+	}
+	uresp := &resource.UpdateResponse{State: tfsdk.State{Schema: sr.Schema}}
+	r.Update(ctx, resource.UpdateRequest{Plan: up, State: us}, uresp)
+	if uresp.Diagnostics.HasError() {
+		return fmt.Errorf("Update errored: %v", uresp.Diagnostics.Errors())
+	}
+	s.tUpdate = cap.CreateOrUpdateRemaining
+
+	// Delete → observe the applied delete deadline (~15m).
+	ds := tfsdk.State{Schema: sr.Schema}
+	if d := ds.Set(ctx, model()); d.HasError() {
+		return fmt.Errorf("build delete state: %v", d)
+	}
+	dresp := &resource.DeleteResponse{State: ds}
+	r.Delete(ctx, resource.DeleteRequest{State: ds}, dresp)
+	if dresp.Diagnostics.HasError() {
+		return fmt.Errorf("Delete errored: %v", dresp.Diagnostics.Errors())
+	}
+	s.tDelete = cap.DeleteRemaining
 	return nil
 }
 
+// thenTimeoutDefaults asserts each observed deadline is the default budget minus the
+// tiny elapsed time (so within (default-1m, default]).
 func (s *crudState) thenTimeoutDefaults() error {
-	if s.tCreate != 30*time.Minute {
-		return fmt.Errorf("create default = %s, want 30m", s.tCreate)
+	within := func(name string, got, want time.Duration) error {
+		if got <= want-time.Minute || got > want {
+			return fmt.Errorf("%s deadline = %s, want ~%s (default applied at the engine boundary)", name, got, want)
+		}
+		return nil
 	}
-	if s.tUpdate != 30*time.Minute {
-		return fmt.Errorf("update default = %s, want 30m", s.tUpdate)
+	if err := within("create", s.tCreate, 30*time.Minute); err != nil {
+		return err
 	}
-	if s.tDelete != 15*time.Minute {
-		return fmt.Errorf("delete default = %s, want 15m", s.tDelete)
+	if err := within("update", s.tUpdate, 30*time.Minute); err != nil {
+		return err
 	}
-	return nil
+	return within("delete", s.tDelete, 15*time.Minute)
 }
 
 // --- import-unsupported steps -------------------------------------------------
