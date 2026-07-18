@@ -258,6 +258,7 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 		// is NOT actually clean, so we surface ERR_ROLLBACK_FAILED rather than
 		// falsely report a cleaned target (evaluator iter2 item 6).
 		rcNew := releaseCtx(s, p)
+		rcNew.EmitStep = sl.forHost(host).emit
 		var cleanupErrs []error
 		if err := pat.Stop(ctx, t, rcNew); err != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("stop: %w", err))
@@ -307,6 +308,7 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 	// (DESIGN §9.1). Otherwise Configure would bake the new version's LD_VERSION
 	// into the restored previous-version service's SCM Environment value.
 	rcPrev := releaseCtxVersion(s, pp, prev)
+	rcPrev.EmitStep = sl.forHost(host).emit
 	rb := func() error {
 		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rcPrev) }); err != nil {
 			return err
@@ -820,6 +822,7 @@ func (e *Engine) cleanupIncompleteRelease(ctx context.Context, t transport.Trans
 func (e *Engine) switchOn(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, pat pattern.Pattern, rc pattern.ReleaseCtx) error {
 	sl = sl.forHost(t.Host())
+	rc.EmitStep = sl.emit
 	if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
 		return err
 	}

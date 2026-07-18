@@ -204,11 +204,24 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		return ok(""), nil
 
-	case strings.Contains(s, "Stop-Service"): // Stop
+	case strings.Contains(s, "Stop-Service"): // S1 graceful Stop
 		f.mark("STOP")
+		if f.fail["stopgrace"] {
+			// service ignores the graceful stop ⇒ escalate to FORCE_KILL
+			// (windows_service Stop returns the sentinel exit 100).
+			return transport.Result{ExitCode: 100}, nil
+		}
 		if f.svc == "Running" {
 			f.svc = "Stopped"
 		}
+		return ok(""), nil
+
+	case strings.Contains(s, "taskkill /PID"): // S2 FORCE_KILL escalation
+		f.mark("FORCE_KILL")
+		if f.fail["forcekill"] {
+			return transport.Result{ExitCode: 43, Stderr: "still running after kill"}, nil
+		}
+		f.svc = "Stopped"
 		return ok(""), nil
 
 	case strings.Contains(s, "Start-Service"): // Start

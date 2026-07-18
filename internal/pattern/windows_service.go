@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
@@ -241,7 +242,10 @@ exit 100`, psq(svc), timeout)
 		return failFrom(t.Host(), "STOP", r)
 	}
 	// S2 FORCE_KILL: taskkill the service process tree, re-wait 10s; still
-	// running ⇒ exit 43 (ERR_SERVICE_STOP). Emitted as its own step.
+	// running ⇒ exit 43 (ERR_SERVICE_STOP). Emitted as its own structured step
+	// (via rc.emitStep) so the escalation is observable on success too, not just
+	// as an error's step tag — DESIGN WSV-07.
+	killStart := time.Now()
 	killScript := fmt.Sprintf(`$ErrorActionPreference='Continue'
 $svc=%s
 $svcPid=(Get-CimInstance Win32_Service -Filter "Name='$svc'").ProcessId
@@ -254,6 +258,9 @@ while((Get-Date) -lt $deadline){
 }
 exit %d`, psq(svc), ExitServiceStop)
 	rk, err := runPS(ctx, t, t.Host(), "FORCE_KILL", killScript, nil, 60)
+	// Record the FORCE_KILL step regardless of outcome (matches engine `timed`
+	// semantics): escalation happened and must appear in the deploy step log.
+	rc.emitStep(ctx, "FORCE_KILL", killStart)
 	if err != nil {
 		return err
 	}
