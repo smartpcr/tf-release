@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -161,22 +162,71 @@ func TestStateSpecUsesPersistedSnapshot(t *testing.T) {
 	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-99")), 0o600); err != nil {
 		t.Fatalf("rewrite spec: %v", err)
 	}
-	got, _, err := r.stateSpec(context.Background(), state)
+	got, _, verified, err := r.stateSpec(context.Background(), state)
 	if err != nil {
 		t.Fatalf("stateSpec: %v", err)
+	}
+	if !verified {
+		t.Fatalf("snapshot-backed stateSpec must be verified")
 	}
 	if len(got.Target.Hosts) != 1 || got.Target.Hosts[0] != "lab-01" {
 		t.Fatalf("stateSpec must return DEPLOYED host lab-01 from snapshot, got %v", got.Target.Hosts)
 	}
-	// Legacy state with no snapshot falls back to the on-disk file (only source).
+	// Legacy state with no snapshot falls back to the on-disk file (only source) but is
+	// flagged UNVERIFIED so Read will not treat a missing manifest as absence.
 	legacy := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue(path),
 		ResolvedSpec: types.StringNull()}
-	lg, _, err := r.stateSpec(context.Background(), legacy)
+	lg, _, lgVerified, err := r.stateSpec(context.Background(), legacy)
 	if err != nil {
 		t.Fatalf("stateSpec legacy: %v", err)
 	}
+	if lgVerified {
+		t.Fatalf("legacy spec_file stateSpec must be UNVERIFIED")
+	}
 	if lg.Target.Hosts[0] != "lab-99" {
 		t.Fatalf("legacy stateSpec must fall back to on-disk host lab-99, got %v", lg.Target.Hosts)
+	}
+}
+
+// TestStateSpecCorruptSnapshotErrors covers item 2: a non-empty but undecodable
+// resolved_spec must surface a state-corruption error, NOT silently fall back to the
+// mutable spec_file (which could target the wrong identity).
+func TestStateSpecCorruptSnapshotErrors(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-01")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	state := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue(path),
+		ResolvedSpec: types.StringValue("{ this is not valid json")}
+	_, _, _, err := r.stateSpec(context.Background(), state)
+	if err == nil {
+		t.Fatal("corrupt resolved_spec must return an error, not fall back to spec_file")
+	}
+	if !strings.Contains(err.Error(), "ERR_STATE_CORRUPT") {
+		t.Fatalf("error must be a state-corruption diagnostic, got %v", err)
+	}
+}
+
+// TestStateSpecInlineLegacyVerified covers the inline back-compat path: legacy state
+// with an inline `spec` (no resolved_spec) is faithful verbatim, so it is VERIFIED and
+// Read may treat a missing manifest as genuine absence.
+func TestStateSpecInlineLegacyVerified(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	r := &DeploymentResource{}
+	state := &deploymentModel{Spec: types.StringValue(wsSpecYAMLHost("1.0.0", "lab-01")),
+		SpecFile: types.StringNull(), ResolvedSpec: types.StringNull()}
+	got, _, verified, err := r.stateSpec(context.Background(), state)
+	if err != nil {
+		t.Fatalf("stateSpec inline: %v", err)
+	}
+	if !verified {
+		t.Fatalf("inline legacy spec must be VERIFIED (faithful verbatim)")
+	}
+	if got.Target.Hosts[0] != "lab-01" {
+		t.Fatalf("inline stateSpec host = %v, want lab-01", got.Target.Hosts)
 	}
 }
 

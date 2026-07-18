@@ -298,17 +298,29 @@ func (r *DeploymentResource) priorFromState(ctx context.Context, state *deployme
 // unsafe — an edit to an immutable field (target.hosts, service_name, install_root)
 // would make Read query, and Delete destroy, the DESIRED target instead of the DEPLOYED
 // one, removing state while orphaning the live service (Read) or destroying the wrong
-// identity and leaving the original service installed (Delete). Falls back to
-// re-resolving only for legacy state written before resolved_spec existed, where no
-// snapshot is available and the state input is the only source.
-func (r *DeploymentResource) stateSpec(ctx context.Context, state *deploymentModel) (*spec.Deployment, string, error) {
+// identity and leaving the original service installed (Delete).
+//
+// A non-empty resolved_spec that fails to decode is treated as STATE CORRUPTION and
+// surfaced as an error — we must NOT silently fall back to the mutable spec_file, which
+// could target the wrong identity. Legacy state written before resolved_spec existed has
+// no snapshot: inline `spec` is faithful verbatim (verified==true), but a spec_file
+// reread is NOT a trustworthy deployed identity (verified==false) so callers must not
+// treat a missing manifest as resource absence.
+func (r *DeploymentResource) stateSpec(ctx context.Context, state *deploymentModel) (d *spec.Deployment, hash string, verified bool, err error) {
 	if rs := state.ResolvedSpec.ValueString(); rs != "" {
-		var d spec.Deployment
-		if err := json.Unmarshal([]byte(rs), &d); err == nil {
-			return &d, state.SpecHash.ValueString(), nil
+		var sd spec.Deployment
+		if uerr := json.Unmarshal([]byte(rs), &sd); uerr != nil {
+			return nil, "", false, fmt.Errorf("[ERR_STATE_CORRUPT] resolved_spec in state is not decodable: %w; "+
+				"refusing to fall back to the mutable spec_file (which could target the wrong identity). "+
+				"Taint and re-apply (terraform apply -replace) to repair state", uerr)
 		}
+		return &sd, state.SpecHash.ValueString(), true, nil
 	}
-	return r.resolveSpec(ctx, state)
+	// Legacy state with no snapshot. Inline `spec` is faithful verbatim; a spec_file
+	// reread is unverifiable as the deployed identity.
+	verified = !state.Spec.IsNull() && state.Spec.ValueString() != ""
+	sd, h, rerr := r.resolveSpec(ctx, state)
+	return sd, h, verified, rerr
 }
 
 func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
@@ -340,7 +352,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	d, _, err := r.stateSpec(ctx, &state)
+	d, _, verified, err := r.stateSpec(ctx, &state)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid spec in state", err.Error())
 		return
@@ -358,8 +370,22 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 		resp.Diagnostics.AddError("labdeploy read failed", err.Error())
 		return
 	}
-	if st == nil { // manifest absent ⇒ resource gone
-		resp.State.RemoveResource(ctx)
+	if st == nil { // manifest absent
+		if !verified {
+			// Unverifiable legacy spec_file target: we queried a spec_file re-read, not a
+			// persisted snapshot, so a missing manifest may only mean the file was edited to
+			// point at a DIFFERENT target — treating it as absence would drop state and
+			// orphan the still-deployed service. Retain state and demand an explicit
+			// migration instead of silently removing the resource.
+			resp.Diagnostics.AddError("labdeploy state migration required",
+				"this resource predates resolved_spec and is configured via spec_file, so its "+
+					"deployed identity cannot be verified from state. A missing manifest here may be "+
+					"the result of a spec_file edit pointing at a different target rather than a real "+
+					"deletion. Re-apply (terraform apply, or apply -replace to redeploy) to persist a "+
+					"resolved_spec snapshot before relying on refresh or destroy.")
+			return
+		}
+		resp.State.RemoveResource(ctx) // verified snapshot ⇒ genuine absence
 		return
 	}
 	fillStatus(ctx, &state, st, &resp.Diagnostics)
@@ -372,7 +398,7 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	d, _, err := r.stateSpec(ctx, &state)
+	d, _, _, err := r.stateSpec(ctx, &state)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid spec in state", err.Error())
 		return
