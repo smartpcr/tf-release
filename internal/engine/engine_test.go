@@ -257,6 +257,13 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
 		return transport.Result{}, fmt.Errorf("runner transport blew up")
 
+	case strings.Contains(s, "npm ci --omit=dev"): // node_web_app InstallDeps (STAGE)
+		if f.fail["npmci"] {
+			return transport.Result{ExitCode: 46, Stderr: "npm ci failed"}, nil
+		}
+		f.mark("NPMCI")
+		return ok(""), nil
+
 	case strings.Contains(s, "LDPOSTINSTALL"): // post_install hook
 		if f.fail["postinstall"] {
 			return transport.Result{ExitCode: 9, Stderr: "hook failed"}, nil

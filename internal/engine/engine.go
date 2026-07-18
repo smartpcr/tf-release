@@ -129,14 +129,28 @@ func (e *Engine) Update(ctx context.Context, s, prior *spec.Deployment) (*Status
 }
 
 // reconfigurable reports whether a same-artifact configuration change should be
-// applied via Reconfigure rather than Deploy. Reconfigure is single-host and, in
-// this stage, defined for the windows_service pattern; anything else defers to
-// Deploy. artifactUnchanged gates it so version upgrades always deploy.
+// applied via Reconfigure rather than Deploy. Reconfigure is single-host and
+// defined for the SCM-registered service patterns (windows_service and the
+// node_web_app / dotnet_api patterns that delegate their Configure/Stop/Start/
+// Status verbs to WindowsService); anything else defers to Deploy.
+// artifactUnchanged gates it so version upgrades always deploy.
+//
+// node_web_app is additionally excluded when install_deps toggles: enabling
+// dependency installation requires the STAGE-phase `npm ci` (which Reconfigure's
+// STOP→CONFIGURE→START→HEALTH transaction does not run), so that change must
+// fall through to Deploy — which now runs InstallDeps for cached releases too.
 func reconfigurable(s, prior *spec.Deployment) bool {
 	if prior == nil || s == nil {
 		return false
 	}
-	if s.Pattern.Type != spec.PatternWindowsService {
+	switch s.Pattern.Type {
+	case spec.PatternWindowsService, spec.PatternDotnetAPI:
+		// applied entirely via Configure/Stop/Start on the deployed release.
+	case spec.PatternNodeWebApp:
+		if s.Pattern.InstallDeps != prior.Pattern.InstallDeps {
+			return false
+		}
+	default:
 		return false
 	}
 	if len(s.Target.Hosts) != 1 {
@@ -798,11 +812,6 @@ func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Tra
 		if xerr := sl.timed(ctx, "EXTRACT", func() error { return e.extract(ctx, t, p) }); xerr != nil {
 			return xerr
 		}
-		if n, ok := pat.(*pattern.NodeWebApp); ok {
-			if derr := n.InstallDeps(ctx, t, rc); derr != nil {
-				return derr
-			}
-		}
 		if merr := e.writeReleaseMarker(ctx, t, p, s); merr != nil {
 			return coded("ERR_CONNECT", host, "STAGE", merr)
 		}
@@ -812,6 +821,19 @@ func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Tra
 		sl.emit(ctx, "STAGE", stageStart)
 		tflog.Info(ctx, "release cached; skipping fetch/extract",
 			map[string]interface{}{"host": host, "version": s.Artifact.Version})
+	}
+	// node_web_app dependency install (`npm ci --omit=dev`) runs for BOTH freshly
+	// extracted AND cached releases (DESIGN §9.4). A cached release previously
+	// deployed with install_deps=false must still get its deps installed (and its
+	// package-lock.json validated) when this apply flips install_deps=true — so
+	// InstallDeps cannot live only on the fresh-extract path. It no-ops for other
+	// patterns and when install_deps=false. On a freshly-created release a failure
+	// trips the incomplete-release cleanup (createdRelease=true); on a cached
+	// release we did not create the tree survives for inspection.
+	if n, ok := pat.(*pattern.NodeWebApp); ok {
+		if derr := n.InstallDeps(ctx, t, rc); derr != nil {
+			return derr
+		}
 	}
 	// RENDER: files land in the release dir every apply (DESIGN §6.4). A failure
 	// here on a freshly-created release trips the incomplete-release cleanup.
