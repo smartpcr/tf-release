@@ -14,6 +14,15 @@ destroy — DESIGN §10.2).
 Use `labdeploy_deployment` instead when you need a multi-host WSFC cluster, a
 non-Windows pattern, or you already keep specs as YAML files.
 
+> **Authorization.** `labdeploy_windows_service` is an *additive* convenience
+> surface beyond the two resources enumerated in DESIGN §5
+> (`labdeploy_deployment`, `labdeploy_e2e_test`). It introduces **no new engine
+> behavior** — it is a typed projection onto the existing canonical `Deployment`
+> document and the same single-target state machine. It is retained by explicit
+> operator decision (`typed-resource-scope -> Keep the typed resource
+> (additive)`, Stage 4.2). It should only be removed by a reversing operator
+> decision, at which point DESIGN §5 remains the normative resource set.
+
 ## Example Usage
 
 ```hcl

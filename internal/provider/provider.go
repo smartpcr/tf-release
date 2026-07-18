@@ -123,6 +123,12 @@ func (p *LabDeployProvider) Resources(_ context.Context) []func() resource.Resou
 	return []func() resource.Resource{
 		NewDeploymentResource,
 		NewE2ETestResource,
+		// NewWindowsServiceResource is an operator-authorized ADDITIVE resource
+		// beyond the two surfaces enumerated in DESIGN §5. It is a strongly-typed
+		// projection over the same canonical Deployment document (no new engine
+		// behavior). Authorization: operator decision "typed-resource-scope ->
+		// Keep the typed resource (additive)" (Stage 4.2). Do not remove without a
+		// reversing operator decision; see docs/resources/windows_service.md.
 		NewWindowsServiceResource,
 	}
 }
