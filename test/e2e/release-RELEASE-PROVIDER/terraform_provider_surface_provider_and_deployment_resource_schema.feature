@@ -3,7 +3,7 @@ Feature: Provider and Deployment Resource Schema
   The labdeploy_deployment resource schema enforces the VAL-06 exactly-one-of
   rule for spec/spec_file at the Terraform config layer, and round-trips a
   deployment state through the schema without dropping or mutating attributes
-  (DESIGN §5.2, §14, T9). These scenarios drive the REAL provider schema and
+  (DESIGN §5.2, §14, VAL-06). These scenarios drive the REAL provider schema and
   config validators — no provider server, in-process (terraform-plugin-framework).
 
   Scenario: VAL-06 One-of validation rejects both spec and spec_file set
