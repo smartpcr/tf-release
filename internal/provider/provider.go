@@ -120,6 +120,7 @@ func (p *LabDeployProvider) Resources(_ context.Context) []func() resource.Resou
 	return []func() resource.Resource{
 		NewDeploymentResource,
 		NewE2ETestResource,
+		NewWindowsServiceResource,
 	}
 }
 

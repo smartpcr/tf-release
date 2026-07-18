@@ -102,9 +102,20 @@ func (w *WindowsService) configureWithBinPath(ctx context.Context, t transport.T
 			"& sc.exe failure \"%s\" reset= 86400 actions= restart/5000/restart/5000/restart/5000\nif($LASTEXITCODE -ne 0){ exit %d }",
 			svc, ExitSvcInstall)
 	} else {
+		// Windows PowerShell 5.1 DROPS an empty-string token ("") when splatting
+		// to a native command, so `actions= ""` would reach sc.exe as a dangling
+		// `actions=` and fail to clear. Pass the literal two-char token '""' so
+		// sc.exe receives an explicit empty actions list and clears recovery.
 		recovery = fmt.Sprintf(
-			"& sc.exe failure \"%s\" reset= 0 actions= \"\"\nif($LASTEXITCODE -ne 0){ exit %d }",
+			"& sc.exe failure \"%s\" reset= 0 actions= '\"\"'\nif($LASTEXITCODE -ne 0){ exit %d }",
 			svc, ExitSvcInstall)
+	}
+	// sc.exe description with an empty value clears a prior description, but PS
+	// 5.1 drops an empty '' token — pass the literal '""' so sc.exe gets an
+	// explicit empty argument and actually clears it (same 5.1 quirk as above).
+	descArg := psq(p.Description)
+	if p.Description == "" {
+		descArg = `'""'`
 	}
 	// S0 + S4: create when 1060 (service does not exist), else config.
 	script := fmt.Sprintf(`$ErrorActionPreference='Continue'
@@ -132,7 +143,7 @@ exit 0`,
 		startTypeArg(st), psq(display),
 		ExitSvcInstall,
 		startTypeArg(st), ExitSvcInstall,
-		psq(p.Description), ExitSvcInstall, recovery)
+		descArg, ExitSvcInstall, recovery)
 	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, env, 120)
 	if err != nil {
 		return err
@@ -326,9 +337,13 @@ if($LASTEXITCODE -ne 1060){
   & sc.exe delete %s
   if($LASTEXITCODE -ne 0){ exit %d }
 }
-& sc.exe query %s *> $null
-if($LASTEXITCODE -ne 1060){ exit %d }
-exit 0`, psq(wrapper), psq(wrapper), psq(xmlPath),
+$deadline=(Get-Date).AddSeconds(30)
+while((Get-Date) -lt $deadline){
+  & sc.exe query %s *> $null
+  if($LASTEXITCODE -eq 1060){ exit 0 }
+  Start-Sleep -Seconds 1
+}
+exit %d`, psq(wrapper), psq(wrapper), psq(xmlPath),
 			psq(svc), psq(svc), ExitSvcInstall,
 			psq(svc), ExitSvcInstall)
 	} else {

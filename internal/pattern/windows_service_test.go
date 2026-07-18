@@ -260,8 +260,8 @@ func TestWindowsServiceRecoveryClear(t *testing.T) {
 		t.Fatal("Configure emitted no scripts")
 	}
 	s4 := f.scripts[0]
-	if !strings.Contains(s4, `reset= 0 actions= ""`) {
-		t.Errorf("disabled restart_on_failure must clear recovery actions (reset= 0 actions= \"\"):\n%s", s4)
+	if !strings.Contains(s4, `reset= 0 actions= '""'`) {
+		t.Errorf("disabled restart_on_failure must clear recovery actions with a PS 5.1-safe empty arg (reset= 0 actions= '\"\"'):\n%s", s4)
 	}
 	if strings.Contains(s4, "restart/5000") {
 		t.Errorf("disabled restart_on_failure must NOT install restart actions:\n%s", s4)
@@ -269,5 +269,76 @@ func TestWindowsServiceRecoveryClear(t *testing.T) {
 	// clearing recovery is still gated so a failed sc.exe failure surfaces.
 	if !strings.Contains(s4, "if($LASTEXITCODE -ne 0){ exit 46 }") {
 		t.Errorf("recovery-clear must be exit-code gated:\n%s", s4)
+	}
+}
+
+// Scenario: an empty description must be CLEARED, not left stale. PS 5.1 drops an
+// empty single-quoted native-command token, so the S4 script must pass the
+// literal '""' to sc.exe description so it receives an explicit empty argument.
+func TestWindowsServiceDescriptionClear(t *testing.T) {
+	var w WindowsService
+	rc := winsvcRC(spec.Pattern{
+		Type:        spec.PatternWindowsService,
+		ServiceName: "NoDescSvc",
+		Exe:         `bin\App.exe`,
+		StartType:   "auto",
+		Description: "",
+	}, nil)
+
+	f := &scriptTransport{osKind: spec.OSWindows}
+	if err := w.Configure(context.Background(), f, rc); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	s4 := f.scripts[0]
+	if !strings.Contains(s4, `& sc.exe description $svc '""'`) {
+		t.Errorf("empty description must be cleared with a PS 5.1-safe empty arg (description $svc '\"\"'):\n%s", s4)
+	}
+	// A non-empty description must still be single-quoted normally (regression).
+	rc2 := winsvcRC(spec.Pattern{
+		Type: spec.PatternWindowsService, ServiceName: "DescSvc", Exe: `bin\App.exe`,
+		StartType: "auto", Description: "Hello",
+	}, nil)
+	f2 := &scriptTransport{osKind: spec.OSWindows}
+	if err := w.Configure(context.Background(), f2, rc2); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if !strings.Contains(f2.scripts[0], `& sc.exe description $svc 'Hello'`) {
+		t.Errorf("non-empty description must be passed normally:\n%s", f2.scripts[0])
+	}
+}
+
+// Scenario: WinSW uninstall must POLL for the service to disappear because
+// sc.exe delete is asynchronous — an immediate re-query can still see the
+// service and falsely report ERR_SERVICE_INSTALL (DESIGN §9.2 winsw uninstall).
+func TestWindowsServiceWinswUninstallPolls(t *testing.T) {
+	var w WindowsService
+	rc := winsvcRC(spec.Pattern{
+		Type:        spec.PatternWindowsService,
+		ServiceName: "WorkerSvc",
+		Exe:         `bin\Worker.exe`,
+		Wrapper:     "winsw",
+		WinswExe:    `tools\WinSW.exe`,
+	}, nil)
+
+	f := &scriptTransport{osKind: spec.OSWindows}
+	if err := w.Uninstall(context.Background(), f, rc, false); err != nil {
+		t.Fatalf("Uninstall(winsw): %v", err)
+	}
+	// Uninstall runs Stop (graceful, exit 0) first, then the winsw uninstall.
+	var uninstall string
+	for _, s := range f.scripts {
+		if strings.Contains(s, "sc.exe delete") {
+			uninstall = s
+		}
+	}
+	if uninstall == "" {
+		t.Fatalf("no winsw uninstall script emitted; scripts=%v", f.scripts)
+	}
+	if !strings.Contains(uninstall, "(Get-Date).AddSeconds(30)") || !strings.Contains(uninstall, "if($LASTEXITCODE -eq 1060){ exit 0 }") {
+		t.Errorf("winsw uninstall must poll for service disappearance after async delete:\n%s", uninstall)
+	}
+	// The fallback delete failure is still propagated.
+	if !strings.Contains(uninstall, "if($LASTEXITCODE -ne 0){ exit 46 }") {
+		t.Errorf("winsw uninstall must still propagate sc.exe delete failure:\n%s", uninstall)
 	}
 }

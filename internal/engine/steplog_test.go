@@ -326,6 +326,44 @@ func TestStepLogForceKillEscalation(t *testing.T) {
 	}
 }
 
+// TestStepLogDestroyForceKill — DESIGN §9.2 S2 / WSV-07 on the DESTROY path:
+// Uninstall stops the service first and may escalate to force-kill; that
+// escalation must also emit a structured FORCE_KILL step record, not just on
+// deploy/rollback.
+func TestStepLogDestroyForceKill(t *testing.T) {
+	payload := []byte("v1")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("deploy: %v\nlog=%v", err, f.log)
+	}
+	// The deployed service is Running; make it ignore the graceful stop so the
+	// destroy path's Uninstall→Stop escalates to force-kill.
+	f.fail["stopgrace"] = true
+
+	var buf bytes.Buffer
+	ctx := tflogtest.RootLogger(context.Background(), &buf)
+	if err := eng.Destroy(ctx, d, "purge"); err != nil {
+		t.Fatalf("destroy with force-kill escalation should succeed: %v\nlog=%v", err, f.log)
+	}
+
+	steps := captureSteps(t, &buf)
+	if countStep(steps, "FORCE_KILL") == 0 {
+		t.Fatalf("destroy-path force-kill escalation must emit a structured FORCE_KILL step (WSV-07): %v", stepNames(steps))
+	}
+	for _, se := range steps {
+		if se.step == "FORCE_KILL" && (se.app != "sample-svc" || se.host != "lab-01") {
+			t.Fatalf("destroy FORCE_KILL step wrong fields: %+v", se)
+		}
+	}
+	if !strings.Contains(strings.Join(f.log, ","), "FORCE_KILL") {
+		t.Fatalf("force-kill script was not executed on the destroy path: %v", f.log)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // seed helpers
 // ---------------------------------------------------------------------------

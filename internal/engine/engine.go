@@ -1259,6 +1259,10 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 		}
 	}()
 	rc := releaseCtx(s, p)
+	// Uninstall calls Stop internally, which may escalate to FORCE_KILL; wire the
+	// step sink so that escalation emits a structured FORCE_KILL record on the
+	// destroy path too (DESIGN §9.2 S2 / WSV-07), not only on deploy/rollback.
+	rc.EmitStep = newStepLogger(s, host).emit
 	if err := pat.Uninstall(ctx, t, rc, mode == "purge"); err != nil {
 		return err
 	}
