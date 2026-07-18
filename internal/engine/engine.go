@@ -1218,6 +1218,59 @@ func (e *Engine) ReadStatus(ctx context.Context, s *spec.Deployment) (*Status, e
 	return out, nil
 }
 
+// Reconfigure re-applies pattern configuration (e.g. a Windows service's
+// description, start type, recovery actions, and environment) to the CURRENTLY
+// deployed release WITHOUT re-staging, switching, or restarting for a new
+// artifact. It exists because a configuration-only change — one that leaves
+// artifact.version and artifact.checksum untouched — hits Deploy's idempotency
+// short-circuit (DESIGN §10.1 step 2) and would otherwise never reach the
+// CONFIGURE step, silently skipping the mutable settings while Terraform still
+// records the new desired state. pattern.Configure is idempotent, so callers may
+// invoke this unconditionally after Deploy. Returns a nil status with a nil error
+// when nothing is deployed yet (there is nothing to reconfigure). Single-host.
+func (e *Engine) Reconfigure(ctx context.Context, s *spec.Deployment) (*Status, error) {
+	host := strings.ToLower(s.Target.Hosts[0])
+	t, err := e.NewTransport(&s.Target, host)
+	if err != nil {
+		return nil, coded("ERR_SPEC_INVALID", host, "VALIDATE", err)
+	}
+	pat, verr := pattern.For(s.Pattern.Type)
+	if verr != nil {
+		return nil, coded("ERR_UNSUPPORTED", host, "VALIDATE", verr)
+	}
+	if err := t.Connect(ctx); err != nil {
+		return nil, wrapTransportErr(err, host, "CONNECT")
+	}
+	defer t.Close()
+	p := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, s.Artifact.Version)
+	m, err := ReadManifest(ctx, t, p)
+	if err != nil {
+		return nil, coded("ERR_CONNECT", host, "PREFLIGHT", err)
+	}
+	present, deployedVer, warn := ReconcileManifest(m)
+	if !present {
+		return nil, nil
+	}
+	if warn != "" {
+		e.warnf("%s", warn)
+	}
+	// Configure the CURRENT deployed version's release (mirrors ReadStatus): the
+	// pattern context version MUST be the manifest's current_version so Configure
+	// targets the live binary path, not a desired version that is not yet on disk.
+	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
+	rc := releaseCtxVersion(s, rp, m.CurrentVersion)
+	if err := pat.Configure(ctx, t, rc); err != nil {
+		return nil, coded("ERR_SERVICE_INSTALL", host, "CONFIGURE", err)
+	}
+	st, serr := pat.Status(ctx, t, rc)
+	if serr != nil {
+		return nil, wrapTransportErr(serr, host, "READ")
+	}
+	out := statusFrom(m, host, st)
+	out.DeployedVersion = deployedVer
+	return out, nil
+}
+
 // Destroy honors destroy_mode purge|unregister|abandon (DESIGN §10.6).
 func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) error {
 	if mode == "abandon" {

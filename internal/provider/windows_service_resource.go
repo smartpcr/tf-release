@@ -330,6 +330,19 @@ func (r *WindowsServiceResource) Update(ctx context.Context, req resource.Update
 		resp.Diagnostics.AddError(wsDiagSummary("ERR_SERVICE_INSTALL", "windows_service update failed", err), err.Error())
 		return
 	}
+	// A configuration-only change (same artifact version/checksum) makes the
+	// Deploy above an idempotent no-op (DESIGN §10.1 step 2) that never reaches
+	// the CONFIGURE step. Re-apply configuration so mutable settings (description,
+	// start type, recovery, environment) always reach the target on Update.
+	rst, rwarns, rerr := std.reconfigure(ctx)
+	appendWarnings(&resp.Diagnostics, rwarns)
+	if rerr != nil {
+		resp.Diagnostics.AddError(wsDiagSummary("ERR_SERVICE_INSTALL", "windows_service reconfigure failed", rerr), rerr.Error())
+		return
+	}
+	if rst != nil {
+		st = rst
+	}
 	fillWSStatus(&plan, st)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }

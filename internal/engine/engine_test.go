@@ -30,12 +30,12 @@ type fakeHost struct {
 	files      map[string][]byte // path -> content (case-sensitive; engine is consistent)
 	dirs       map[string]bool
 	dirTS      map[string]int64 // optional per-dir mtime ticks for deterministic prune
-	current    string          // junction target
-	svc        string          // "", "Stopped", "Running"
-	fail       map[string]bool // step toggles: "switch","health","start","extract"
-	failN      map[string]int  // one-shot step failures: fail the first N calls, then succeed
-	healthGate func() bool     // optional dynamic health failure (true => fail)
-	log        []string        // executed step markers, in order
+	current    string           // junction target
+	svc        string           // "", "Stopped", "Running"
+	fail       map[string]bool  // step toggles: "switch","health","start","extract"
+	failN      map[string]int   // one-shot step failures: fail the first N calls, then succeed
+	healthGate func() bool      // optional dynamic health failure (true => fail)
+	log        []string         // executed step markers, in order
 }
 
 func newFakeHost(name string) *fakeHost {
@@ -50,9 +50,9 @@ func (f *fakeHost) Connect(ctx context.Context) error {
 	}
 	return nil
 }
-func (f *fakeHost) Close() error                      { return nil }
-func (f *fakeHost) OS() spec.OSKind                   { return spec.OSWindows }
-func (f *fakeHost) Host() string                      { return f.host }
+func (f *fakeHost) Close() error    { return nil }
+func (f *fakeHost) OS() spec.OSKind { return spec.OSWindows }
+func (f *fakeHost) Host() string    { return f.host }
 
 var reRead = regexp.MustCompile(`ReadAllBytes\('([^']+)'\)`)
 var reWrite = regexp.MustCompile(`WriteAllBytes\('([^']+)',\[Convert\]::FromBase64String\('([^']*)'\)\)`)
@@ -495,6 +495,53 @@ func TestIdempotentNoop(t *testing.T) { // IDP-01
 	}
 }
 
+func TestReconfigureAppliesConfig(t *testing.T) { // IDP-02: config-only update reaches CONFIGURE
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Same artifact version/checksum: Deploy would be an idempotent no-op that
+	// skips CONFIGURE. Reconfigure must still reach CONFIGURE so mutable service
+	// settings land, WITHOUT re-staging/switching (no FETCH/EXTRACT/SWITCH/STOP).
+	st, err := eng.Reconfigure(context.Background(), d)
+	if err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if st == nil || st.DeployedVersion != "1.0.0" {
+		t.Fatalf("reconfigure status: %+v", st)
+	}
+	joined := strings.Join(f.log, ">")
+	if !strings.Contains(joined, "CONFIGURE") {
+		t.Fatalf("reconfigure must apply CONFIGURE, got %v", f.log)
+	}
+	for _, banned := range []string{"FETCH", "EXTRACT", "SWITCH", "STOP"} {
+		if strings.Contains(joined, banned) {
+			t.Fatalf("reconfigure must not %s, got %v", banned, f.log)
+		}
+	}
+}
+
+func TestReconfigureAbsentIsNoop(t *testing.T) { // IDP-03: nothing deployed => nil status, no error
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	st, err := eng.Reconfigure(context.Background(), winSvcSpec(t, url, sum))
+	if err != nil {
+		t.Fatalf("reconfigure on absent deployment must be a no-op, got %v", err)
+	}
+	if st != nil {
+		t.Fatalf("reconfigure on absent deployment must return nil status, got %+v", st)
+	}
+}
+
 func TestHealthFailureRollsBack(t *testing.T) { // RBK-01
 	p1 := []byte("v1")
 	url1, sum1, done1 := testArtifactServer(t, p1)
@@ -843,9 +890,9 @@ type recLinux struct {
 }
 
 func (r *recLinux) Connect(ctx context.Context) error { return nil }
-func (r *recLinux) Close() error                       { return nil }
-func (r *recLinux) OS() spec.OSKind                    { return spec.OSLinux }
-func (r *recLinux) Host() string                       { return r.host }
+func (r *recLinux) Close() error                      { return nil }
+func (r *recLinux) OS() spec.OSKind                   { return spec.OSLinux }
+func (r *recLinux) Host() string                      { return r.host }
 func (r *recLinux) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	r.scripts = append(r.scripts, c.Script)
 	return transport.Result{ExitCode: 0}, nil // empty stdout => empty prune listing
@@ -858,7 +905,7 @@ var _ transport.Transport = (*recLinux)(nil)
 // TestLinuxOrchestrationQuotesHostileRoot drives the REAL staging/prune
 // orchestration (wipeStaging + pruneReleases, not just the script generators)
 // with an install_root that embeds a single quote and a shell metacharacter
-// payload, and asserts every emitted script POSIX-escapes it via shq (`'\''`)
+// payload, and asserts every emitted script POSIX-escapes it via shq (`'\”`)
 // so the payload can never break out of its quotes (evaluator feedback item 4).
 func TestLinuxOrchestrationQuotesHostileRoot(t *testing.T) {
 	url, sum, done := testArtifactServer(t, []byte("x"))
@@ -961,7 +1008,7 @@ func TestIncompleteReleaseCleanupFailureSurfaced(t *testing.T) {
 	defer done()
 	f := newFakeHost("lab-01")
 	f.fail["postinstall"] = true // pre-switch failure on a freshly-created release
-	f.fail["rmRelease"] = true    // ...and the release cleanup removal fails
+	f.fail["rmRelease"] = true   // ...and the release cleanup removal fails
 	eng := engineWith(f)
 
 	_, err := eng.Deploy(context.Background(), winSvcSpecPostInstall(t, url, sum))
@@ -1092,4 +1139,3 @@ func TestRunStagingFailureRemovesRelease(t *testing.T) {
 		t.Fatalf("pre-execution staging failure must remove the partial release; log=%v", f.log)
 	}
 }
-
