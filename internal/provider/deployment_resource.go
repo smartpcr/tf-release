@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -99,11 +100,17 @@ func deploymentSchema(version int64) schema.Schema {
 // attribute was populated, converting an unverifiable spec_file deployment into a
 // VERIFIED snapshot BEFORE any plan/refresh acts on it. This is the migration path
 // that breaks the legacy deadlock (ModifyPlan forcing replacement ↔ Delete refusing
-// snapshot-less state) WITHOUT any unsafe deletion: the snapshot is reconstructed from
-// the spec_file/spec while it still reflects the deployed identity — i.e. right after a
-// provider upgrade, before the operator edits the config. If the spec can't be resolved
-// (e.g. spec_file removed) the snapshot is left empty and the downstream Read/Delete
-// guards keep the state fail-safe.
+// snapshot-less state) WITHOUT any unsafe deletion.
+//
+// The backfill is TRUSTWORTHY ONLY when the current spec_file still resolves to the
+// SAME spec_hash that was persisted at the last apply — i.e. the file has NOT been
+// edited since the deployment. If the operator upgraded the provider AND edited the
+// spec in the same step, the file now describes the DESIRED (not deployed) config, so
+// snapshotting it would fabricate a false prior — suppressing immutable replacement,
+// reconfiguration, changed post_install, and truthful rollback. In that case (or when
+// no baseline spec_hash exists, or the spec cannot be resolved) we DECLINE to backfill,
+// leave resolved_spec empty, warn, and let the downstream Read/Delete guards +
+// legacyReplaceRequired safeguard keep the state fail-safe.
 func (r *DeploymentResource) UpgradeState(_ context.Context) map[int64]resource.StateUpgrader {
 	priorSchema := deploymentSchema(0)
 	return map[int64]resource.StateUpgrader{
@@ -116,23 +123,43 @@ func (r *DeploymentResource) UpgradeState(_ context.Context) map[int64]resource.
 					return
 				}
 				if state.ResolvedSpec.IsNull() || state.ResolvedSpec.ValueString() == "" {
-					if d, hash, err := r.resolveSpec(ctx, &state); err == nil {
-						state.ResolvedSpec = marshalResolvedSpec(d)
-						if state.SpecHash.IsNull() || state.SpecHash.ValueString() == "" {
-							state.SpecHash = types.StringValue(hash)
-						}
-					} else {
-						resp.Diagnostics.AddWarning("labdeploy state not fully migrated",
-							"could not reconstruct a resolved_spec snapshot for this legacy resource "+
-								"(the spec could not be resolved: "+err.Error()+"). Lifecycle operations "+
-								"remain fail-safe; run terraform apply once the spec is resolvable to persist "+
-								"the snapshot.")
-					}
+					r.backfillResolvedSpec(ctx, &state, &resp.Diagnostics)
 				}
 				resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 			},
 		},
 	}
+}
+
+// backfillResolvedSpec reconstructs the resolved_spec snapshot for legacy state, but
+// ONLY when the current spec resolves to the persisted spec_hash (proving the source
+// is unchanged since deployment, so the snapshot faithfully captures the DEPLOYED
+// identity). A missing baseline hash, a hash mismatch (source edited), or a resolve
+// error all cause it to DECLINE and warn — never fabricate a desired-config prior.
+func (r *DeploymentResource) backfillResolvedSpec(ctx context.Context, state *deploymentModel, diags *diag.Diagnostics) {
+	d, hash, err := r.resolveSpec(ctx, state)
+	if err != nil {
+		diags.AddWarning("labdeploy state not fully migrated",
+			"could not reconstruct a resolved_spec snapshot for this legacy resource "+
+				"(the spec could not be resolved: "+err.Error()+"). Lifecycle operations "+
+				"remain fail-safe; run terraform apply once the spec is resolvable to persist "+
+				"the snapshot.")
+		return
+	}
+	persisted := state.SpecHash.ValueString()
+	if persisted == "" || persisted != hash {
+		// The source no longer matches what was deployed (edited alongside the provider
+		// upgrade) or there is no baseline to compare. Snapshotting now would record the
+		// DESIRED config as the deployed prior — a false, high-impact fabrication. Decline.
+		diags.AddWarning("labdeploy state not fully migrated",
+			"the current spec no longer matches the spec_hash recorded at the last apply "+
+				"(or no baseline spec_hash exists), so a resolved_spec snapshot cannot be "+
+				"trusted to reflect the DEPLOYED configuration. Leaving the snapshot unset so "+
+				"immutable-field replacement, reconfiguration, and rollback stay truthful; "+
+				"re-apply against the currently deployed spec to persist a faithful snapshot.")
+		return
+	}
+	state.ResolvedSpec = marshalResolvedSpec(d)
 }
 
 func (r *DeploymentResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {

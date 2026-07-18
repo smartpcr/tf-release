@@ -284,27 +284,16 @@ func TestDeleteRejectsUnverifiedLegacyState(t *testing.T) {
 	}
 }
 
-// TestUpgradeStateBackfillsResolvedSpec covers item 2 (iter-26 review): the v0→v1 state
-// upgrader must reconstruct a resolved_spec snapshot for legacy spec_file state BEFORE
-// any plan/refresh runs, converting an unverifiable identity into a verified one without
-// any unsafe deletion — this is what breaks the legacy migration deadlock.
-func TestUpgradeStateBackfillsResolvedSpec(t *testing.T) {
-	t.Setenv("LABDEPLOY_PASSWORD", "pw")
-	dir := t.TempDir()
-	path := filepath.Join(dir, "spec.yaml")
-	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-01")), 0o600); err != nil {
-		t.Fatalf("write spec: %v", err)
-	}
-	r := &DeploymentResource{}
+// runUpgrade drives the v0→v1 state upgrader against a legacy model and returns the
+// upgraded model plus the response diagnostics.
+func runUpgrade(t *testing.T, r *DeploymentResource, legacy *deploymentModel) (deploymentModel, *resource.UpgradeStateResponse) {
+	t.Helper()
 	up := r.UpgradeState(context.Background())
 	u, ok := up[0]
 	if !ok || u.PriorSchema == nil {
 		t.Fatal("expected a v0 state upgrader with a PriorSchema")
 	}
-	// Legacy v0 state: spec_file set, NO resolved_spec snapshot.
 	prior := tfsdk.State{Schema: *u.PriorSchema}
-	legacy := &deploymentModel{SpecFile: types.StringValue(path), ResolvedSpec: types.StringNull(),
-		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
 	if diags := prior.Set(context.Background(), legacy); diags.HasError() {
 		t.Fatalf("build prior state: %v", diags)
 	}
@@ -319,8 +308,33 @@ func TestUpgradeStateBackfillsResolvedSpec(t *testing.T) {
 	if diags := resp.State.Get(context.Background(), &upgraded); diags.HasError() {
 		t.Fatalf("read upgraded state: %v", diags)
 	}
+	return upgraded, resp
+}
+
+// TestUpgradeStateBackfillsResolvedSpec covers item 1 (iter-28 review): the v0→v1 state
+// upgrader reconstructs a resolved_spec snapshot for legacy spec_file state ONLY when the
+// current file still resolves to the persisted spec_hash (the source is unchanged since
+// deployment), converting an unverifiable identity into a verified one without any unsafe
+// deletion — this is what breaks the legacy migration deadlock.
+func TestUpgradeStateBackfillsResolvedSpec(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-01")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	// The persisted spec_hash matches the unchanged file → faithful backfill.
+	_, hash, err := r.resolveSpec(context.Background(), &deploymentModel{SpecFile: types.StringValue(path)})
+	if err != nil {
+		t.Fatalf("resolve for baseline hash: %v", err)
+	}
+	legacy := &deploymentModel{SpecFile: types.StringValue(path), ResolvedSpec: types.StringNull(),
+		SpecHash: types.StringValue(hash),
+		Hosts:    types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	upgraded, _ := runUpgrade(t, r, legacy)
 	if upgraded.ResolvedSpec.IsNull() || upgraded.ResolvedSpec.ValueString() == "" {
-		t.Fatal("upgrader must backfill resolved_spec for legacy spec_file state")
+		t.Fatal("upgrader must backfill resolved_spec when the file matches the persisted spec_hash")
 	}
 	// The backfilled snapshot must now make stateSpec VERIFIED so Read/Delete no longer
 	// treat this state as unverifiable — the deadlock is broken.
@@ -333,33 +347,60 @@ func TestUpgradeStateBackfillsResolvedSpec(t *testing.T) {
 	}
 }
 
+// TestUpgradeStateDeclinesOnHashMismatch covers item 2 (iter-28 review): when the current
+// spec_file no longer resolves to the persisted spec_hash — i.e. the operator upgraded the
+// provider AND edited the spec — the upgrader must NOT snapshot the edited (desired) file
+// as the deployed prior. It leaves resolved_spec unset, warns, and keeps the legacy
+// replacement safeguard (legacyReplaceRequired) active.
+func TestUpgradeStateDeclinesOnHashMismatch(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.yaml")
+	// Current on-disk file is the EDITED (desired) config at host lab-99.
+	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("2.0.0", "lab-99")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	// Persisted spec_hash is from the ORIGINAL deployed config (host lab-01, v1) — differs
+	// from the current file's hash.
+	stalePersisted := fmt.Sprintf("sha256:%064d", 1)
+	legacy := &deploymentModel{SpecFile: types.StringValue(path), ResolvedSpec: types.StringNull(),
+		SpecHash: types.StringValue(stalePersisted),
+		Hosts:    types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	upgraded, resp := runUpgrade(t, r, legacy)
+	if !upgraded.ResolvedSpec.IsNull() && upgraded.ResolvedSpec.ValueString() != "" {
+		t.Fatal("hash mismatch must NOT backfill resolved_spec (would fabricate a desired-config prior)")
+	}
+	if resp.Diagnostics.WarningsCount() == 0 {
+		t.Fatal("hash mismatch must warn that the snapshot was declined")
+	}
+	// Safeguard still active: no snapshot ⇒ priorFromState nil ⇒ legacyReplaceRequired fires
+	// on real drift, and stateSpec reports UNVERIFIED so Read/Delete stay fail-safe.
+	_, _, verified, err := r.stateSpec(context.Background(), &upgraded)
+	if err != nil {
+		t.Fatalf("stateSpec after declined upgrade: %v", err)
+	}
+	if verified {
+		t.Fatal("state must remain UNVERIFIED when the snapshot was declined")
+	}
+	if !legacyReplaceRequired(r.priorFromState(context.Background(), &upgraded), "sha256:different", &upgraded) {
+		t.Fatal("legacy replacement safeguard must remain active after a declined backfill")
+	}
+}
+
 // TestUpgradeStateUnresolvableStaysFailSafe covers the edge case where the legacy
 // spec_file can no longer be resolved (e.g. removed): the upgrader must NOT error the
 // whole refresh; it leaves resolved_spec empty (still fail-safe) and emits a warning.
 func TestUpgradeStateUnresolvableStaysFailSafe(t *testing.T) {
 	t.Setenv("LABDEPLOY_PASSWORD", "pw")
 	r := &DeploymentResource{}
-	up := r.UpgradeState(context.Background())
-	u := up[0]
-	prior := tfsdk.State{Schema: *u.PriorSchema}
 	legacy := &deploymentModel{SpecFile: types.StringValue("/nonexistent/spec.yaml"),
 		ResolvedSpec: types.StringNull(), Hosts: types.ListNull(types.StringType),
 		Variables: types.MapNull(types.StringType)}
-	if diags := prior.Set(context.Background(), legacy); diags.HasError() {
-		t.Fatalf("build prior state: %v", diags)
-	}
-	sr := resource.SchemaResponse{}
-	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)
-	resp := &resource.UpgradeStateResponse{State: tfsdk.State{Schema: sr.Schema}}
-	u.StateUpgrader(context.Background(), resource.UpgradeStateRequest{State: &prior}, resp)
-	if resp.Diagnostics.HasError() {
-		t.Fatalf("upgrade must not hard-error on unresolvable spec: %v", resp.Diagnostics)
-	}
+	upgraded, resp := runUpgrade(t, r, legacy)
 	if resp.Diagnostics.WarningsCount() == 0 {
 		t.Fatal("upgrade must warn when it cannot reconstruct the snapshot")
 	}
-	var upgraded deploymentModel
-	resp.State.Get(context.Background(), &upgraded)
 	if !upgraded.ResolvedSpec.IsNull() && upgraded.ResolvedSpec.ValueString() != "" {
 		t.Fatal("unresolvable legacy state must keep resolved_spec empty (fail-safe)")
 	}
