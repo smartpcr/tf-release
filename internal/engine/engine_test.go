@@ -952,6 +952,71 @@ func TestLockContention(t *testing.T) { // LCK-01
 	}
 }
 
+// TestWarnInsecureTransportExactlyOnce covers DESIGN §11: the lab-insecure transport
+// settings — WinRM insecure_skip_verify=true and an unpinned SSH host_key ("") — each
+// emit EXACTLY ONE WARN naming the setting, deduped across repeated preflight calls (the
+// cluster path preflights every host), while a secure spec emits nothing.
+func TestWarnInsecureTransportExactlyOnce(t *testing.T) {
+	insecure := true
+	winInsecure := &spec.Deployment{Target: spec.Target{
+		Transport: spec.TransportWinRM, WinRM: spec.WinRMOpts{InsecureSkipVerify: &insecure}}}
+	e := New()
+	// Simulate a 3-host cluster preflighting each node: the notice must appear once.
+	e.warnInsecureTransport(winInsecure)
+	e.warnInsecureTransport(winInsecure)
+	e.warnInsecureTransport(winInsecure)
+	if got := countContaining(e.Warnings, "insecure_skip_verify"); got != 1 {
+		t.Fatalf("winrm insecure_skip_verify=true must warn exactly once, got %d in %v", got, e.Warnings)
+	}
+
+	sshUnpinned := &spec.Deployment{Target: spec.Target{
+		Transport: spec.TransportSSH, SSH: spec.SSHOpts{HostKey: ""}}}
+	e2 := New()
+	e2.warnInsecureTransport(sshUnpinned)
+	e2.warnInsecureTransport(sshUnpinned)
+	if got := countContaining(e2.Warnings, "host_key not pinned"); got != 1 {
+		t.Fatalf("unpinned ssh host_key must warn exactly once, got %d in %v", got, e2.Warnings)
+	}
+
+	// A secure spec (pinned host key) emits no insecure-transport notice.
+	sshPinned := &spec.Deployment{Target: spec.Target{
+		Transport: spec.TransportSSH, SSH: spec.SSHOpts{HostKey: "AAAA"}}}
+	e3 := New()
+	e3.warnInsecureTransport(sshPinned)
+	if len(e3.Warnings) != 0 {
+		t.Fatalf("pinned host key must emit no warning, got %v", e3.Warnings)
+	}
+}
+
+// TestDeployWinRMInsecureWarnsOnce proves the DESIGN §11 WinRM notice flows through a real
+// apply (preflight) exactly once per apply.
+func TestDeployWinRMInsecureWarnsOnce(t *testing.T) {
+	payload := []byte("v1")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	insecure := true
+	d.Target.WinRM.InsecureSkipVerify = &insecure
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if got := countContaining(eng.Warnings, "insecure_skip_verify"); got != 1 {
+		t.Fatalf("apply must emit exactly one insecure_skip_verify warning, got %d in %v", got, eng.Warnings)
+	}
+}
+
+func countContaining(ss []string, sub string) int {
+	n := 0
+	for _, s := range ss {
+		if strings.Contains(s, sub) {
+			n++
+		}
+	}
+	return n
+}
+
 func TestDestroyPurge(t *testing.T) { // DST-01
 	payload := []byte("v1")
 	url, sum, done := testArtifactServer(t, payload)

@@ -1328,3 +1328,95 @@ func (f *fakeErrEngine) ReadStatus(_ context.Context, _ *spec.Deployment) (*engi
 }
 func (f *fakeErrEngine) Destroy(_ context.Context, _ *spec.Deployment, _ string) error { return f.err }
 func (f *fakeErrEngine) Warns() []string                                               { return nil }
+
+// readReqForModel builds a real resource.ReadRequest whose State carries the given
+// (verified inline-spec) model, using the resource's own schema, so Read can be driven
+// end-to-end and the resulting State inspected (e.g. RemoveResource nulls State.Raw).
+func readReqForModel(t *testing.T, r *DeploymentResource, m *deploymentModel) (resource.ReadRequest, *resource.ReadResponse) {
+	t.Helper()
+	sr := resource.SchemaResponse{}
+	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)
+	st := tfsdk.State{Schema: sr.Schema}
+	m.Timeouts = nullTimeouts()
+	if diags := st.Set(context.Background(), m); diags.HasError() {
+		t.Fatalf("build state: %v", diags)
+	}
+	return resource.ReadRequest{State: st}, &resource.ReadResponse{State: st}
+}
+
+// verifiedReadModel returns a Read-ready model whose inline `spec` makes stateSpec
+// VERIFIED (faithful verbatim), so Read is allowed to treat a missing manifest as a
+// genuine absence rather than the unverifiable-legacy migration guard.
+func verifiedReadModel(version string) *deploymentModel {
+	return &deploymentModel{
+		Spec: types.StringValue(wsSpecYAML(version)), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		DestroyMode: types.StringNull(),
+		Hosts:       types.ListNull(types.StringType), Variables: types.MapNull(types.StringType),
+	}
+}
+
+// TestReadAbsentManifestRemovesResource covers Stage 5.3 scenario 1: a verified state
+// whose target manifest is absent (ReadStatus returns nil,nil) must be removed from
+// state so the next plan is a fresh create. RemoveResource nulls State.Raw.
+func TestReadAbsentManifestRemovesResource(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeDeployEngine{status: nil} // nil status ⇒ absent manifest
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	req, resp := readReqForModel(t, r, verifiedReadModel("1.0.0"))
+	r.Read(context.Background(), req, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("absent manifest Read must not error, got %v", resp.Diagnostics.Errors())
+	}
+	if !resp.State.Raw.IsNull() {
+		t.Fatal("absent manifest must RemoveResource (State.Raw null) so next plan = create")
+	}
+}
+
+// TestReadFailedMarkerForcesPlanChange covers Stage 5.3 scenario 2: a manifest whose
+// last_operation.result==failed reconciles to a "<version>!failed" deployed_version, so
+// the refreshed state differs from any clean desired version and the next plan is
+// non-empty. The engine performs the reconciliation; Read must persist the marker.
+func TestReadFailedMarkerForcesPlanChange(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeDeployEngine{status: &engine.Status{
+		DeployedVersion: "1.0.0!failed", ServiceStatus: "stopped", Hosts: []string{"lab-01"},
+	}}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	req, resp := readReqForModel(t, r, verifiedReadModel("1.0.0"))
+	r.Read(context.Background(), req, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("failed-marker Read must not error, got %v", resp.Diagnostics.Errors())
+	}
+	if resp.State.Raw.IsNull() {
+		t.Fatal("failed-marker Read must retain state, not remove the resource")
+	}
+	var got deploymentModel
+	if d := resp.State.Get(context.Background(), &got); d.HasError() {
+		t.Fatalf("read refreshed state: %v", d)
+	}
+	if got.DeployedVersion.ValueString() != "1.0.0!failed" {
+		t.Fatalf("deployed_version must carry the !failed marker, got %q", got.DeployedVersion.ValueString())
+	}
+}
+
+// TestReadUnreachableTargetIsLoudError covers Stage 5.3 scenario 3 / DESIGN §10.4: a
+// transport error from ReadStatus (e.g. failed dial) must surface a Read ERROR diagnostic
+// — NEVER a silent warning — and MUST leave the prior state intact (the resource is not
+// removed), because an unreachable target is not a deleted resource.
+func TestReadUnreachableTargetIsLoudError(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeErrEngine{err: fmt.Errorf("[ERR_CONNECT] dial tcp lab-01:5986: connect: no route to host")}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	req, resp := readReqForModel(t, r, verifiedReadModel("1.0.0"))
+	r.Read(context.Background(), req, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("unreachable target must produce a Read ERROR diagnostic, not a warning")
+	}
+	if resp.Diagnostics.WarningsCount() != 0 {
+		t.Fatalf("unreachable target must not be downgraded to a WARN, got %d warnings", resp.Diagnostics.WarningsCount())
+	}
+	if resp.State.Raw.IsNull() {
+		t.Fatal("unreachable target must LEAVE prior state intact — the resource must NOT be removed")
+	}
+}
