@@ -250,6 +250,13 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("POSTINSTALL")
 		return ok(""), nil
 
+	case strings.Contains(s, "LDVERIFY"): // console_app verify_command
+		if f.fail["verify"] {
+			return transport.Result{ExitCode: 7, Stderr: "verify failed"}, nil
+		}
+		f.mark("VERIFY")
+		return ok(""), nil
+
 	case strings.Contains(s, "not_installed"): // Status probe
 		if f.fail["status"] {
 			return transport.Result{}, fmt.Errorf("simulated status probe transport failure")

@@ -2,6 +2,8 @@ package pattern
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,40 +13,77 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// console_app (DESIGN §9.3): files-only. Verify happens via verify_command.
+// console_app (DESIGN §9.3): files-only, NO service registration. After the
+// engine switches `current`, the pattern runs post_install then verify_command
+// IN the current release dir; Start/Stop are no-ops; Status is `n/a` when the
+// on-host `.labdeploy-release.json` version matches the manifest, else `drift`.
 // ---------------------------------------------------------------------------
+
+// consoleReleaseMarker is the per-release marker the engine writes; console_app
+// Status reads it under `current` to detect version drift (DESIGN §9.3).
+const consoleReleaseMarker = ".labdeploy-release.json"
 
 type ConsoleApp struct{}
 
 func (c *ConsoleApp) Preflight(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
+	// console_app needs no target tooling of its own; the engine's global
+	// preflight gates (PS/space) are sufficient. This satisfies the
+	// pattern-specific preflight seam the engine invokes after connect.
+	return nil
+}
+
+// shq single-quotes s for POSIX sh, escaping any embedded single quote so an
+// UNVALIDATED install_root-derived path cannot break out of the quoted argument
+// (`install_root` is not constrained against quotes in spec/validate.go). This
+// is the linux analogue of psq for PowerShell; it mirrors engine/scripts.go's
+// shq so pattern scripts quote paths exactly as the engine does.
+func shq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// consoleScript renders the script that runs `cmd` in the CURRENT release dir
+// with the caller's env, propagating the command's exit code (DESIGN §9.3).
+// Deterministic output so Configure scripts can be golden-tested.
+func consoleScript(os spec.OSKind, current, cmd string) string {
+	if os == spec.OSWindows {
+		return fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(current), cmd)
+	}
+	return fmt.Sprintf("cd %s && %s", shq(current), cmd)
+}
+
+// runInCurrent executes `cmd` in the current release dir, mapping a non-zero
+// exit to `code` (post_install ⇒ ERR_SERVICE_INSTALL, verify ⇒ ERR_HEALTH_CHECK).
+func (c *ConsoleApp) runInCurrent(ctx context.Context, t transport.Transport, rc ReleaseCtx, label, code, cmd string) error {
+	script := consoleScript(t.OS(), rc.P.Current, cmd)
+	var r transport.Result
+	var err error
+	if t.OS() == spec.OSWindows {
+		r, err = runPS(ctx, t, t.Host(), "CONFIGURE", script, rc.Env, 300)
+	} else {
+		r, err = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Env: rc.Env, TimeoutSec: 300, Script: script})
+		if err != nil {
+			err = stepErr("ERR_CONNECT", t.Host(), "CONFIGURE", err)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return stepErr(code, t.Host(), "CONFIGURE",
+			fmt.Errorf("%s exit=%d: %s", label, r.ExitCode, truncOut(r)))
+	}
 	return nil
 }
 
 func (c *ConsoleApp) Configure(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
-	vc := rc.Spec.Pattern.VerifyCommand
-	if vc == "" {
-		return nil
-	}
-	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(rc.P.Current), vc)
-		r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, rc.Env, 300)
-		if err != nil {
+	// DESIGN §9.3: after SWITCH, run post_install then verify_command in <cur>.
+	if pi := rc.Spec.Pattern.PostInstall; pi != "" {
+		if err := c.runInCurrent(ctx, t, rc, "post_install", "ERR_SERVICE_INSTALL", pi); err != nil {
 			return err
 		}
-		if r.ExitCode != 0 {
-			return stepErr("ERR_HEALTH_CHECK", t.Host(), "CONFIGURE",
-				fmt.Errorf("verify_command exit=%d: %s", r.ExitCode, truncOut(r)))
+	}
+	if vc := rc.Spec.Pattern.VerifyCommand; vc != "" {
+		if err := c.runInCurrent(ctx, t, rc, "verify_command", "ERR_HEALTH_CHECK", vc); err != nil {
+			return err
 		}
-		return nil
-	}
-	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Env: rc.Env, TimeoutSec: 300,
-		Script: fmt.Sprintf(`cd '%s' && %s`, rc.P.Current, vc)})
-	if err != nil {
-		return stepErr("ERR_CONNECT", t.Host(), "CONFIGURE", err)
-	}
-	if r.ExitCode != 0 {
-		return stepErr("ERR_HEALTH_CHECK", t.Host(), "CONFIGURE",
-			fmt.Errorf("verify_command exit=%d: %s", r.ExitCode, truncOut(r)))
 	}
 	return nil
 }
@@ -56,12 +95,74 @@ func (c *ConsoleApp) Start(ctx context.Context, t transport.Transport, rc Releas
 	return nil
 }
 
+// Status: `n/a` when the on-host release marker under `current` reports the
+// manifest version, else `drift` (a missing/malformed/mismatched marker all
+// mean the deployed tree no longer matches the manifest) — DESIGN §9.3/§5.2.
 func (c *ConsoleApp) Status(ctx context.Context, t transport.Transport, rc ReleaseCtx) (string, error) {
-	return "n/a", nil
+	sep := `\`
+	if t.OS() == spec.OSLinux {
+		sep = "/"
+	}
+	marker := rc.P.Current + sep + consoleReleaseMarker
+	raw, ok, err := readMarker(ctx, t, marker)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "drift", nil
+	}
+	var m struct {
+		Version string `json:"version"`
+	}
+	if json.Unmarshal([]byte(raw), &m) != nil || m.Version == "" {
+		return "drift", nil
+	}
+	if m.Version == rc.Version {
+		return "n/a", nil
+	}
+	return "drift", nil
+}
+
+// readMarker reads a small on-host file as text, returning ok=false when it does
+// not exist (exit 3). Mirrors the engine marker read (base64 over the channel so
+// arbitrary bytes survive) but lives here so the pattern has no engine import.
+func readMarker(ctx context.Context, t transport.Transport, path string) (string, bool, error) {
+	var script string
+	shell := transport.ShellPowerShell
+	if t.OS() == spec.OSWindows {
+		script = fmt.Sprintf(`if(Test-Path %s){[Convert]::ToBase64String([IO.File]::ReadAllBytes(%s))}else{exit 3}`,
+			psq(path), psq(path))
+	} else {
+		shell = transport.ShellSh
+		script = fmt.Sprintf(`[ -f %s ] || exit 3; base64 < %s`, shq(path), shq(path))
+	}
+	r, err := t.Exec(ctx, transport.Cmd{Shell: shell, Script: script, TimeoutSec: 60})
+	if err != nil {
+		return "", false, stepErr("ERR_CONNECT", t.Host(), "STATUS", err)
+	}
+	if r.ExitCode == 3 {
+		return "", false, nil
+	}
+	if r.ExitCode != 0 {
+		return "", false, stepErr("ERR_CONNECT", t.Host(), "STATUS",
+			fmt.Errorf("read %s exit=%d: %s", path, r.ExitCode, truncOut(r)))
+	}
+	decoded, derr := base64.StdEncoding.DecodeString(strings.Map(stripWS, r.Stdout))
+	if derr != nil {
+		return "", false, stepErr("ERR_CONNECT", t.Host(), "STATUS", derr)
+	}
+	return string(decoded), true, nil
+}
+
+func stripWS(r rune) rune {
+	if r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+		return -1
+	}
+	return r
 }
 
 func (c *ConsoleApp) Uninstall(ctx context.Context, t transport.Transport, rc ReleaseCtx, purge bool) error {
-	return nil // engine removes files for purge
+	return nil // no service registration; engine removes files for purge
 }
 
 // ---------------------------------------------------------------------------
