@@ -388,6 +388,46 @@ func TestUpgradeStateDeclinesOnHashMismatch(t *testing.T) {
 	}
 }
 
+// TestUpgradeStateDeclinesWhenProviderDefaultsContribute covers item 1/2 (iter-30 review):
+// spec_hash is computed over the RAW spec, BEFORE provider default_target is merged. If the
+// raw spec_file is unchanged (so spec_hash still matches) but the provider's default_target
+// now contributes a target field (here: port), the resolved_spec would capture merged fields
+// that may never have been deployed. The upgrader must DECLINE the backfill, leave
+// resolved_spec unset, warn, and keep the state UNVERIFIED so lifecycle stays truthful.
+func TestUpgradeStateDeclinesWhenProviderDefaultsContribute(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.yaml")
+	// Unchanged raw spec_file — leaves target.port unset so a provider default can fill it.
+	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-01")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	// Provider now supplies a default_target that contributes port 5986 during the merge.
+	r := &DeploymentResource{pd: &providerData{DefaultTarget: &spec.Target{Port: 5986}}}
+	// spec_hash is pre-merge, so it matches the unchanged raw file even with the new default.
+	_, hash, err := r.resolveSpec(context.Background(), &deploymentModel{SpecFile: types.StringValue(path)})
+	if err != nil {
+		t.Fatalf("resolve for baseline hash: %v", err)
+	}
+	legacy := &deploymentModel{SpecFile: types.StringValue(path), ResolvedSpec: types.StringNull(),
+		SpecHash: types.StringValue(hash),
+		Hosts:    types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	upgraded, resp := runUpgrade(t, r, legacy)
+	if !upgraded.ResolvedSpec.IsNull() && upgraded.ResolvedSpec.ValueString() != "" {
+		t.Fatal("changed provider default_target must NOT backfill resolved_spec (fields may never have been deployed)")
+	}
+	if resp.Diagnostics.WarningsCount() == 0 {
+		t.Fatal("declined default_target backfill must emit a migration warning")
+	}
+	_, _, verified, err := r.stateSpec(context.Background(), &upgraded)
+	if err != nil {
+		t.Fatalf("stateSpec after declined upgrade: %v", err)
+	}
+	if verified {
+		t.Fatal("state must remain UNVERIFIED when provider defaults contributed unverifiable fields")
+	}
+}
+
 // TestUpgradeStateUnresolvableStaysFailSafe covers the edge case where the legacy
 // spec_file can no longer be resolved (e.g. removed): the upgrader must NOT error the
 // whole refresh; it leaves resolved_spec empty (still fail-safe) and emits a warning.

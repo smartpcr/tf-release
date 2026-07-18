@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -134,10 +135,11 @@ func (r *DeploymentResource) UpgradeState(_ context.Context) map[int64]resource.
 // backfillResolvedSpec reconstructs the resolved_spec snapshot for legacy state, but
 // ONLY when the current spec resolves to the persisted spec_hash (proving the source
 // is unchanged since deployment, so the snapshot faithfully captures the DEPLOYED
-// identity). A missing baseline hash, a hash mismatch (source edited), or a resolve
-// error all cause it to DECLINE and warn — never fabricate a desired-config prior.
+// identity). A missing baseline hash, a hash mismatch (source edited), a resolve
+// error, or a provider default_target that contributes merged fields the pre-merge
+// hash never covered all cause it to DECLINE and warn — never fabricate a prior.
 func (r *DeploymentResource) backfillResolvedSpec(ctx context.Context, state *deploymentModel, diags *diag.Diagnostics) {
-	d, hash, err := r.resolveSpec(ctx, state)
+	d, hash, defaultsContributed, err := r.resolveSpecDetail(ctx, state)
 	if err != nil {
 		diags.AddWarning("labdeploy state not fully migrated",
 			"could not reconstruct a resolved_spec snapshot for this legacy resource "+
@@ -159,6 +161,22 @@ func (r *DeploymentResource) backfillResolvedSpec(ctx context.Context, state *de
 				"re-apply against the currently deployed spec to persist a faithful snapshot.")
 		return
 	}
+	if defaultsContributed {
+		// spec_hash matches because it is computed over the RAW spec, BEFORE provider
+		// default_target is merged. A default_target that now contributes target fields
+		// (transport/os/port/credentials/winrm) means the resolved_spec identity depends
+		// on provider config the persisted hash never covered — the merged fields may
+		// never have been deployed. Decline so a provider-default change cannot fabricate
+		// the deployed identity during state migration.
+		diags.AddWarning("labdeploy state not fully migrated",
+			"the current spec relies on provider default_target values to fill one or more "+
+				"target fields, but spec_hash is computed before those defaults are merged, "+
+				"so it cannot prove the merged configuration was ever deployed. Leaving the "+
+				"resolved_spec snapshot unset so immutable-field replacement, reconfiguration, "+
+				"and rollback stay truthful; re-apply against the currently deployed spec to "+
+				"persist a faithful snapshot.")
+		return
+	}
 	state.ResolvedSpec = marshalResolvedSpec(d)
 }
 
@@ -171,36 +189,51 @@ func (r *DeploymentResource) Configure(_ context.Context, req resource.Configure
 
 // resolveSpec loads+parses the deployment for a model (DESIGN §6.1).
 func (r *DeploymentResource) resolveSpec(ctx context.Context, m *deploymentModel) (*spec.Deployment, string, error) {
+	d, hash, _, err := r.resolveSpecDetail(ctx, m)
+	return d, hash, err
+}
+
+// resolveSpecDetail is resolveSpec plus a defaultsContributed flag reporting whether
+// the provider's default_target actually filled any target field during the merge.
+// spec_hash is computed over the RAW (pre-merge) spec, so it CANNOT detect a change to
+// provider default_target: an unchanged spec_file hashes identically even when a new
+// default now contributes never-deployed fields to the resolved spec. The flag lets the
+// state-migration backfill refuse to snapshot a resolved_spec whose identity depends on
+// provider config that the persisted hash never covered.
+func (r *DeploymentResource) resolveSpecDetail(ctx context.Context, m *deploymentModel) (*spec.Deployment, string, bool, error) {
 	hasSpec := !m.Spec.IsNull() && m.Spec.ValueString() != ""
 	hasFile := !m.SpecFile.IsNull() && m.SpecFile.ValueString() != ""
 	if hasSpec == hasFile {
-		return nil, "", fmt.Errorf("[ERR_SPEC_INVALID] exactly one of spec/spec_file must be set")
+		return nil, "", false, fmt.Errorf("[ERR_SPEC_INVALID] exactly one of spec/spec_file must be set")
 	}
 	raw := m.Spec.ValueString()
 	if hasFile {
 		b, err := os.ReadFile(m.SpecFile.ValueString())
 		if err != nil {
-			return nil, "", fmt.Errorf("[ERR_SPEC_INVALID] spec_file: %w", err)
+			return nil, "", false, fmt.Errorf("[ERR_SPEC_INVALID] spec_file: %w", err)
 		}
 		raw = string(b)
 	}
 	vars := map[string]string{}
 	if !m.Variables.IsNull() {
 		if diag := m.Variables.ElementsAs(ctx, &vars, false); diag.HasError() {
-			return nil, "", fmt.Errorf("[ERR_SPEC_INVALID] variables: %v", diag.Errors())
+			return nil, "", false, fmt.Errorf("[ERR_SPEC_INVALID] variables: %v", diag.Errors())
 		}
 	}
 	d, hash, err := spec.ParseDeploymentLenient(raw, vars, m.VersionOverride.ValueString())
 	if err != nil {
-		return nil, "", err // already [ERR_SPEC_INVALID]-coded by the spec package
+		return nil, "", false, err // already [ERR_SPEC_INVALID]-coded by the spec package
 	}
+	defaultsContributed := false
 	if r.pd != nil && r.pd.DefaultTarget != nil {
+		before := d.Target
 		spec.MergeTargetDefaults(&d.Target, r.pd.DefaultTarget)
+		defaultsContributed = !reflect.DeepEqual(before, d.Target)
 	}
 	if err := spec.ValidateDeployment(d); err != nil { // validate post-merge (DESIGN §6.2)
-		return nil, "", err // already [ERR_SPEC_INVALID]-coded
+		return nil, "", false, err // already [ERR_SPEC_INVALID]-coded
 	}
-	return d, hash, nil
+	return d, hash, defaultsContributed, nil
 }
 
 // immutableKey captures the spec paths that force replacement (DESIGN §5.2):
