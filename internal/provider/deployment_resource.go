@@ -247,6 +247,44 @@ func immutableKey(d *spec.Deployment) string {
 	}, "|")
 }
 
+// Recovery procedures surfaced in migration/corruption diagnostics. These are
+// EXECUTABLE (not the dead-end `terraform apply -replace`, which the Read/Delete guards
+// intentionally block for unverifiable state): they either make the deployed identity
+// verifiable in place, or remove the untrustworthy state so a clean re-adopt can proceed.
+const (
+	// recoveryUnverifiableDefaults applies when the deployed identity cannot be verified
+	// from state AND provider default_target contributes immutable fields the pre-merge
+	// spec_hash does not cover. Pinning the defaulted fields into the spec makes them
+	// hash-covered, so the next apply persists a faithful resolved_spec snapshot.
+	recoveryUnverifiableDefaults = "the deployed identity cannot be verified from state and " +
+		"the provider default_target contributes one or more target fields (transport/os/port/" +
+		"hosts/credentials/winrm) that spec_hash — computed before defaults are merged — does not " +
+		"cover, so planning an update could deploy to a newly-defaulted target and orphan the " +
+		"original deployment. Recovery: copy the provider default_target values into this spec's " +
+		"target block explicitly (so spec_hash covers them), then run `terraform apply`; the apply " +
+		"persists a verified resolved_spec snapshot matching the deployed identity, after which " +
+		"update and destroy operate on the verified snapshot."
+
+	// recoveryUnverifiableLegacy applies to legacy spec_file state with no snapshot and no
+	// contributing defaults: a plain re-apply persists the snapshot from the unchanged file.
+	recoveryUnverifiableLegacy = "this resource predates resolved_spec and is configured via " +
+		"spec_file, so its deployed identity cannot be verified from state. Recovery: without editing " +
+		"the spec_file, run `terraform apply`; the apply persists a resolved_spec snapshot from the " +
+		"currently-deployed spec, after which refresh, update, and destroy operate on the verified " +
+		"snapshot. (Do NOT use `terraform apply -replace` — the destroy half is blocked for " +
+		"unverifiable state precisely so it cannot orphan the live service.)"
+
+	// recoveryCorruptSnapshot applies when a non-empty resolved_spec cannot be decoded. It
+	// cannot be repaired in place; the state entry must be removed so the resource can be
+	// re-adopted against the live service.
+	recoveryCorruptSnapshot = "the persisted resolved_spec snapshot is corrupt and cannot be " +
+		"decoded, so the deployed identity is unknown; the Read/Delete guards refuse to act on it to " +
+		"avoid querying or destroying the wrong identity. Recovery: remove the resource from state " +
+		"with `terraform state rm <address>` and re-adopt it (re-apply to recreate, or import once an " +
+		"importer exists), or restore a known-good state backup — the corrupt snapshot cannot be " +
+		"repaired in place."
+)
+
 // ModifyPlan computes spec_hash drift and RequiresReplace on immutable paths.
 func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() { // destroy
@@ -257,7 +295,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	newSpec, newHash, err := r.resolveSpec(ctx, &plan)
+	newSpec, newHash, defaultsContributed, err := r.resolveSpecDetail(ctx, &plan)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid spec", err.Error())
 		return
@@ -280,15 +318,29 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	// Compare against the PERSISTED prior spec, not a fresh re-read of spec_file
 	// (which by plan time already holds the NEW contents and would make old == new,
 	// hiding immutable-field changes).
-	oldSpec := r.priorFromState(ctx, &state)
+	oldSpec, perr := r.priorFromState(ctx, &state)
+	if perr != nil {
+		// Corrupt persisted snapshot: fail loudly (consistent with stateSpec) rather than
+		// planning an update against an untrustworthy prior that could target the wrong host.
+		resp.Diagnostics.AddError("Invalid spec in state", perr.Error())
+		return
+	}
 	if oldSpec == nil {
-		// No faithful prior snapshot. Normally the v0→v1 state upgrader (UpgradeState)
-		// has already backfilled resolved_spec for legacy state before planning, so this
-		// branch is only reached when even the upgrader could not reconstruct a snapshot
-		// (e.g. the spec_file was unresolvable at upgrade time). We cannot honestly
-		// Reconfigure without the ACTUAL prior configuration, so when the resolved spec
-		// really changed, force a REPLACEMENT to apply the change via a full, truthful
-		// create/deploy (which also persists resolved_spec). No drift ⇒ nothing to do.
+		// No faithful prior snapshot. When provider default_target contributes fields to the
+		// resolved spec, spec_hash (computed pre-merge) cannot detect a default change, and
+		// because that hash is unchanged we CANNOT hang a replacement off spec_hash. Adopting
+		// the merged spec would silently deploy to the newly-defaulted target and orphan the
+		// original deployment. BLOCK the plan with an executable recovery instead of laundering
+		// the unverifiable merged identity into state.
+		if defaultsContributed {
+			resp.Diagnostics.AddError("labdeploy state migration required", recoveryUnverifiableDefaults)
+			return
+		}
+		// Otherwise the v0→v1 state upgrader normally backfilled resolved_spec already; this
+		// branch is only reached when even the upgrader could not reconstruct a snapshot. We
+		// cannot honestly Reconfigure without the ACTUAL prior configuration, so when the
+		// resolved spec really changed (hash drift), force a REPLACEMENT to apply the change via
+		// a full, truthful create/deploy. No drift ⇒ nothing to do.
 		if legacyReplaceRequired(oldSpec, newHash, &state) {
 			resp.RequiresReplace = append(resp.RequiresReplace, path.Root("spec_hash"))
 		}
@@ -361,7 +413,13 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	prior := r.priorFromState(ctx, &state)
+	prior, perr := r.priorFromState(ctx, &state)
+	if perr != nil {
+		// Corrupt persisted snapshot: surface it (consistent with stateSpec / ModifyPlan)
+		// rather than feeding a fabricated or nil prior into a blind Deploy.
+		resp.Diagnostics.AddError("Invalid spec in state", perr.Error())
+		return
+	}
 	r.apply(ctx, &plan, prior, &resp.Diagnostics, func(m *deploymentModel) {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 	})
@@ -373,25 +431,30 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 // since changed on the runner. This is what lets a same-artifact spec_file
 // configuration change route correctly through Reconfigure (applying CONFIGURE and a
 // changed post_install) while a real artifact upgrade still routes to Deploy, and it
-// gives rollback the ACTUAL prior configuration to restore. Falls back to re-parsing
-// inline spec for state written before resolved_spec existed (still faithful verbatim);
-// returns nil for legacy spec_file state (whose on-disk contents cannot be trusted as
-// the prior) so ModifyPlan can force a truthful replacement rather than fabricate a
-// prior for Reconfigure.
-func (r *DeploymentResource) priorFromState(ctx context.Context, state *deploymentModel) *spec.Deployment {
+// gives rollback the ACTUAL prior configuration to restore. A non-empty resolved_spec
+// that fails to decode is STATE CORRUPTION: it returns an error (consistent with
+// stateSpec) so Update/ModifyPlan fail loudly instead of fabricating a prior. Falls back
+// to re-parsing inline spec for state written before resolved_spec existed (still faithful
+// verbatim); returns (nil, nil) for legacy spec_file state (whose on-disk contents cannot
+// be trusted as the prior) so ModifyPlan can force a truthful replacement.
+func (r *DeploymentResource) priorFromState(ctx context.Context, state *deploymentModel) (*spec.Deployment, error) {
 	if rs := state.ResolvedSpec.ValueString(); rs != "" {
 		var d spec.Deployment
-		if err := json.Unmarshal([]byte(rs), &d); err == nil {
-			return &d
+		if err := json.Unmarshal([]byte(rs), &d); err != nil {
+			// Corrupt snapshot: do NOT fall back to the mutable spec_file (which could target
+			// the wrong identity) and do NOT return a nil "no prior" (which Update would treat
+			// as a blind first deploy). Surface it as state corruption.
+			return nil, fmt.Errorf("[ERR_STATE_CORRUPT] resolved_spec in state is not decodable: %w; %s", err, recoveryCorruptSnapshot)
 		}
+		return &d, nil
 	}
 	// Back-compat: state persisted before resolved_spec existed. Inline spec is
 	// still faithful verbatim.
 	if !state.Spec.IsNull() && state.Spec.ValueString() != "" {
 		if d, _, err := r.resolveSpec(ctx, state); err == nil {
-			return d
+			return d, nil
 		}
-		return nil
+		return nil, nil
 	}
 	// Legacy spec_file state (no resolved_spec): re-reading the file at Update time
 	// yields the CURRENT (possibly already-changed) contents, and only deployed_version
@@ -400,7 +463,7 @@ func (r *DeploymentResource) priorFromState(ctx context.Context, state *deployme
 	// make rollback restore the DESIRED settings, and health-check against the new spec —
 	// a false promise of transactional restoration. So we decline (nil); ModifyPlan
 	// instead forces a truthful replacement when the spec has actually changed.
-	return nil
+	return nil, nil
 }
 
 // stateSpec returns the deployment that Read and Delete must operate on: the ACTUAL
@@ -421,9 +484,7 @@ func (r *DeploymentResource) stateSpec(ctx context.Context, state *deploymentMod
 	if rs := state.ResolvedSpec.ValueString(); rs != "" {
 		var sd spec.Deployment
 		if uerr := json.Unmarshal([]byte(rs), &sd); uerr != nil {
-			return nil, "", false, fmt.Errorf("[ERR_STATE_CORRUPT] resolved_spec in state is not decodable: %w; "+
-				"refusing to fall back to the mutable spec_file (which could target the wrong identity). "+
-				"Taint and re-apply (terraform apply -replace) to repair state", uerr)
+			return nil, "", false, fmt.Errorf("[ERR_STATE_CORRUPT] resolved_spec in state is not decodable: %w; %s", uerr, recoveryCorruptSnapshot)
 		}
 		return &sd, state.SpecHash.ValueString(), true, nil
 	}
@@ -489,11 +550,9 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 			// orphan the still-deployed service. Retain state and demand an explicit
 			// migration instead of silently removing the resource.
 			resp.Diagnostics.AddError("labdeploy state migration required",
-				"this resource predates resolved_spec and is configured via spec_file, so its "+
-					"deployed identity cannot be verified from state. A missing manifest here may be "+
-					"the result of a spec_file edit pointing at a different target rather than a real "+
-					"deletion. Re-apply (terraform apply, or apply -replace to redeploy) to persist a "+
-					"resolved_spec snapshot before relying on refresh or destroy.")
+				"a missing manifest here may be the result of a spec_file edit pointing at a "+
+					"different target rather than a real deletion, so removing state would orphan the "+
+					"still-deployed service. "+recoveryUnverifiableLegacy)
 			return
 		}
 		resp.State.RemoveResource(ctx) // verified snapshot ⇒ genuine absence
@@ -521,11 +580,9 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 		// Destroy target the WRONG service and orphan the one actually deployed. Refuse to
 		// destroy an unverifiable identity; demand an explicit migration first.
 		resp.Diagnostics.AddError("labdeploy state migration required",
-			"this resource predates resolved_spec and is configured via spec_file, so the "+
-				"identity to destroy cannot be verified from state — it would be re-derived from "+
-				"the current spec_file, which may have been edited to point at a different target. "+
-				"Destroying now could orphan the deployed service. Re-apply (terraform apply) to "+
-				"persist a resolved_spec snapshot, then destroy.")
+			"the identity to destroy cannot be verified from state — it would be re-derived from "+
+				"the current spec_file, which may have been edited to point at a different target, so "+
+				"destroying now could orphan the deployed service. "+recoveryUnverifiableLegacy)
 		return
 	}
 	eng := engine.New()

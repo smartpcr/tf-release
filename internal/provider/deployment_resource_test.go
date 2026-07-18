@@ -50,6 +50,33 @@ strategy: { keep_releases: 2, rollback_on_failure: true }
 `, host, version, 0)
 }
 
+// wsSpecYAMLNoHost is wsSpecYAML with target.hosts OMITTED, so a provider
+// default_target must supply the host — used to prove a changed default host cannot be
+// silently adopted during an update of unverifiable state.
+func wsSpecYAMLNoHost(version string) string {
+	return fmt.Sprintf(`apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: winrm
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: %s
+  checksum: "sha256:%064d"
+  source: { type: http, url: "http://example.test/a.zip" }
+pattern:
+  type: windows_service
+  service_name: SampleSvc
+  exe: bin\SampleSvc.exe
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, version, 0)
+}
+
 // TestUpdatePriorFromPersistedResolvedSpec is the item-2/3 regression: the prior
 // spec is reconstructed from the PERSISTED resolved_spec, so it stays faithful even
 // after the spec_file on disk is changed to a new version. This lets a same-artifact
@@ -77,7 +104,10 @@ func TestUpdatePriorFromPersistedResolvedSpec(t *testing.T) {
 	}
 	// priorFromState must return the PERSISTED 1.0.0, NOT the mutated 2.0.0 on disk,
 	// so Engine.Update can tell 2.0.0 is a real upgrade (Deploy) vs a config change.
-	prior := r.priorFromState(context.Background(), resolvedState)
+	prior, perr := r.priorFromState(context.Background(), resolvedState)
+	if perr != nil {
+		t.Fatalf("priorFromState errored: %v", perr)
+	}
 	if prior == nil {
 		t.Fatalf("priorFromState must reconstruct persisted spec, got nil")
 	}
@@ -94,13 +124,13 @@ func TestPriorFromStateBackCompat(t *testing.T) {
 	r := &DeploymentResource{}
 	inline := &deploymentModel{Spec: types.StringValue(wsSpecYAML("1.0.0")), SpecFile: types.StringNull(),
 		ResolvedSpec: types.StringNull()}
-	if prior := r.priorFromState(context.Background(), inline); prior == nil || prior.Artifact.Version != "1.0.0" {
-		t.Fatalf("inline back-compat prior must reconstruct 1.0.0, got %+v", prior)
+	if prior, perr := r.priorFromState(context.Background(), inline); perr != nil || prior == nil || prior.Artifact.Version != "1.0.0" {
+		t.Fatalf("inline back-compat prior must reconstruct 1.0.0, got %+v (err %v)", prior, perr)
 	}
 	fileState := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue("/nonexistent/spec.yaml"),
 		ResolvedSpec: types.StringNull(), DeployedVersion: types.StringNull()}
-	if prior := r.priorFromState(context.Background(), fileState); prior != nil {
-		t.Fatalf("spec_file back-compat prior with no deployed_version must decline (nil), got version %q", prior.Artifact.Version)
+	if prior, perr := r.priorFromState(context.Background(), fileState); perr != nil || prior != nil {
+		t.Fatalf("spec_file back-compat prior with no deployed_version must decline (nil,nil), got %+v (err %v)", prior, perr)
 	}
 }
 
@@ -118,8 +148,8 @@ func TestPriorFromStateLegacySpecFileDeclines(t *testing.T) {
 	r := &DeploymentResource{}
 	state := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue(path),
 		ResolvedSpec: types.StringNull(), DeployedVersion: types.StringValue("1.0.0")}
-	if prior := r.priorFromState(context.Background(), state); prior != nil {
-		t.Fatalf("legacy spec_file prior must decline (nil) even with deployed_version, got version %q", prior.Artifact.Version)
+	if prior, perr := r.priorFromState(context.Background(), state); perr != nil || prior != nil {
+		t.Fatalf("legacy spec_file prior must decline (nil,nil) even with deployed_version, got %+v (err %v)", prior, perr)
 	}
 }
 
@@ -284,6 +314,112 @@ func TestDeleteRejectsUnverifiedLegacyState(t *testing.T) {
 	}
 }
 
+// runModifyPlan drives ModifyPlan end-to-end with a real plan+state built from the
+// resource schema, returning the response so tests can assert RequiresReplace / errors.
+func runModifyPlan(t *testing.T, r *DeploymentResource, plan, state *deploymentModel) *resource.ModifyPlanResponse {
+	t.Helper()
+	ctx := context.Background()
+	sr := resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, &sr)
+	p := tfsdk.Plan{Schema: sr.Schema}
+	if d := p.Set(ctx, plan); d.HasError() {
+		t.Fatalf("build plan: %v", d)
+	}
+	st := tfsdk.State{Schema: sr.Schema}
+	if d := st.Set(ctx, state); d.HasError() {
+		t.Fatalf("build state: %v", d)
+	}
+	resp := &resource.ModifyPlanResponse{Plan: p}
+	r.ModifyPlan(ctx, resource.ModifyPlanRequest{
+		Plan:   p,
+		State:  st,
+		Config: tfsdk.Config{Schema: sr.Schema, Raw: p.Raw},
+	}, resp)
+	return resp
+}
+
+// TestModifyPlanBlocksDefaultContributedHostAdoption covers items 1+2 (iter-32 review):
+// when unverifiable state (no resolved_spec, matching pre-merge spec_hash) is planned for
+// update and the provider default_target now contributes an immutable field (here: the
+// host), ModifyPlan must BLOCK with an executable migration error instead of laundering the
+// merged identity into the plan — otherwise Update would deploy to the newly-defaulted host
+// and orphan the original deployment.
+func TestModifyPlanBlocksDefaultContributedHostAdoption(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	// Raw spec_file omits target.hosts; the provider default supplies it.
+	if err := os.WriteFile(specPath, []byte(wsSpecYAMLNoHost("1.0.0")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	// Provider default_target now points at lab-99 (a DIFFERENT host than was deployed).
+	r := &DeploymentResource{pd: &providerData{DefaultTarget: &spec.Target{Hosts: []string{"lab-99"}}}}
+	_, hash, contributed, err := r.resolveSpecDetail(context.Background(), &deploymentModel{SpecFile: types.StringValue(specPath)})
+	if err != nil {
+		t.Fatalf("resolve for baseline hash: %v", err)
+	}
+	if !contributed {
+		t.Fatal("test precondition: provider default_target must contribute the host")
+	}
+	// Unverifiable state: empty resolved_spec (upgrader declined) but pre-merge hash matches.
+	state := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringValue(hash),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	plan := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runModifyPlan(t, r, plan, state)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("ModifyPlan must block adoption of a default-contributed identity on unverifiable state")
+	}
+	if !strings.Contains(resp.Diagnostics.Errors()[0].Detail(), "terraform apply") {
+		t.Fatalf("block must carry an executable recovery, got %q", resp.Diagnostics.Errors()[0].Detail())
+	}
+}
+
+// TestPriorFromStateCorruptSnapshotErrors covers item 3 (iter-32 review): a non-empty but
+// undecodable resolved_spec must be treated as state corruption (error), consistent with
+// stateSpec, rather than silently falling through to inline/spec_file reconstruction and
+// feeding a fabricated prior to Update. It must also carry the executable recovery (item 4).
+func TestPriorFromStateCorruptSnapshotErrors(t *testing.T) {
+	r := &DeploymentResource{}
+	state := &deploymentModel{ResolvedSpec: types.StringValue("{ this is not valid json"),
+		Spec: types.StringNull(), SpecFile: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	prior, err := r.priorFromState(context.Background(), state)
+	if err == nil {
+		t.Fatal("corrupt resolved_spec must surface an error, not a fabricated/nil prior")
+	}
+	if prior != nil {
+		t.Fatal("corrupt resolved_spec must not yield a prior deployment")
+	}
+	if !strings.Contains(err.Error(), "ERR_STATE_CORRUPT") {
+		t.Fatalf("expected ERR_STATE_CORRUPT, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "terraform state rm") {
+		t.Fatalf("corrupt-state recovery must be executable (terraform state rm), got %q", err.Error())
+	}
+}
+
+// TestDeleteCorruptSnapshotExecutableRecovery covers item 4 (iter-32 review): Delete on a
+// corrupt resolved_spec must not just recommend the dead-end `terraform apply -replace`
+// (the destroy half is guarded); it must give the executable `terraform state rm` recovery.
+func TestDeleteCorruptSnapshotExecutableRecovery(t *testing.T) {
+	r := &DeploymentResource{}
+	m := &deploymentModel{ResolvedSpec: types.StringValue("{ corrupt"),
+		Spec: types.StringNull(), SpecFile: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	req, resp := deleteReqForModel(t, r, m)
+	r.Delete(context.Background(), req, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Delete on corrupt state must surface an error")
+	}
+	detail := resp.Diagnostics.Errors()[0].Detail()
+	if !strings.Contains(detail, "terraform state rm") {
+		t.Fatalf("expected executable recovery (terraform state rm), got %q", detail)
+	}
+}
+
 // runUpgrade drives the v0→v1 state upgrader against a legacy model and returns the
 // upgraded model plus the response diagnostics.
 func runUpgrade(t *testing.T, r *DeploymentResource, legacy *deploymentModel) (deploymentModel, *resource.UpgradeStateResponse) {
@@ -383,7 +519,11 @@ func TestUpgradeStateDeclinesOnHashMismatch(t *testing.T) {
 	if verified {
 		t.Fatal("state must remain UNVERIFIED when the snapshot was declined")
 	}
-	if !legacyReplaceRequired(r.priorFromState(context.Background(), &upgraded), "sha256:different", &upgraded) {
+	declinedPrior, perr := r.priorFromState(context.Background(), &upgraded)
+	if perr != nil {
+		t.Fatalf("priorFromState errored: %v", perr)
+	}
+	if !legacyReplaceRequired(declinedPrior, "sha256:different", &upgraded) {
 		t.Fatal("legacy replacement safeguard must remain active after a declined backfill")
 	}
 }
