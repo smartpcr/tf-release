@@ -2,13 +2,18 @@ package provider
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -17,6 +22,19 @@ import (
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
+
+// nullTimeouts returns a null timeouts.Value of the deployment resource's
+// timeouts block type (create/update/delete). Test models built as struct
+// literals leave Timeouts as its zero value (an untyped, empty object) which
+// fails tfsdk.Set against the schema's typed timeouts block; normalizing to a
+// typed null keeps the create/update/delete defaults in force.
+func nullTimeouts() timeouts.Value {
+	return timeouts.Value{Object: types.ObjectNull(map[string]attr.Type{
+		"create": types.StringType,
+		"update": types.StringType,
+		"delete": types.StringType,
+	})}
+}
 
 // wsSpecYAML is a minimal, valid single-host windows_service deployment at the
 // given artifact version. The checksum is a well-formed sha256:<64 hex> so the
@@ -285,6 +303,7 @@ func deleteReqForModel(t *testing.T, r *DeploymentResource, m *deploymentModel) 
 	sr := resource.SchemaResponse{}
 	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)
 	st := tfsdk.State{Schema: sr.Schema}
+	m.Timeouts = nullTimeouts()
 	if diags := st.Set(context.Background(), m); diags.HasError() {
 		t.Fatalf("build state: %v", diags)
 	}
@@ -326,11 +345,13 @@ func runModifyPlan(t *testing.T, r *DeploymentResource, plan, state *deploymentM
 	sr := resource.SchemaResponse{}
 	r.Schema(ctx, resource.SchemaRequest{}, &sr)
 	p := tfsdk.Plan{Schema: sr.Schema}
+	plan.Timeouts = nullTimeouts()
 	if d := p.Set(ctx, plan); d.HasError() {
 		t.Fatalf("build plan: %v", d)
 	}
 	st := tfsdk.State{Schema: sr.Schema} // nil state ⇒ Raw stays null ⇒ create path
 	if state != nil {
+		state.Timeouts = nullTimeouts()
 		if d := st.Set(ctx, state); d.HasError() {
 			t.Fatalf("build state: %v", d)
 		}
@@ -445,6 +466,7 @@ func runCreate(t *testing.T, r *DeploymentResource, plan *deploymentModel) *reso
 	sr := resource.SchemaResponse{}
 	r.Schema(ctx, resource.SchemaRequest{}, &sr)
 	p := tfsdk.Plan{Schema: sr.Schema}
+	plan.Timeouts = nullTimeouts()
 	if d := p.Set(ctx, plan); d.HasError() {
 		t.Fatalf("build plan: %v", d)
 	}
@@ -571,6 +593,7 @@ func runUpgrade(t *testing.T, r *DeploymentResource, legacy *deploymentModel) (d
 		t.Fatal("expected a v0 state upgrader with a PriorSchema")
 	}
 	prior := tfsdk.State{Schema: *u.PriorSchema}
+	legacy.Timeouts = nullTimeouts()
 	if diags := prior.Set(context.Background(), legacy); diags.HasError() {
 		t.Fatalf("build prior state: %v", diags)
 	}
@@ -726,3 +749,266 @@ func TestUpgradeStateUnresolvableStaysFailSafe(t *testing.T) {
 		t.Fatal("unresolvable legacy state must keep resolved_spec empty (fail-safe)")
 	}
 }
+
+// clusterSpecYAMLHosts is a valid multi-host cluster_generic_service deployment,
+// used to exercise target.hosts set semantics (reorder vs add/remove) at the
+// plan layer. The single-host wsSpecYAML forms cannot carry 2 hosts (validation
+// requires exactly one for windows_service), so the plan-level host tests use
+// this cluster form.
+func clusterSpecYAMLHosts(hosts ...string) string {
+	hl := `["` + strings.Join(hosts, `", "`) + `"]`
+	return fmt.Sprintf(`apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: winrm
+  hosts: %s
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:%064d"
+  source: { type: http, url: "http://example.test/a.zip" }
+pattern:
+  type: cluster_generic_service
+  service_name: SampleSvc
+  role_name: SampleRole
+  exe: bin\SampleSvc.exe
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, hl, 0)
+}
+
+// wsDeployment builds a resolved Deployment for the given immutable-field values,
+// used by the pure immutableKey tests (no transport / validation needed).
+func wsDeployment(ptype spec.PatternType, service, role, name, os string, hosts ...string) *spec.Deployment {
+	d := &spec.Deployment{
+		Metadata: spec.Metadata{Name: name},
+		Target:   spec.Target{Hosts: hosts, OS: spec.OSKind(os)},
+	}
+	d.Pattern.Type = ptype
+	d.Pattern.ServiceName = service
+	d.Pattern.RoleName = role
+	return d
+}
+
+// TestImmutableKeyHostReorderEqual proves the "host reorder is not a replace"
+// scenario at the immutableKey layer: [a,b] and [b,a] compare equal because hosts
+// are compared as a SET (lower-cased + sorted), per architecture.md line 350.
+func TestImmutableKeyHostReorderEqual(t *testing.T) {
+	ab := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "app", "windows", "lab-a", "lab-b")
+	ba := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "app", "windows", "lab-b", "lab-a")
+	if immutableKey(ab) != immutableKey(ba) {
+		t.Fatalf("host reorder must NOT change immutableKey:\n [a,b]=%q\n [b,a]=%q", immutableKey(ab), immutableKey(ba))
+	}
+	// Case-insensitive set: LAB-A vs lab-a must not differ either.
+	mixed := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "app", "windows", "LAB-B", "LAB-A")
+	if immutableKey(ab) != immutableKey(mixed) {
+		t.Fatalf("host case/order must not change immutableKey: %q vs %q", immutableKey(ab), immutableKey(mixed))
+	}
+}
+
+// TestImmutableKeyImmutablePathsDiffer proves the T9 scenario at the immutableKey
+// layer: a change to pattern.type, service_name, target.hosts (set membership), or
+// target.os each yields a different key (so ModifyPlan appends RequiresReplace).
+func TestImmutableKeyImmutablePathsDiffer(t *testing.T) {
+	base := wsDeployment(spec.PatternWindowsService, "Svc", "", "app", "windows", "lab-a")
+	cases := map[string]*spec.Deployment{
+		"pattern.type":  wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "app", "windows", "lab-a", "lab-b"),
+		"service_name":  wsDeployment(spec.PatternWindowsService, "Other", "", "app", "windows", "lab-a"),
+		"target.hosts":  wsDeployment(spec.PatternWindowsService, "Svc", "", "app", "windows", "lab-z"),
+		"metadata.name": wsDeployment(spec.PatternWindowsService, "Svc", "", "other", "windows", "lab-a"),
+		"target.os":     wsDeployment(spec.PatternWindowsService, "Svc", "", "app", "linux", "lab-a"),
+	}
+	for name, changed := range cases {
+		if immutableKey(base) == immutableKey(changed) {
+			t.Fatalf("changing %s must change immutableKey, but it stayed %q", name, immutableKey(base))
+		}
+	}
+}
+
+// TestDeploymentIDDeterministicSHA1 proves the "deterministic SHA-1 id" scenario:
+// id == sha1(sorted(hosts)+"/"+name)[0:12] + ":" + name, and is byte-identical
+// when the same hosts are supplied in a different order (architecture.md line 78).
+func TestDeploymentIDDeterministicSHA1(t *testing.T) {
+	d1 := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "n", "windows", "b", "a")
+	d2 := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "n", "windows", "a", "b")
+	got := deploymentID(d1)
+
+	sum := sha1.Sum([]byte("a,b/n"))
+	want := hex.EncodeToString(sum[:])[:12] + ":n"
+	if got != want {
+		t.Fatalf("deploymentID = %q, want authoritative formula %q", got, want)
+	}
+	if deploymentID(d1) != deploymentID(d2) {
+		t.Fatalf("deploymentID must be host-order-independent: %q vs %q", deploymentID(d1), deploymentID(d2))
+	}
+	if len(strings.SplitN(got, ":", 2)[0]) != 12 {
+		t.Fatalf("deploymentID hash prefix must be 12 chars, got %q", got)
+	}
+	if !strings.HasSuffix(got, ":n") {
+		t.Fatalf("deploymentID must end with :<name>, got %q", got)
+	}
+}
+
+// TestDiagSummaryCoded proves the "coded diagnostic Summary" scenario: an engine
+// *CodedError carrying the real taxonomy code ERR_CONNECT surfaces as a Summary of
+// the exact "[<CODE>] <short>" shape (begins "[ERR_CONNECT] ").
+func TestDiagSummaryCoded(t *testing.T) {
+	err := &engine.CodedError{Code: "ERR_CONNECT", Host: "lab-01", Step: "PREFLIGHT",
+		Err: fmt.Errorf("dial tcp: connection refused")}
+	sum := diagSummary("ERR_SPEC_INVALID", "deploy failed", err)
+	if sum != "[ERR_CONNECT] deploy failed" {
+		t.Fatalf("coded engine error must surface its taxonomy code, got %q", sum)
+	}
+	if !strings.HasPrefix(sum, "[ERR_CONNECT] ") {
+		t.Fatalf("Summary must begin with the coded prefix, got %q", sum)
+	}
+	// A non-coded (pre-flight) error falls back to the operation code, preserving
+	// the DESIGN §12 contract that EVERY Summary is "[<CODE>] <short>".
+	if fb := diagSummary("ERR_SPEC_INVALID", "invalid spec", fmt.Errorf("plain")); fb != "[ERR_SPEC_INVALID] invalid spec" {
+		t.Fatalf("non-coded error must use the fallback code, got %q", fb)
+	}
+}
+
+// TestTimeoutDefaults proves the "timeout defaults" scenario: the schema exposes a
+// timeouts block, and with no explicit timeouts configured create/update default to
+// 30m and delete to 15m (DESIGN §5.2).
+func TestTimeoutDefaults(t *testing.T) {
+	ctx := context.Background()
+	sr := resource.SchemaResponse{}
+	(&DeploymentResource{}).Schema(ctx, resource.SchemaRequest{}, &sr)
+	if _, ok := sr.Schema.Blocks["timeouts"]; !ok {
+		t.Fatal("schema must declare a timeouts block")
+	}
+	if defaultCreateTimeout != 30*time.Minute || defaultUpdateTimeout != 30*time.Minute || defaultDeleteTimeout != 15*time.Minute {
+		t.Fatalf("timeout defaults wrong: create=%s update=%s delete=%s", defaultCreateTimeout, defaultUpdateTimeout, defaultDeleteTimeout)
+	}
+	// A null (unconfigured) timeouts value resolves to the operation defaults.
+	to := nullTimeouts()
+	if got, d := to.Create(ctx, defaultCreateTimeout); d.HasError() || got != 30*time.Minute {
+		t.Fatalf("create default = %s (diags %v), want 30m", got, d)
+	}
+	if got, d := to.Update(ctx, defaultUpdateTimeout); d.HasError() || got != 30*time.Minute {
+		t.Fatalf("update default = %s (diags %v), want 30m", got, d)
+	}
+	if got, d := to.Delete(ctx, defaultDeleteTimeout); d.HasError() || got != 15*time.Minute {
+		t.Fatalf("delete default = %s (diags %v), want 15m", got, d)
+	}
+}
+
+// TestImportUnsupported proves the "import unsupported" scenario: ImportState emits
+// the pinned message "import is not supported; adopt via apply" (DESIGN §5.2).
+func TestImportUnsupported(t *testing.T) {
+	r := &DeploymentResource{}
+	resp := &resource.ImportStateResponse{}
+	r.ImportState(context.Background(), resource.ImportStateRequest{ID: "anything"}, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("ImportState must surface an error")
+	}
+	if got := resp.Diagnostics.Errors()[0].Detail(); got != "import is not supported; adopt via apply" {
+		t.Fatalf("import error message = %q, want the pinned %q", got, "import is not supported; adopt via apply")
+	}
+}
+
+// TestModifyPlanHostReorderNoReplace proves the "host reorder is not a replace"
+// scenario end-to-end through ModifyPlan: a prior state with hosts [lab-01,lab-02]
+// and a new plan with [lab-02,lab-01] and no other change produces NO RequiresReplace.
+func TestModifyPlanHostReorderNoReplace(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	// New plan: hosts reordered.
+	if err := os.WriteFile(specPath, []byte(clusterSpecYAMLHosts("lab-02", "lab-01")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	// Prior persisted snapshot: hosts in the original order.
+	priorSpec, priorHash, err := r.resolveSpec(context.Background(),
+		&deploymentModel{Spec: types.StringValue(clusterSpecYAMLHosts("lab-01", "lab-02")), SpecFile: types.StringNull(),
+			Variables: types.MapNull(types.StringType)})
+	if err != nil {
+		t.Fatalf("resolve prior: %v", err)
+	}
+	plan := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	state := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: marshalResolvedSpec(priorSpec), SpecHash: types.StringValue(priorHash),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runModifyPlan(t, r, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("reorder plan must not error: %v", resp.Diagnostics.Errors())
+	}
+	if len(resp.RequiresReplace) != 0 {
+		t.Fatalf("host reorder must NOT force replacement, got RequiresReplace=%v", resp.RequiresReplace)
+	}
+}
+
+// TestModifyPlanImmutableHostChangeReplaces proves the T9 scenario end-to-end: a
+// plan changing target.hosts set membership (lab-02 → lab-03) forces RequiresReplace.
+func TestModifyPlanImmutableHostChangeReplaces(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(specPath, []byte(clusterSpecYAMLHosts("lab-01", "lab-03")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	priorSpec, priorHash, err := r.resolveSpec(context.Background(),
+		&deploymentModel{Spec: types.StringValue(clusterSpecYAMLHosts("lab-01", "lab-02")), SpecFile: types.StringNull(),
+			Variables: types.MapNull(types.StringType)})
+	if err != nil {
+		t.Fatalf("resolve prior: %v", err)
+	}
+	plan := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	state := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: marshalResolvedSpec(priorSpec), SpecHash: types.StringValue(priorHash),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runModifyPlan(t, r, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("immutable-change plan must not error: %v", resp.Diagnostics.Errors())
+	}
+	if len(resp.RequiresReplace) == 0 {
+		t.Fatal("changing target.hosts set membership must force RequiresReplace")
+	}
+}
+
+// TestCreateSurfacesCodedDeployError proves the coded-diagnostic contract on the
+// Create path itself: when the engine deploy fails with an ERR_CONNECT CodedError,
+// the Create diagnostic Summary begins "[ERR_CONNECT] " (DESIGN §12).
+func TestCreateSurfacesCodedDeployError(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeErrEngine{err: &engine.CodedError{Code: "ERR_CONNECT", Host: "lab-01",
+		Step: "PREFLIGHT", Err: fmt.Errorf("dial tcp: connection refused")}}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	plan := &deploymentModel{Spec: types.StringValue(wsSpecYAML("1.0.0")), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runCreate(t, r, plan)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Create must surface the engine deploy failure")
+	}
+	sum := resp.Diagnostics.Errors()[0].Summary()
+	if !strings.HasPrefix(sum, "[ERR_CONNECT] ") {
+		t.Fatalf("deploy failure Summary must begin with the coded prefix, got %q", sum)
+	}
+}
+
+// fakeErrEngine is a deployEngine whose Update fails with a fixed coded error, so
+// the resource's coded-diagnostic mapping can be exercised without a live transport.
+type fakeErrEngine struct{ err error }
+
+func (f *fakeErrEngine) Update(_ context.Context, _, _ *spec.Deployment) (*engine.Status, error) {
+	return nil, f.err
+}
+func (f *fakeErrEngine) ReadStatus(_ context.Context, _ *spec.Deployment) (*engine.Status, error) {
+	return nil, f.err
+}
+func (f *fakeErrEngine) Destroy(_ context.Context, _ *spec.Deployment, _ string) error { return f.err }
+func (f *fakeErrEngine) Warns() []string                                               { return nil }

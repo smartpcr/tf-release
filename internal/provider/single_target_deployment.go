@@ -36,8 +36,9 @@ func newSingleTargetDeployment(d *spec.Deployment) (*singleTargetDeployment, err
 // host returns the single resolved target host.
 func (s *singleTargetDeployment) host() string { return s.dep.Target.Hosts[0] }
 
-// id returns the stable resource id `<metadata.name>@<host>` (lower-cased),
-// matching the identity scheme used by labdeploy_deployment.
+// id returns the stable resource id computed by deploymentID
+// (`sha1(sorted(hosts)+"/"+name)[0:12] + ":" + name`), matching the identity
+// scheme used by labdeploy_deployment (DESIGN §5.2).
 func (s *singleTargetDeployment) id() string {
 	return deploymentID(s.dep)
 }

@@ -2,12 +2,18 @@ package provider
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -19,6 +25,14 @@ import (
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
+)
+
+// Timeout defaults for the deployment lifecycle (DESIGN §5.2): create/update run
+// long-lived deploys (30m); destroy is bounded tighter (15m).
+const (
+	defaultCreateTimeout = 30 * time.Minute
+	defaultUpdateTimeout = 30 * time.Minute
+	defaultDeleteTimeout = 15 * time.Minute
 )
 
 var (
@@ -83,14 +97,15 @@ type deploymentModel struct {
 	Hosts           types.List   `tfsdk:"hosts"`
 	ReleasePath     types.String `tfsdk:"release_path"`
 	ServiceStatus   types.String `tfsdk:"service_status"`
+	Timeouts        timeouts.Value `tfsdk:"timeouts"`
 }
 
 func (r *DeploymentResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_deployment"
 }
 
-func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
-	resp.Schema = deploymentSchema(1)
+func (r *DeploymentResource) Schema(ctx context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = deploymentSchema(ctx, 1)
 }
 
 // deploymentSchema builds the resource schema at the given version. The attribute
@@ -98,7 +113,7 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 // serves both the current Schema (v1) and the UpgradeState PriorSchema (v0). The v0→v1
 // bump exists solely to trigger the state upgrader that backfills resolved_spec for
 // legacy state persisted before the snapshot was populated.
-func deploymentSchema(version int64) schema.Schema {
+func deploymentSchema(ctx context.Context, version int64) schema.Schema {
 	return schema.Schema{
 		Version:             version,
 		MarkdownDescription: "One application deployed to one host or one WSFC cluster (DESIGN §5.2).",
@@ -124,6 +139,16 @@ func deploymentSchema(version int64) schema.Schema {
 			"release_path":     schema.StringAttribute{Computed: true},
 			"service_status":   schema.StringAttribute{Computed: true},
 		},
+		Blocks: map[string]schema.Block{
+			// DESIGN §5.2: create/update default 30m, delete 15m. The block only
+			// declares the attributes; the defaults are applied at read time via
+			// Timeouts.Create/Update/Delete(ctx, default) in the CRUD methods.
+			"timeouts": timeouts.Block(ctx, timeouts.Opts{
+				Create: true,
+				Update: true,
+				Delete: true,
+			}),
+		},
 	}
 }
 
@@ -143,8 +168,8 @@ func deploymentSchema(version int64) schema.Schema {
 // no baseline spec_hash exists, or the spec cannot be resolved) we DECLINE to backfill,
 // leave resolved_spec empty, warn, and let the downstream Read/Delete guards +
 // legacyReplaceRequired safeguard keep the state fail-safe.
-func (r *DeploymentResource) UpgradeState(_ context.Context) map[int64]resource.StateUpgrader {
-	priorSchema := deploymentSchema(0)
+func (r *DeploymentResource) UpgradeState(ctx context.Context) map[int64]resource.StateUpgrader {
+	priorSchema := deploymentSchema(ctx, 0)
 	return map[int64]resource.StateUpgrader{
 		0: {
 			PriorSchema: &priorSchema,
@@ -269,12 +294,19 @@ func (r *DeploymentResource) resolveSpecDetail(ctx context.Context, m *deploymen
 
 // immutableKey captures the spec paths that force replacement (DESIGN §5.2):
 // pattern.type, service_name, role_name, install_root, metadata.name,
-// target.hosts, target.os.
+// target.hosts, target.os. target.hosts is compared as a SET (lower-cased and
+// sorted) per architecture.md line 350: reordering the same hosts is NOT a
+// replacement, only adding/removing a host is.
 func immutableKey(d *spec.Deployment) string {
+	hosts := make([]string, len(d.Target.Hosts))
+	for i, h := range d.Target.Hosts {
+		hosts[i] = strings.ToLower(h)
+	}
+	sort.Strings(hosts)
 	return strings.Join([]string{
 		string(d.Pattern.Type), d.Pattern.ServiceName, d.Pattern.RoleName,
 		d.Pattern.EffectiveInstallRoot(d.Target.OS), d.Metadata.Name,
-		strings.ToLower(strings.Join(d.Target.Hosts, ",")), string(d.Target.OS),
+		strings.Join(hosts, ","), string(d.Target.OS),
 	}, "|")
 }
 
@@ -339,7 +371,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	}
 	newSpec, newHash, defaultsContributed, err := r.resolveSpecDetail(ctx, &plan)
 	if err != nil {
-		resp.Diagnostics.AddError("Invalid spec", err.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec", err), err.Error())
 		return
 	}
 	plan.SpecHash = types.StringValue(newHash)
@@ -364,7 +396,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	if perr != nil {
 		// Corrupt persisted snapshot: fail loudly (consistent with stateSpec) rather than
 		// planning an update against an untrustworthy prior that could target the wrong host.
-		resp.Diagnostics.AddError("Invalid spec in state", perr.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_STATE_CORRUPT", "invalid spec in state", perr), perr.Error())
 		return
 	}
 	if oldSpec == nil {
@@ -434,6 +466,13 @@ func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	createTimeout, diags := plan.Timeouts.Create(ctx, defaultCreateTimeout)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
 	r.apply(ctx, &plan, nil, &resp.Diagnostics, func(m *deploymentModel) {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 	})
@@ -445,6 +484,13 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	updateTimeout, diags := plan.Timeouts.Update(ctx, defaultUpdateTimeout)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
 	// Resolve the PRIOR spec from state so a same-artifact configuration change is
 	// routed through the transactional Reconfigure path instead of Deploy, whose
 	// idempotency short-circuit would otherwise skip it. Decoding errors are NOT
@@ -459,7 +505,7 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	if perr != nil {
 		// Corrupt persisted snapshot: surface it (consistent with stateSpec / ModifyPlan)
 		// rather than feeding a fabricated or nil prior into a blind Deploy.
-		resp.Diagnostics.AddError("Invalid spec in state", perr.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_STATE_CORRUPT", "invalid spec in state", perr), perr.Error())
 		return
 	}
 	r.apply(ctx, &plan, prior, &resp.Diagnostics, func(m *deploymentModel) {
@@ -541,16 +587,16 @@ func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
 	prior *spec.Deployment, diags diagAppender, setState func(*deploymentModel)) {
 	d, hash, err := r.resolveSpec(ctx, plan)
 	if err != nil {
-		diags.AddError("Invalid spec", err.Error())
+		diags.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec", err), err.Error())
 		return
 	}
 	eng := r.engine()
 	st, err := eng.Update(ctx, d, prior)
 	for _, w := range eng.Warns() {
-		diags.AddWarning("labdeploy", w)
+		diags.AddWarning(warnSummary(w), w)
 	}
 	if err != nil {
-		diags.AddError("Deploy failed", err.Error())
+		diags.AddError(diagSummary("ERR_CONNECT", "deploy failed", err), err.Error())
 		return
 	}
 	plan.ID = types.StringValue(deploymentID(d))
@@ -569,20 +615,20 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	}
 	d, _, verified, err := r.stateSpec(ctx, &state)
 	if err != nil {
-		resp.Diagnostics.AddError("Invalid spec in state", err.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_STATE_CORRUPT", "invalid spec in state", err), err.Error())
 		return
 	}
 	eng := r.engine()
 	st, err := eng.ReadStatus(ctx, d)
 	for _, w := range eng.Warns() {
-		resp.Diagnostics.AddWarning("labdeploy", w)
+		resp.Diagnostics.AddWarning(warnSummary(w), w)
 	}
 	if err != nil {
 		// DESIGN §10.4: refresh MUST fail loudly on transport errors (no silent
 		// drop). We surface an ERROR diagnostic but do NOT RemoveResource, so the
 		// prior state is retained — an unreachable target is not a deleted
 		// resource (evaluator item 4).
-		resp.Diagnostics.AddError("labdeploy read failed", err.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_CONNECT", "read failed", err), err.Error())
 		return
 	}
 	if st == nil { // manifest absent
@@ -612,9 +658,16 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	deleteTimeout, diags := state.Timeouts.Delete(ctx, defaultDeleteTimeout)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 	d, _, verified, err := r.stateSpec(ctx, &state)
 	if err != nil {
-		resp.Diagnostics.AddError("Invalid spec in state", err.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_STATE_CORRUPT", "invalid spec in state", err), err.Error())
 		return
 	}
 	if !verified {
@@ -631,30 +684,65 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	}
 	eng := r.engine()
 	if err := eng.Destroy(ctx, d, state.DestroyMode.ValueString()); err != nil {
-		resp.Diagnostics.AddError("Destroy failed", err.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_CONNECT", "destroy failed", err), err.Error())
 		return
 	}
 	for _, w := range eng.Warns() {
-		resp.Diagnostics.AddWarning("labdeploy", w)
+		resp.Diagnostics.AddWarning(warnSummary(w), w)
 	}
 }
 
 // ImportState is unsupported in v1 (DESIGN §5.2): manifests carry target truth
-// but TF state needs the spec input, which import cannot reconstruct.
+// but TF state needs the spec input, which import cannot reconstruct. The message
+// is the pinned string from DESIGN §5.2.
 func (r *DeploymentResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	resp.Diagnostics.AddError("Import not supported",
-		"labdeploy_deployment cannot be imported (DESIGN §5.2); re-apply the spec instead.")
+	resp.Diagnostics.AddError("[ERR_UNSUPPORTED] import is not supported; adopt via apply",
+		"import is not supported; adopt via apply")
 }
 
 // ------------------------------ shared helpers ------------------------------
+
+// diagSummary formats a diagnostic Summary per DESIGN §12: exactly
+// "[<CODE>] <short>". Engine failures bubble up as *engine.CodedError carrying
+// the taxonomy code (e.g. ERR_CONNECT); surface it when present, otherwise fall
+// back to the operation-appropriate code so the contract also holds for
+// pre-flight (spec/state) errors that never reached the engine.
+func diagSummary(fallback, short string, err error) string {
+	code := fallback
+	var ce *engine.CodedError
+	if errors.As(err, &ce) && ce.Code != "" {
+		code = ce.Code
+	}
+	return fmt.Sprintf("[%s] %s", code, short)
+}
+
+// warnSummary formats a warning Summary per DESIGN §12. Engine warnings are
+// free-form and carry no taxonomy code, so they default to the stable WARN code;
+// a warning that already embeds a bracketed code (e.g. "[ERR_ROLLBACK_FAILED]
+// ...") surfaces that code.
+func warnSummary(w string) string {
+	if strings.HasPrefix(w, "[") {
+		if i := strings.Index(w, "]"); i > 1 {
+			return fmt.Sprintf("[%s] labdeploy warning", w[1:i])
+		}
+	}
+	return "[WARN] labdeploy warning"
+}
 
 type diagAppender = interface {
 	AddError(summary, detail string)
 	AddWarning(summary, detail string)
 }
 
+// deploymentID computes the stable, host-order-independent resource id
+// (DESIGN §5.2 / architecture.md line 78): sha1(sorted(hosts)+"/"+name)[0:12] +
+// ":" + name. Sorting the hosts before hashing makes the id byte-identical when
+// the same hosts are supplied in a different order.
 func deploymentID(d *spec.Deployment) string {
-	return strings.ToLower(d.Metadata.Name + "@" + strings.Join(d.Target.Hosts, ","))
+	hosts := append([]string(nil), d.Target.Hosts...)
+	sort.Strings(hosts)
+	sum := sha1.Sum([]byte(strings.Join(hosts, ",") + "/" + d.Metadata.Name))
+	return hex.EncodeToString(sum[:])[:12] + ":" + d.Metadata.Name
 }
 
 func fillStatus(ctx context.Context, m *deploymentModel, st *engine.Status, diags diagAppender) {
