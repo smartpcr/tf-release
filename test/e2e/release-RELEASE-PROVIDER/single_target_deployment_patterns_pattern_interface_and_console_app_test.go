@@ -50,8 +50,10 @@ func (f *consoleScriptTransport) Download(ctx context.Context, remote, local str
 }
 
 // consoleWorld holds per-scenario state exercised through the Pattern interface.
+// The pattern is obtained from pattern.For (never the concrete *ConsoleApp) so
+// this stage actually gates the registry + interface wiring it delivers.
 type consoleWorld struct {
-	c          pattern.ConsoleApp
+	p          pattern.Pattern
 	rc         pattern.ReleaseCtx
 	configure  *consoleScriptTransport
 	start      *consoleScriptTransport
@@ -120,6 +122,15 @@ func (w *consoleWorld) givenConsoleRC(app, version, osName string) error {
 		Type: spec.PatternConsoleApp,
 		Exe:  exe,
 	})
+	// Resolve through the registry so the interface path the engine relies on
+	// is actually exercised: a broken PatternConsoleApp registration or a
+	// *ConsoleApp that stopped satisfying pattern.Pattern would now fail here
+	// instead of silently passing (DESIGN §9.3).
+	p, err := pattern.For(spec.PatternConsoleApp)
+	if err != nil {
+		return err
+	}
+	w.p = p
 	return nil
 }
 
@@ -143,12 +154,12 @@ func (w *consoleWorld) givenMarker(version string) error {
 
 func (w *consoleWorld) whenConfigureAndStart() error {
 	w.configure = &consoleScriptTransport{osKind: w.rc.Spec.Target.OS}
-	if err := w.c.Configure(context.Background(), w.configure, w.rc); err != nil {
+	if err := w.p.Configure(context.Background(), w.configure, w.rc); err != nil {
 		w.configErr = err
 		return fmt.Errorf("Configure: %w", err)
 	}
 	w.start = &consoleScriptTransport{osKind: w.rc.Spec.Target.OS}
-	if err := w.c.Start(context.Background(), w.start, w.rc); err != nil {
+	if err := w.p.Start(context.Background(), w.start, w.rc); err != nil {
 		return fmt.Errorf("Start: %w", err)
 	}
 	return nil
@@ -158,7 +169,7 @@ func (w *consoleWorld) whenStatus() error {
 	if w.statusTx == nil {
 		return fmt.Errorf("no fake transport with a marker was configured")
 	}
-	w.status, w.statusErr = w.c.Status(context.Background(), w.statusTx, w.rc)
+	w.status, w.statusErr = w.p.Status(context.Background(), w.statusTx, w.rc)
 	return nil
 }
 
