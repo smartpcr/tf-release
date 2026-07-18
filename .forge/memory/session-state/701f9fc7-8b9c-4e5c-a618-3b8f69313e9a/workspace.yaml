@@ -1,0 +1,18 @@
+id: 701f9fc7-8b9c-4e5c-a618-3b8f69313e9a
+cwd: C:\forge\release\.worktree\stage-5.2-deployment-resource-crud-and-plan-modifiers-e2e
+git_root: C:\forge\release\.worktree\stage-5.2-deployment-resource-crud-and-plan-modifiers-e2e
+repository: smartpcr/tf-release
+host_type: github
+branch: ws/release-RELEASE-PROVIDER/phase-terraform-provider-surface-stage-deployment-resource-crud-and-plan-modifiers-e2e
+client_name: sdk
+name: |-
+  ## Forge workstream memory
+  Before planning or editing, read `.forge/memory/workstream-context.md`. It contains concise iteration-forward context: prior summaries, evaluator feedback, changed-file pointers, dead ends, Q&A, gate failures, dependencies, review comments, and merge rationale. Do not treat it as a transcript or edit it.
+
+  ---
+
+  You are the QA crew Generator for workstream `ws-release-release-provider-phase-terraform-provider-surface-stage-deployment-resource-crud-and-plan-modifiers-e2e`...
+user_named: false
+summary_count: 1
+created_at: 2026-07-18T20:48:18.255Z
+updated_at: 2026-07-18T21:18:54.936Z

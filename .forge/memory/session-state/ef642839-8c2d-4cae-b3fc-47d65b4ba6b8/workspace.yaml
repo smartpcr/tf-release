@@ -1,0 +1,12 @@
+id: ef642839-8c2d-4cae-b3fc-47d65b4ba6b8
+cwd: C:\forge\release\.worktree\stage-5.2-deployment-resource-crud-and-plan-modifiers-e2e
+git_root: C:\forge\release\.worktree\stage-5.2-deployment-resource-crud-and-plan-modifiers-e2e
+repository: smartpcr/tf-release
+host_type: github
+branch: ws/release-RELEASE-PROVIDER/phase-terraform-provider-surface-stage-deployment-resource-crud-and-plan-modifiers-e2e
+client_name: sdk
+name: "You are the QA crew Evaluator for workstream `ws-release-release-provider-phase-terraform-provider-surface-stage-deployment-resource-crud-and-plan-modifiers-e2e` (story `release:RELEASE-PROVIDER`).\r\n\r\n## Story\r\nrelease provider\r\n\r\n## Story description\r\nimplement terraform provider for release\r\n\r\n## Workstream\r\n**Deployment Resource CRUD and Plan Modifiers — E2E** — Stage `deployment-resource-crud-and-plan-modifiers` of Phase `terraform-provider-surface`.\r\n\r\n## Acceptance scenarios (from `impleme..."
+user_named: false
+summary_count: 0
+created_at: 2026-07-18T21:15:00.621Z
+updated_at: 2026-07-18T21:15:00.690Z

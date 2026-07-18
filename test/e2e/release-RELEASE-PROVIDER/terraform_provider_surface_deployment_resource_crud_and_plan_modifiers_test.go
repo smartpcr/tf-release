@@ -193,6 +193,7 @@ type crudState struct {
 	modifyResp *resource.ModifyPlanResponse
 
 	createSummary string
+	createDetail  string
 	createErrored bool
 
 	idOriginal  string
@@ -351,17 +352,52 @@ func (s *crudState) whenCreateSurfacesFailure() error {
 	r.Create(ctx, resource.CreateRequest{Plan: p}, resp)
 	s.createErrored = resp.Diagnostics.HasError()
 	if s.createErrored {
+		// Capture BOTH Summary and Detail: the Summary carries the taxonomy code but,
+		// because apply()'s fallback code is itself "ERR_CONNECT", only the Detail can
+		// prove the diagnostic actually flowed from the injected transport.ErrConnect
+		// through the real engine taxonomy (see thenSummaryBeginsWith).
 		s.createSummary = resp.Diagnostics.Errors()[0].Summary()
+		s.createDetail = resp.Diagnostics.Errors()[0].Detail()
 	}
 	return nil
 }
 
+// thenSummaryBeginsWith proves the coded diagnostic for a failed Create both carries the
+// taxonomy code in its Summary AND genuinely originated from the injected transport.ErrConnect
+// through the REAL engine taxonomy (deploySingle → Connect → wrapTransportErr → engine.CodedError),
+// rather than from apply()'s hard-coded "ERR_CONNECT" fallback code.
+//
+// The Summary prefix ALONE cannot prove that provenance: apply() (deployment_resource.go) uses
+// "ERR_CONNECT" as the UNIVERSAL fallback code for any deploy error, and diagSummary only overrides
+// that fallback when errors.As finds an *engine.CodedError. Because the injected code and the
+// fallback are the same string, a bare HasPrefix("[ERR_CONNECT] ") check would still pass even if
+// wrapTransportErr dropped the CodedError entirely (raw transport error surfacing untranslated) or
+// the transport injection never ran — the exact regression this scenario exists to guard. We
+// therefore also pin the Detail on two independent witnesses of the real path.
 func (s *crudState) thenSummaryBeginsWith(prefix string) error {
 	if !s.createErrored {
 		return fmt.Errorf("Create must surface the engine deploy failure")
 	}
 	if !strings.HasPrefix(s.createSummary, prefix) {
 		return fmt.Errorf("deploy failure Summary must begin with %q, got %q", prefix, s.createSummary)
+	}
+	// (a) The exact dial error minted by e2eDialFailTransport.Connect can ONLY reach the Detail via
+	//     transport.ErrConnect — never via the fallback, whose short text is merely "deploy failed".
+	for _, want := range []string{"dial tcp", "connect: connection refused"} {
+		if !strings.Contains(s.createDetail, want) {
+			return fmt.Errorf("deploy failure Detail must carry the injected transport dial text %q, "+
+				"proving it originated from transport.ErrConnect rather than the ERR_CONNECT fallback; got %q",
+				want, s.createDetail)
+		}
+	}
+	// (b) Only engine.CodedError.Error() appends the DESIGN §12 "host=<h> step=<STEP>" markers, so
+	//     their presence proves wrapTransportErr re-coded the transport error into the real engine
+	//     taxonomy instead of the raw transport error (or a hand-built code) surfacing.
+	for _, want := range []string{"host=", "step="} {
+		if !strings.Contains(s.createDetail, want) {
+			return fmt.Errorf("deploy failure Detail must carry the DESIGN §12 taxonomy marker %q, "+
+				"proving the real engine.CodedError classified the failure; got %q", want, s.createDetail)
+		}
 	}
 	return nil
 }
