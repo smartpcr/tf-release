@@ -226,10 +226,13 @@ func (n *NodeWebApp) BackupDeps(ctx context.Context, t transport.Transport, rc R
 	if !rc.Spec.Pattern.InstallDeps {
 		return nil
 	}
-	script := fmt.Sprintf(`Set-Location %s
-if(Test-Path 'node_modules.bak'){ Remove-Item -Recurse -Force 'node_modules.bak' }
-if(Test-Path 'node_modules'){ Rename-Item 'node_modules' 'node_modules.bak' }
-exit 0`, psq(rc.P.Release))
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+Set-Location %s
+try {
+  if(Test-Path 'node_modules.bak'){ Remove-Item -Recurse -Force -ErrorAction Stop 'node_modules.bak' }
+  if(Test-Path 'node_modules'){ Rename-Item -ErrorAction Stop 'node_modules' 'node_modules.bak' }
+} catch { Write-Error "node_modules backup failed: $_"; exit %d }
+exit 0`, psq(rc.P.Release), ExitSvcInstall)
 	return n.runDepsMaint(ctx, t, script, 300)
 }
 
@@ -239,12 +242,15 @@ func (n *NodeWebApp) RestoreDeps(ctx context.Context, t transport.Transport, rc 
 	if !rc.Spec.Pattern.InstallDeps {
 		return nil
 	}
-	script := fmt.Sprintf(`Set-Location %s
-if(Test-Path 'node_modules.bak'){
-  if(Test-Path 'node_modules'){ Remove-Item -Recurse -Force 'node_modules' }
-  Rename-Item 'node_modules.bak' 'node_modules'
-}
-exit 0`, psq(rc.P.Release))
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+Set-Location %s
+try {
+  if(Test-Path 'node_modules.bak'){
+    if(Test-Path 'node_modules'){ Remove-Item -Recurse -Force -ErrorAction Stop 'node_modules' }
+    Rename-Item -ErrorAction Stop 'node_modules.bak' 'node_modules'
+  }
+} catch { Write-Error "node_modules restore failed: $_"; exit %d }
+exit 0`, psq(rc.P.Release), ExitSvcInstall)
 	return n.runDepsMaint(ctx, t, script, 300)
 }
 
@@ -253,9 +259,12 @@ func (n *NodeWebApp) CommitDeps(ctx context.Context, t transport.Transport, rc R
 	if !rc.Spec.Pattern.InstallDeps {
 		return nil
 	}
-	script := fmt.Sprintf(`Set-Location %s
-if(Test-Path 'node_modules.bak'){ Remove-Item -Recurse -Force 'node_modules.bak' }
-exit 0`, psq(rc.P.Release))
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+Set-Location %s
+try {
+  if(Test-Path 'node_modules.bak'){ Remove-Item -Recurse -Force -ErrorAction Stop 'node_modules.bak' }
+} catch { Write-Error "node_modules snapshot cleanup failed: $_"; exit %d }
+exit 0`, psq(rc.P.Release), ExitSvcInstall)
 	return n.runDepsMaint(ctx, t, script, 120)
 }
 

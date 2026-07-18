@@ -300,9 +300,14 @@ func TestReconfigureNpmCiFailureRestoresDeps(t *testing.T) {
 	if _, err := eng.Deploy(context.Background(), prior); err != nil {
 		t.Fatalf("first deploy: %v\nlog=%v", err, f.log)
 	}
-	f.log = nil
 	// Break npm ci, then push a same-artifact config change so Reconfigure runs
-	// and re-invokes npm ci (which now fails mid-install).
+	// and re-invokes npm ci (which now fails mid-install and leaves a "partial"
+	// tree). Capture the ORIGINAL dependency-tree token so we can prove the exact
+	// tree is restored (not merely that some restore command ran).
+	origTree := f.nm
+	if origTree == "" || origTree == "partial" {
+		t.Fatalf("precondition: healthy deploy must leave a good node_modules tree, got %q", origTree)
+	}
 	f.fail["npmci"] = true
 	next := nodeWebSpec(t, url, sum, true)
 	next.Pattern.NodeExe = `C:\node20\node.exe`
@@ -331,8 +336,99 @@ func TestReconfigureNpmCiFailureRestoresDeps(t *testing.T) {
 	if !(iRestore < iLastStart) {
 		t.Fatalf("node_modules must be restored before the prior app restarts; order=%v", f.log)
 	}
+	// PROVE the exact original tree is back on disk and the snapshot is consumed.
+	if f.nm != origTree {
+		t.Fatalf("original node_modules tree must be restored; want %q got %q", origTree, f.nm)
+	}
+	if f.nmBak != "" {
+		t.Fatalf("snapshot must be consumed by restore, still present: %q", f.nmBak)
+	}
+	// The prior service must actually be Running (start succeeded because deps are
+	// good), not merely reported restored.
+	if f.svc != "Running" {
+		t.Fatalf("prior app must be running after restore; svc=%q", f.svc)
+	}
 	if !strings.Contains(err.Error(), "prior configuration restored") {
 		t.Fatalf("rollback must restore the prior configuration healthy; got: %v", err)
+	}
+}
+
+// A failed node_modules BACKUP must ABORT before the destructive npm ci runs:
+// the active tree is never touched, so the prior app stays runnable.
+func TestReconfigureBackupFailureAbortsBeforeNpmCi(t *testing.T) {
+	payload := []byte("node zip bakfail")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	prior := nodeWebSpec(t, url, sum, true)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v\nlog=%v", err, f.log)
+	}
+	origTree := f.nm
+	f.log = nil
+	f.fail["depbackup"] = true
+	next := nodeWebSpec(t, url, sum, true)
+	next.Pattern.NodeExe = `C:\node20\node.exe`
+	_, err := eng.Update(context.Background(), next, prior)
+	if err == nil {
+		t.Fatalf("Update must fail when node_modules backup fails; log=%v", f.log)
+	}
+	if !strings.Contains(err.Error(), "ERR_SERVICE_INSTALL") {
+		t.Fatalf("backup failure must surface ERR_SERVICE_INSTALL, got: %v", err)
+	}
+	order := strings.Join(f.log, ">")
+	// A failed backup must NOT be followed by the destructive npm ci.
+	if strings.Contains(order, "NPMCI") {
+		t.Fatalf("destructive npm ci must NOT run after a failed backup; log=%v", f.log)
+	}
+	// The active tree is untouched — the prior app can still run.
+	if f.nm != origTree {
+		t.Fatalf("active node_modules must be untouched on backup failure; want %q got %q", origTree, f.nm)
+	}
+}
+
+// A failed node_modules RESTORE must escalate to ERR_ROLLBACK_FAILED — the
+// engine must NOT report the prior configuration as healthy when the dependency
+// tree is left broken (evaluator iter5 item 2).
+func TestReconfigureRestoreFailureIsRollbackFailed(t *testing.T) {
+	payload := []byte("node zip restfail")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	prior := nodeWebSpec(t, url, sum, true)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v\nlog=%v", err, f.log)
+	}
+	f.log = nil
+	// npm ci fails (tree becomes partial) AND the restore of the snapshot fails.
+	f.fail["npmci"] = true
+	f.fail["deprestore"] = true
+	next := nodeWebSpec(t, url, sum, true)
+	next.Pattern.NodeExe = `C:\node20\node.exe`
+	_, err := eng.Update(context.Background(), next, prior)
+	if err == nil {
+		t.Fatalf("Update must fail when restore fails; log=%v", f.log)
+	}
+	if !strings.Contains(err.Error(), "ERR_ROLLBACK_FAILED") {
+		t.Fatalf("a failed dependency restore must surface ERR_ROLLBACK_FAILED, got: %v", err)
+	}
+	// The engine must NOT falsely claim the prior configuration is healthy.
+	if strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("must not report prior config restored when restore failed; got: %v", err)
+	}
+	order := strings.Join(f.log, ">")
+	// The prior service must NOT be started against the broken tree: no START runs
+	// after the failed restore (the last-restore-then-start coupling is severed).
+	if strings.Contains(order, "DEPRESTORE") {
+		t.Fatalf("a FAILED restore must not be marked as a successful DEPRESTORE; log=%v", f.log)
+	}
+	// The broken tree is left in place for manual repair.
+	if f.nm != "partial" {
+		t.Fatalf("unrecoverable tree must remain partial for repair; got %q", f.nm)
 	}
 }
 

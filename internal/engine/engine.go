@@ -1509,24 +1509,28 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		return nil
 	}
 	if ferr := forward(); ferr != nil {
-		// A partial `npm ci` may have left the ACTIVE release without a runnable
-		// dependency tree — restore the node_modules snapshot BEFORE we restore the
-		// prior service configuration, so activate(priorRC) starts the prior app
-		// against its original dependencies (best-effort: a restore failure is
-		// warned, then surfaced with the reconfigure error via the rollback below).
-		if depsBackedUp {
-			if drerr := node.RestoreDeps(ctx, t, newRC); drerr != nil {
-				e.warnf("node_modules restore failed on %s: %v", host, drerr)
-			}
-		}
-		// Any failure after we began mutating (STOP/CONFIGURE/START/HEALTH/FINALIZE/
-		// Status): restore the PRIOR configuration — the settings Terraform still
-		// holds in state — validated against the PRIOR health check, so the machine
-		// is not left stopped or running rejected settings.
+		// Rollback (DESIGN §10.2 restore): restore the PRIOR configuration — the
+		// settings Terraform still holds in state — validated against the PRIOR
+		// health check, so the machine is not left stopped or running rejected
+		// settings.
 		priorRC := releaseCtxVersion(prior, rp, m.CurrentVersion)
 		priorRC.EmitStep = sl.emit
 		rbStart := time.Now()
-		rerr := activate(priorRC, &prior.HealthCheck, nil)
+		// A partial `npm ci` may have left the ACTIVE release without a runnable
+		// dependency tree — restore the node_modules snapshot BEFORE restoring the
+		// prior service configuration, so the prior app comes up against its
+		// original dependencies. If the snapshot restore ITSELF fails, the prior
+		// dependency tree is UNRECOVERABLE: do NOT attempt to start the prior
+		// configuration (it would come up against a broken/absent node_modules and
+		// could still report healthy under health_check=none) — escalate straight
+		// to ERR_ROLLBACK_FAILED so the operator is forced to repair.
+		var rerr error
+		if depsBackedUp {
+			rerr = node.RestoreDeps(ctx, t, newRC)
+		}
+		if rerr == nil {
+			rerr = activate(priorRC, &prior.HealthCheck, nil)
+		}
 		if rerr == nil {
 			// Prior configuration restored and healthy — re-finalize the manifest to
 			// record the rolled-back reconfigure (version/checksum unchanged).
