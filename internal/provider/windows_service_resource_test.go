@@ -206,8 +206,13 @@ func TestSingleTargetGuard(t *testing.T) {
 	if std.host() != "only" {
 		t.Fatalf("host() = %q", std.host())
 	}
-	if !strings.Contains(std.id(), "x@only") {
-		t.Fatalf("id() = %q, want to contain x@only", std.id())
+	// id() is the authoritative sha1(sorted(hosts)+"/"+name)[0:12]+":"+name form
+	// (DESIGN §5.2), so it ends with ":<name>" — here ":x".
+	if !strings.HasSuffix(std.id(), ":x") {
+		t.Fatalf("id() = %q, want suffix :x", std.id())
+	}
+	if std.id() != deploymentID(d1) {
+		t.Fatalf("id() = %q, want the shared deploymentID formula %q", std.id(), deploymentID(d1))
 	}
 }
 

@@ -24,6 +24,7 @@ func configForModel(t *testing.T, m *deploymentModel) tfsdk.Config {
 	// give the collection attributes typed nulls so only spec/spec_file drive the case.
 	m.Variables = types.MapNull(types.StringType)
 	m.Hosts = types.ListNull(types.StringType)
+	m.Timeouts = nullTimeouts()
 	st := tfsdk.State{Schema: sr.Schema}
 	if diags := st.Set(context.Background(), m); diags.HasError() {
 		t.Fatalf("build config: %v", diags)
@@ -190,6 +191,7 @@ func TestDeploymentSchemaRoundTrip(t *testing.T) {
 		Hosts:           types.ListValueMust(types.StringType, []attr.Value{types.StringValue("lab-01"), types.StringValue("lab-02")}),
 		ReleasePath:     types.StringValue(`C:\releases\dep-123`),
 		ServiceStatus:   types.StringValue("running"),
+		Timeouts:        nullTimeouts(),
 	}
 
 	st := tfsdk.State{Schema: sr.Schema}

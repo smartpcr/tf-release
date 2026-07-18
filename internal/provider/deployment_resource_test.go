@@ -2,13 +2,18 @@ package provider
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -17,6 +22,19 @@ import (
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
+
+// nullTimeouts returns a null timeouts.Value of the deployment resource's
+// timeouts block type (create/update/delete). Test models built as struct
+// literals leave Timeouts as its zero value (an untyped, empty object) which
+// fails tfsdk.Set against the schema's typed timeouts block; normalizing to a
+// typed null keeps the create/update/delete defaults in force.
+func nullTimeouts() timeouts.Value {
+	return timeouts.Value{Object: types.ObjectNull(map[string]attr.Type{
+		"create": types.StringType,
+		"update": types.StringType,
+		"delete": types.StringType,
+	})}
+}
 
 // wsSpecYAML is a minimal, valid single-host windows_service deployment at the
 // given artifact version. The checksum is a well-formed sha256:<64 hex> so the
@@ -239,7 +257,7 @@ func TestStateSpecCorruptSnapshotErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("corrupt resolved_spec must return an error, not fall back to spec_file")
 	}
-	if !strings.Contains(err.Error(), "ERR_STATE_CORRUPT") {
+	if !strings.Contains(err.Error(), "ERR_SPEC_INVALID") {
 		t.Fatalf("error must be a state-corruption diagnostic, got %v", err)
 	}
 }
@@ -285,6 +303,7 @@ func deleteReqForModel(t *testing.T, r *DeploymentResource, m *deploymentModel) 
 	sr := resource.SchemaResponse{}
 	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)
 	st := tfsdk.State{Schema: sr.Schema}
+	m.Timeouts = nullTimeouts()
 	if diags := st.Set(context.Background(), m); diags.HasError() {
 		t.Fatalf("build state: %v", diags)
 	}
@@ -326,11 +345,13 @@ func runModifyPlan(t *testing.T, r *DeploymentResource, plan, state *deploymentM
 	sr := resource.SchemaResponse{}
 	r.Schema(ctx, resource.SchemaRequest{}, &sr)
 	p := tfsdk.Plan{Schema: sr.Schema}
+	plan.Timeouts = nullTimeouts()
 	if d := p.Set(ctx, plan); d.HasError() {
 		t.Fatalf("build plan: %v", d)
 	}
 	st := tfsdk.State{Schema: sr.Schema} // nil state ⇒ Raw stays null ⇒ create path
 	if state != nil {
+		state.Timeouts = nullTimeouts()
 		if d := st.Set(ctx, state); d.HasError() {
 			t.Fatalf("build state: %v", d)
 		}
@@ -445,6 +466,7 @@ func runCreate(t *testing.T, r *DeploymentResource, plan *deploymentModel) *reso
 	sr := resource.SchemaResponse{}
 	r.Schema(ctx, resource.SchemaRequest{}, &sr)
 	p := tfsdk.Plan{Schema: sr.Schema}
+	plan.Timeouts = nullTimeouts()
 	if d := p.Set(ctx, plan); d.HasError() {
 		t.Fatalf("build plan: %v", d)
 	}
@@ -534,8 +556,8 @@ func TestPriorFromStateCorruptSnapshotErrors(t *testing.T) {
 	if prior != nil {
 		t.Fatal("corrupt resolved_spec must not yield a prior deployment")
 	}
-	if !strings.Contains(err.Error(), "ERR_STATE_CORRUPT") {
-		t.Fatalf("expected ERR_STATE_CORRUPT, got %q", err.Error())
+	if !strings.Contains(err.Error(), "ERR_SPEC_INVALID") {
+		t.Fatalf("expected ERR_SPEC_INVALID, got %q", err.Error())
 	}
 	if !strings.Contains(err.Error(), "terraform state rm") {
 		t.Fatalf("corrupt-state recovery must be executable (terraform state rm), got %q", err.Error())
@@ -571,6 +593,7 @@ func runUpgrade(t *testing.T, r *DeploymentResource, legacy *deploymentModel) (d
 		t.Fatal("expected a v0 state upgrader with a PriorSchema")
 	}
 	prior := tfsdk.State{Schema: *u.PriorSchema}
+	legacy.Timeouts = nullTimeouts()
 	if diags := prior.Set(context.Background(), legacy); diags.HasError() {
 		t.Fatalf("build prior state: %v", diags)
 	}
@@ -726,3 +749,582 @@ func TestUpgradeStateUnresolvableStaysFailSafe(t *testing.T) {
 		t.Fatal("unresolvable legacy state must keep resolved_spec empty (fail-safe)")
 	}
 }
+
+// clusterSpecYAMLHosts is a valid multi-host cluster_generic_service deployment,
+// used to exercise target.hosts set semantics (reorder vs add/remove) at the
+// plan layer. The single-host wsSpecYAML forms cannot carry 2 hosts (validation
+// requires exactly one for windows_service), so the plan-level host tests use
+// this cluster form.
+func clusterSpecYAMLHosts(hosts ...string) string {
+	hl := `["` + strings.Join(hosts, `", "`) + `"]`
+	return fmt.Sprintf(`apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: winrm
+  hosts: %s
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:%064d"
+  source: { type: http, url: "http://example.test/a.zip" }
+pattern:
+  type: cluster_generic_service
+  service_name: SampleSvc
+  role_name: SampleRole
+  exe: bin\SampleSvc.exe
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, hl, 0)
+}
+
+// wsSpecServiceYAML is wsSpecYAML with a configurable pattern.service_name, for
+// driving a service_name (immutable) change through ModifyPlan.
+func wsSpecServiceYAML(service, host string) string {
+	return fmt.Sprintf(`apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: winrm
+  hosts: ["%s"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:%064d"
+  source: { type: http, url: "http://example.test/a.zip" }
+pattern:
+  type: windows_service
+  service_name: %s
+  exe: bin\SampleSvc.exe
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, host, 0, service)
+}
+
+// dotnetSpecYAML is a valid dotnet_api single-host windows spec sharing the same
+// metadata.name/service_name/host as wsSpecYAML, so switching between them isolates
+// pattern.type as the changed immutable field.
+func dotnetSpecYAML(host string) string {
+	return fmt.Sprintf(`apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: winrm
+  hosts: ["%s"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:%064d"
+  source: { type: http, url: "http://example.test/a.zip" }
+pattern:
+  type: dotnet_api
+  service_name: SampleSvc
+  launcher: exe
+  exe: bin\SampleSvc.exe
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, host, 0)
+}
+
+// consoleSpecYAML is a console_app spec parametrized by target.os (console_app is one
+// of the few patterns valid on both windows and linux), for driving a target.os
+// (immutable) change through ModifyPlan with no other field varying.
+func consoleSpecYAML(os, host string) string {
+	return fmt.Sprintf(`apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: winrm
+  hosts: ["%s"]
+  os: %s
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "sha256:%064d"
+  source: { type: http, url: "http://example.test/a.zip" }
+pattern:
+  type: console_app
+  exe: bin\SampleSvc.exe
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, host, os, 0)
+}
+
+func wsDeployment(ptype spec.PatternType, service, role, name, os string, hosts ...string) *spec.Deployment {
+	d := &spec.Deployment{
+		Metadata: spec.Metadata{Name: name},
+		Target:   spec.Target{Hosts: hosts, OS: spec.OSKind(os)},
+	}
+	d.Pattern.Type = ptype
+	d.Pattern.ServiceName = service
+	d.Pattern.RoleName = role
+	return d
+}
+
+// TestImmutableKeyHostReorderEqual proves the "host reorder is not a replace"
+// scenario at the immutableKey layer: [a,b] and [b,a] compare equal because hosts
+// are compared as a SET (lower-cased + sorted), per architecture.md line 350.
+func TestImmutableKeyHostReorderEqual(t *testing.T) {
+	ab := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "app", "windows", "lab-a", "lab-b")
+	ba := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "app", "windows", "lab-b", "lab-a")
+	if immutableKey(ab) != immutableKey(ba) {
+		t.Fatalf("host reorder must NOT change immutableKey:\n [a,b]=%q\n [b,a]=%q", immutableKey(ab), immutableKey(ba))
+	}
+	// Case-insensitive set: LAB-A vs lab-a must not differ either.
+	mixed := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "app", "windows", "LAB-B", "LAB-A")
+	if immutableKey(ab) != immutableKey(mixed) {
+		t.Fatalf("host case/order must not change immutableKey: %q vs %q", immutableKey(ab), immutableKey(mixed))
+	}
+}
+
+// TestImmutableKeyImmutablePathsDiffer proves the T9 scenario at the immutableKey
+// layer: a change to pattern.type, service_name, target.hosts (set membership), or
+// target.os each yields a different key (so ModifyPlan appends RequiresReplace).
+func TestImmutableKeyImmutablePathsDiffer(t *testing.T) {
+	base := wsDeployment(spec.PatternWindowsService, "Svc", "", "app", "windows", "lab-a")
+	cases := map[string]*spec.Deployment{
+		"pattern.type":  wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "app", "windows", "lab-a", "lab-b"),
+		"service_name":  wsDeployment(spec.PatternWindowsService, "Other", "", "app", "windows", "lab-a"),
+		"target.hosts":  wsDeployment(spec.PatternWindowsService, "Svc", "", "app", "windows", "lab-z"),
+		"metadata.name": wsDeployment(spec.PatternWindowsService, "Svc", "", "other", "windows", "lab-a"),
+		"target.os":     wsDeployment(spec.PatternWindowsService, "Svc", "", "app", "linux", "lab-a"),
+	}
+	for name, changed := range cases {
+		if immutableKey(base) == immutableKey(changed) {
+			t.Fatalf("changing %s must change immutableKey, but it stayed %q", name, immutableKey(base))
+		}
+	}
+}
+
+// TestDeploymentIDDeterministicSHA1 proves the "deterministic SHA-1 id" scenario:
+// id == sha1(sorted(hosts)+"/"+name)[0:12] + ":" + name, and is byte-identical
+// when the same hosts are supplied in a different order (architecture.md line 78).
+func TestDeploymentIDDeterministicSHA1(t *testing.T) {
+	d1 := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "n", "windows", "b", "a")
+	d2 := wsDeployment(spec.PatternClusterGeneric, "Svc", "Role", "n", "windows", "a", "b")
+	got := deploymentID(d1)
+
+	sum := sha1.Sum([]byte("a,b/n"))
+	want := hex.EncodeToString(sum[:])[:12] + ":n"
+	if got != want {
+		t.Fatalf("deploymentID = %q, want authoritative formula %q", got, want)
+	}
+	if deploymentID(d1) != deploymentID(d2) {
+		t.Fatalf("deploymentID must be host-order-independent: %q vs %q", deploymentID(d1), deploymentID(d2))
+	}
+	if len(strings.SplitN(got, ":", 2)[0]) != 12 {
+		t.Fatalf("deploymentID hash prefix must be 12 chars, got %q", got)
+	}
+	if !strings.HasSuffix(got, ":n") {
+		t.Fatalf("deploymentID must end with :<name>, got %q", got)
+	}
+}
+
+// TestDiagSummaryCoded is the unit-level contract for the Summary formatter and the
+// DESIGN §8.1-vs-§12 timeout taxonomy. Classification keys on the OPERATION CONTEXT:
+//   - outer resource context expired            → ERR_TIMEOUT (TF/runner timeout)
+//   - outer context LIVE + coded engine error   → the engine's taxonomy code
+//   - outer context LIVE + nested transport      → ERR_CONNECT even though the error's
+//     Unwrap chain carries context.DeadlineExceeded (a dial/WinRM child deadline)
+//   - non-coded pre-flight error                → the operation fallback code
+//
+// Every result is the exact "[<CODE>] <short>" shape.
+func TestDiagSummaryCoded(t *testing.T) {
+	liveCtx := context.Background()
+	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+	defer cancel()
+	if expiredCtx.Err() != context.DeadlineExceeded {
+		t.Fatalf("test setup: expiredCtx must be DeadlineExceeded, got %v", expiredCtx.Err())
+	}
+	cases := []struct {
+		name     string
+		ctx      context.Context
+		fallback string
+		err      error
+		want     string
+	}{
+		{"coded", liveCtx, "ERR_SPEC_INVALID", &engine.CodedError{Code: "ERR_CONNECT", Err: fmt.Errorf("x")}, "[ERR_CONNECT] deploy failed"},
+		{"fallback", liveCtx, "ERR_SPEC_INVALID", fmt.Errorf("plain"), "[ERR_SPEC_INVALID] deploy failed"},
+		// Live outer context + nested transport/dial deadline: STAYS ERR_CONNECT.
+		{"live-ctx-nested-transport-deadline", liveCtx, "ERR_CONNECT",
+			&engine.CodedError{Code: "ERR_CONNECT", Err: fmt.Errorf("dial: %w", context.DeadlineExceeded)},
+			"[ERR_CONNECT] deploy failed"},
+		{"live-ctx-bare-deadline", liveCtx, "ERR_CONNECT", context.DeadlineExceeded, "[ERR_CONNECT] deploy failed"},
+		// Expired outer resource context ⇒ ERR_TIMEOUT regardless of the wrapped code.
+		{"expired-ctx-timeout", expiredCtx, "ERR_CONNECT",
+			&engine.CodedError{Code: "ERR_CONNECT", Err: fmt.Errorf("d: %w", context.DeadlineExceeded)},
+			"[ERR_TIMEOUT] deploy failed"},
+		{"expired-ctx-plain-err", expiredCtx, "ERR_CONNECT", fmt.Errorf("plain"), "[ERR_TIMEOUT] deploy failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := diagSummary(tc.ctx, tc.fallback, "deploy failed", tc.err); got != tc.want {
+				t.Fatalf("diagSummary = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTimeoutDefaults proves the "timeout defaults" scenario: the schema exposes a
+// timeouts block, and with no explicit timeouts configured create/update default to
+// 30m and delete to 15m (DESIGN §5.2).
+func TestTimeoutDefaults(t *testing.T) {
+	ctx := context.Background()
+	sr := resource.SchemaResponse{}
+	(&DeploymentResource{}).Schema(ctx, resource.SchemaRequest{}, &sr)
+	if _, ok := sr.Schema.Blocks["timeouts"]; !ok {
+		t.Fatal("schema must declare a timeouts block")
+	}
+	if defaultCreateTimeout != 30*time.Minute || defaultUpdateTimeout != 30*time.Minute || defaultDeleteTimeout != 15*time.Minute {
+		t.Fatalf("timeout defaults wrong: create=%s update=%s delete=%s", defaultCreateTimeout, defaultUpdateTimeout, defaultDeleteTimeout)
+	}
+	// A null (unconfigured) timeouts value resolves to the operation defaults.
+	to := nullTimeouts()
+	if got, d := to.Create(ctx, defaultCreateTimeout); d.HasError() || got != 30*time.Minute {
+		t.Fatalf("create default = %s (diags %v), want 30m", got, d)
+	}
+	if got, d := to.Update(ctx, defaultUpdateTimeout); d.HasError() || got != 30*time.Minute {
+		t.Fatalf("update default = %s (diags %v), want 30m", got, d)
+	}
+	if got, d := to.Delete(ctx, defaultDeleteTimeout); d.HasError() || got != 15*time.Minute {
+		t.Fatalf("delete default = %s (diags %v), want 15m", got, d)
+	}
+}
+
+// TestImportUnsupported proves the "import unsupported" scenario: ImportState emits
+// the pinned message "import is not supported; adopt via apply" (DESIGN §5.2).
+func TestImportUnsupported(t *testing.T) {
+	r := &DeploymentResource{}
+	resp := &resource.ImportStateResponse{}
+	r.ImportState(context.Background(), resource.ImportStateRequest{ID: "anything"}, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("ImportState must surface an error")
+	}
+	if got := resp.Diagnostics.Errors()[0].Detail(); got != "import is not supported; adopt via apply" {
+		t.Fatalf("import error message = %q, want the pinned %q", got, "import is not supported; adopt via apply")
+	}
+}
+
+// TestModifyPlanHostReorderNoReplace proves the "host reorder is not a replace"
+// scenario end-to-end through ModifyPlan: a prior state with hosts [lab-01,lab-02]
+// and a new plan with [lab-02,lab-01] and no other change produces NO RequiresReplace.
+func TestModifyPlanHostReorderNoReplace(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	// New plan: hosts reordered.
+	if err := os.WriteFile(specPath, []byte(clusterSpecYAMLHosts("lab-02", "lab-01")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	// Prior persisted snapshot: hosts in the original order.
+	priorSpec, priorHash, err := r.resolveSpec(context.Background(),
+		&deploymentModel{Spec: types.StringValue(clusterSpecYAMLHosts("lab-01", "lab-02")), SpecFile: types.StringNull(),
+			Variables: types.MapNull(types.StringType)})
+	if err != nil {
+		t.Fatalf("resolve prior: %v", err)
+	}
+	plan := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	state := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: marshalResolvedSpec(priorSpec), SpecHash: types.StringValue(priorHash),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runModifyPlan(t, r, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("reorder plan must not error: %v", resp.Diagnostics.Errors())
+	}
+	if len(resp.RequiresReplace) != 0 {
+		t.Fatalf("host reorder must NOT force replacement, got RequiresReplace=%v", resp.RequiresReplace)
+	}
+}
+
+// TestModifyPlanImmutableHostChangeReplaces proves the T9 scenario end-to-end: a
+// plan changing target.hosts set membership (lab-02 → lab-03) forces RequiresReplace.
+func TestModifyPlanImmutableHostChangeReplaces(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(specPath, []byte(clusterSpecYAMLHosts("lab-01", "lab-03")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	priorSpec, priorHash, err := r.resolveSpec(context.Background(),
+		&deploymentModel{Spec: types.StringValue(clusterSpecYAMLHosts("lab-01", "lab-02")), SpecFile: types.StringNull(),
+			Variables: types.MapNull(types.StringType)})
+	if err != nil {
+		t.Fatalf("resolve prior: %v", err)
+	}
+	plan := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	state := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: marshalResolvedSpec(priorSpec), SpecHash: types.StringValue(priorHash),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runModifyPlan(t, r, plan, state)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("immutable-change plan must not error: %v", resp.Diagnostics.Errors())
+	}
+	if len(resp.RequiresReplace) == 0 {
+		t.Fatal("changing target.hosts set membership must force RequiresReplace")
+	}
+}
+
+// TestCreateSurfacesCodedDeployError proves the coded-diagnostic contract on the
+// Create path itself: when the engine deploy fails with an ERR_CONNECT CodedError,
+// the Create diagnostic Summary begins "[ERR_CONNECT] " (DESIGN §12).
+func TestCreateSurfacesCodedDeployError(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeErrEngine{err: &engine.CodedError{Code: "ERR_CONNECT", Host: "lab-01",
+		Step: "PREFLIGHT", Err: fmt.Errorf("dial tcp: connection refused")}}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	plan := &deploymentModel{Spec: types.StringValue(wsSpecYAML("1.0.0")), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runCreate(t, r, plan)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Create must surface the engine deploy failure")
+	}
+	sum := resp.Diagnostics.Errors()[0].Summary()
+	if !strings.HasPrefix(sum, "[ERR_CONNECT] ") {
+		t.Fatalf("deploy failure Summary must begin with the coded prefix, got %q", sum)
+	}
+}
+
+// TestCreateNestedTransportDeadlineIsConnect proves the DESIGN §8.1 side of the
+// timeout taxonomy end-to-end: when the OUTER resource operation context is still
+// live but the engine surfaces a nested dial/transport child deadline (an ERR_CONNECT
+// CodedError whose Unwrap chain carries context.DeadlineExceeded), Create must keep
+// the ERR_CONNECT code — the child deadline is a connectivity failure, not a TF timeout.
+func TestCreateNestedTransportDeadlineIsConnect(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	// Engine surfaces the deadline the way wrapTransportErr does: an ERR_CONNECT
+	// CodedError whose Unwrap chain still carries context.DeadlineExceeded. runCreate's
+	// outer context uses the default 30m create timeout, so it is LIVE here.
+	fake := &fakeErrEngine{err: &engine.CodedError{Code: "ERR_CONNECT", Host: "lab-01",
+		Step: "PREFLIGHT", Err: fmt.Errorf("dial: %w", context.DeadlineExceeded)}}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	plan := &deploymentModel{Spec: types.StringValue(wsSpecYAML("1.0.0")), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runCreate(t, r, plan)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Create must surface the deploy failure")
+	}
+	sum := resp.Diagnostics.Errors()[0].Summary()
+	if !strings.HasPrefix(sum, "[ERR_CONNECT] ") {
+		t.Fatalf("nested transport deadline under a live resource context must stay [ERR_CONNECT], got %q", sum)
+	}
+}
+
+// TestCreateResourceDeadlineIsTimeout proves the DESIGN §12 side of the taxonomy
+// end-to-end: when the OUTER Terraform resource-operation deadline (the create
+// timeout block) actually expires, Create maps the failure to ERR_TIMEOUT. The
+// engine blocks until the operation context is Done, so the classifier observes the
+// expired resource context (not merely a DeadlineExceeded buried in the error).
+func TestCreateResourceDeadlineIsTimeout(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	r := &DeploymentResource{newEngine: func() deployEngine { return &blockingEngine{} }}
+	ctx := context.Background()
+	sr := resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, &sr)
+	p := tfsdk.Plan{Schema: sr.Schema}
+	plan := &deploymentModel{Spec: types.StringValue(wsSpecYAML("1.0.0")), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType),
+		Timeouts: shortTimeouts(t, "1ms")}
+	if d := p.Set(ctx, plan); d.HasError() {
+		t.Fatalf("build plan: %v", d)
+	}
+	resp := &resource.CreateResponse{State: tfsdk.State{Schema: sr.Schema}}
+	r.Create(ctx, resource.CreateRequest{Plan: p}, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Create must surface the resource-timeout failure")
+	}
+	sum := resp.Diagnostics.Errors()[0].Summary()
+	if !strings.HasPrefix(sum, "[ERR_TIMEOUT] ") {
+		t.Fatalf("expired resource context must map to [ERR_TIMEOUT], got %q", sum)
+	}
+}
+
+// shortTimeouts builds a timeouts.Value whose create attribute is the given duration
+// string (e.g. "1ms"), so a test can drive an operation context that expires promptly.
+func shortTimeouts(t *testing.T, create string) timeouts.Value {
+	t.Helper()
+	obj, d := types.ObjectValue(
+		map[string]attr.Type{"create": types.StringType, "update": types.StringType, "delete": types.StringType},
+		map[string]attr.Value{"create": types.StringValue(create), "update": types.StringNull(), "delete": types.StringNull()},
+	)
+	if d.HasError() {
+		t.Fatalf("build timeouts: %v", d)
+	}
+	return timeouts.Value{Object: obj}
+}
+
+// blockingEngine blocks each engine call until the operation context is Done, then
+// returns that context's error — modelling a real transport whose in-flight operation
+// is aborted when the outer resource deadline fires.
+type blockingEngine struct{}
+
+func (*blockingEngine) Update(ctx context.Context, _, _ *spec.Deployment) (*engine.Status, error) {
+	<-ctx.Done()
+	return nil, fmt.Errorf("deploy aborted: %w", ctx.Err())
+}
+func (*blockingEngine) ReadStatus(ctx context.Context, _ *spec.Deployment) (*engine.Status, error) {
+	<-ctx.Done()
+	return nil, fmt.Errorf("read aborted: %w", ctx.Err())
+}
+func (*blockingEngine) Destroy(ctx context.Context, _ *spec.Deployment, _ string) error {
+	<-ctx.Done()
+	return fmt.Errorf("destroy aborted: %w", ctx.Err())
+}
+func (*blockingEngine) Warns() []string { return nil }
+
+// TestModifyPlanImmutablePathsRequireReplace is the T9 plan-level proof that a change
+// to EACH immutable path — pattern.type, service_name, and target.os (target.hosts is
+// covered by TestModifyPlanImmutableHostChangeReplaces) — forces RequiresReplace when
+// driven end-to-end through ModifyPlan, not merely compared via immutableKey. Each case
+// varies exactly one immutable field against an otherwise-identical prior snapshot.
+func TestModifyPlanImmutablePathsRequireReplace(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	r := &DeploymentResource{}
+	// resolvePrior builds a persisted resolved_spec snapshot the way an apply would.
+	resolvePrior := func(t *testing.T, yaml string) types.String {
+		t.Helper()
+		ps, _, err := r.resolveSpec(context.Background(),
+			&deploymentModel{Spec: types.StringValue(yaml), SpecFile: types.StringNull(),
+				Variables: types.MapNull(types.StringType)})
+		if err != nil {
+			t.Fatalf("resolve prior: %v", err)
+		}
+		return marshalResolvedSpec(ps)
+	}
+	// console_app resolved specs cannot round-trip marshalResolvedSpec (the flat Pattern's
+	// non-pointer Account struct always marshals as `"account":{}`, which the concrete
+	// console_app schema rejects on strict re-decode) — a spec-package union limitation
+	// unrelated to this stage. So the target.os case supplies a hand-built decodable prior
+	// snapshot carrying only console_app-legal fields, at os=windows.
+	consolePriorWindows := types.StringValue(
+		`{"metadata":{"name":"sample-svc"},"target":{"transport":"winrm","hosts":["lab-01"],` +
+			`"os":"windows","credentials":{"username":"u","password_env":"LABDEPLOY_PASSWORD"}},` +
+			`"pattern":{"type":"console_app","exe":"bin\\SampleSvc.exe"}}`)
+	cases := []struct {
+		name    string
+		prior   types.String
+		newYAML string
+	}{
+		{"pattern.type", resolvePrior(t, wsSpecYAMLHost("1.0.0", "lab-01")), dotnetSpecYAML("lab-01")},
+		{"service_name", resolvePrior(t, wsSpecServiceYAML("SampleSvc", "lab-01")), wsSpecServiceYAML("OtherSvc", "lab-01")},
+		{"target.os", consolePriorWindows, consoleSpecYAML("linux", "lab-01")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			specPath := filepath.Join(dir, "spec.yaml")
+			if err := os.WriteFile(specPath, []byte(tc.newYAML), 0o600); err != nil {
+				t.Fatalf("write spec: %v", err)
+			}
+			plan := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+				ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+				Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+			state := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+				ResolvedSpec: tc.prior, SpecHash: types.StringValue("prior-hash"),
+				Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+			resp := runModifyPlan(t, r, plan, state)
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("%s change plan must not error: %v", tc.name, resp.Diagnostics.Errors())
+			}
+			if len(resp.RequiresReplace) == 0 {
+				t.Fatalf("changing immutable path %s must force RequiresReplace", tc.name)
+			}
+		})
+	}
+}
+
+// TestCreatePersistsAllComputedOutputs proves the Stage 5.2 computed-output contract:
+// every computed attribute is populated in persisted state FROM the engine result —
+// deployed_version, previous_version, hosts, release_path, service_status, spec_hash,
+// name, and the deterministic id — asserted together off one fully-populated status.
+func TestCreatePersistsAllComputedOutputs(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	fake := &fakeDeployEngine{status: &engine.Status{
+		DeployedVersion: "2.1.0",
+		PreviousVersion: "2.0.0",
+		ReleasePath:     `C:\labdeploy\releases\2.1.0`,
+		ServiceStatus:   "running",
+		Hosts:           []string{"lab-01"},
+	}}
+	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
+	plan := &deploymentModel{Spec: types.StringValue(wsSpecYAML("2.1.0")), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runCreate(t, r, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Create must succeed, got %v", resp.Diagnostics.Errors())
+	}
+	var st deploymentModel
+	if d := resp.State.Get(context.Background(), &st); d.HasError() {
+		t.Fatalf("read persisted state: %v", d)
+	}
+	if got := st.DeployedVersion.ValueString(); got != "2.1.0" {
+		t.Errorf("deployed_version = %q, want 2.1.0", got)
+	}
+	if got := st.PreviousVersion.ValueString(); got != "2.0.0" {
+		t.Errorf("previous_version = %q, want 2.0.0", got)
+	}
+	if got := st.ReleasePath.ValueString(); got != `C:\labdeploy\releases\2.1.0` {
+		t.Errorf("release_path = %q, want release dir", got)
+	}
+	if got := st.ServiceStatus.ValueString(); got != "running" {
+		t.Errorf("service_status = %q, want running", got)
+	}
+	if st.SpecHash.ValueString() == "" {
+		t.Error("spec_hash must be populated")
+	}
+	if got := st.Name.ValueString(); got != "sample-svc" {
+		t.Errorf("name = %q, want sample-svc", got)
+	}
+	var hosts []string
+	if d := st.Hosts.ElementsAs(context.Background(), &hosts, false); d.HasError() {
+		t.Fatalf("read hosts: %v", d)
+	}
+	if len(hosts) != 1 || hosts[0] != "lab-01" {
+		t.Errorf("hosts = %v, want [lab-01]", hosts)
+	}
+	// id must equal the authoritative deterministic formula sha1(sorted(hosts)+"/"+name)[0:12]+":"+name.
+	wantID := deploymentID(&spec.Deployment{
+		Metadata: spec.Metadata{Name: "sample-svc"},
+		Target:   spec.Target{Hosts: []string{"lab-01"}},
+	})
+	if got := st.ID.ValueString(); got != wantID {
+		t.Errorf("id = %q, want %q", got, wantID)
+	}
+}
+
+// fakeErrEngine is a deployEngine whose Update fails with a fixed coded error, so
+// the resource's coded-diagnostic mapping can be exercised without a live transport.
+type fakeErrEngine struct{ err error }
+
+func (f *fakeErrEngine) Update(_ context.Context, _, _ *spec.Deployment) (*engine.Status, error) {
+	return nil, f.err
+}
+func (f *fakeErrEngine) ReadStatus(_ context.Context, _ *spec.Deployment) (*engine.Status, error) {
+	return nil, f.err
+}
+func (f *fakeErrEngine) Destroy(_ context.Context, _ *spec.Deployment, _ string) error { return f.err }
+func (f *fakeErrEngine) Warns() []string                                               { return nil }
