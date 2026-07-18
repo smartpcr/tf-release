@@ -25,6 +25,7 @@ var (
 	_ resource.ResourceWithModifyPlan       = (*DeploymentResource)(nil)
 	_ resource.ResourceWithImportState      = (*DeploymentResource)(nil)
 	_ resource.ResourceWithConfigValidators = (*DeploymentResource)(nil)
+	_ resource.ResourceWithUpgradeState     = (*DeploymentResource)(nil)
 )
 
 func NewDeploymentResource() resource.Resource { return &DeploymentResource{} }
@@ -58,7 +59,17 @@ func (r *DeploymentResource) Metadata(_ context.Context, req resource.MetadataRe
 }
 
 func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
-	resp.Schema = schema.Schema{
+	resp.Schema = deploymentSchema(1)
+}
+
+// deploymentSchema builds the resource schema at the given version. The attribute
+// shape is identical across versions — only Version differs — so the same builder
+// serves both the current Schema (v1) and the UpgradeState PriorSchema (v0). The v0→v1
+// bump exists solely to trigger the state upgrader that backfills resolved_spec for
+// legacy state persisted before the snapshot was populated.
+func deploymentSchema(version int64) schema.Schema {
+	return schema.Schema{
+		Version:             version,
 		MarkdownDescription: "One application deployed to one host or one WSFC cluster (DESIGN §5.2).",
 		Attributes: map[string]schema.Attribute{
 			"spec":      schema.StringAttribute{Optional: true, MarkdownDescription: "Inline YAML/JSON Deployment spec. Exactly one of spec/spec_file."},
@@ -79,6 +90,47 @@ func (r *DeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest,
 			"hosts":            schema.ListAttribute{Computed: true, ElementType: types.StringType},
 			"release_path":     schema.StringAttribute{Computed: true},
 			"service_status":   schema.StringAttribute{Computed: true},
+		},
+	}
+}
+
+// UpgradeState migrates state persisted at an earlier schema version. The v0→v1
+// upgrader BACKFILLS resolved_spec for legacy state written before the snapshot
+// attribute was populated, converting an unverifiable spec_file deployment into a
+// VERIFIED snapshot BEFORE any plan/refresh acts on it. This is the migration path
+// that breaks the legacy deadlock (ModifyPlan forcing replacement ↔ Delete refusing
+// snapshot-less state) WITHOUT any unsafe deletion: the snapshot is reconstructed from
+// the spec_file/spec while it still reflects the deployed identity — i.e. right after a
+// provider upgrade, before the operator edits the config. If the spec can't be resolved
+// (e.g. spec_file removed) the snapshot is left empty and the downstream Read/Delete
+// guards keep the state fail-safe.
+func (r *DeploymentResource) UpgradeState(_ context.Context) map[int64]resource.StateUpgrader {
+	priorSchema := deploymentSchema(0)
+	return map[int64]resource.StateUpgrader{
+		0: {
+			PriorSchema: &priorSchema,
+			StateUpgrader: func(ctx context.Context, req resource.UpgradeStateRequest, resp *resource.UpgradeStateResponse) {
+				var state deploymentModel
+				resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+				if resp.Diagnostics.HasError() {
+					return
+				}
+				if state.ResolvedSpec.IsNull() || state.ResolvedSpec.ValueString() == "" {
+					if d, hash, err := r.resolveSpec(ctx, &state); err == nil {
+						state.ResolvedSpec = marshalResolvedSpec(d)
+						if state.SpecHash.IsNull() || state.SpecHash.ValueString() == "" {
+							state.SpecHash = types.StringValue(hash)
+						}
+					} else {
+						resp.Diagnostics.AddWarning("labdeploy state not fully migrated",
+							"could not reconstruct a resolved_spec snapshot for this legacy resource "+
+								"(the spec could not be resolved: "+err.Error()+"). Lifecycle operations "+
+								"remain fail-safe; run terraform apply once the spec is resolvable to persist "+
+								"the snapshot.")
+					}
+				}
+				resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+			},
 		},
 	}
 }
@@ -170,14 +222,13 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	// hiding immutable-field changes).
 	oldSpec := r.priorFromState(ctx, &state)
 	if oldSpec == nil {
-		// No faithful prior snapshot (state written before resolved_spec, from a
-		// spec_file whose on-disk contents cannot be trusted as the prior). We cannot
-		// honestly Reconfigure — that needs the ACTUAL prior configuration for
-		// changed-post_install detection, rollback restoration, and prior-health
-		// validation. When the resolved spec has actually changed, force a REPLACEMENT
-		// so the change is applied via a full, truthful create/deploy (which also
-		// persists resolved_spec, self-healing the legacy state for future updates).
-		// No drift ⇒ nothing to migrate.
+		// No faithful prior snapshot. Normally the v0→v1 state upgrader (UpgradeState)
+		// has already backfilled resolved_spec for legacy state before planning, so this
+		// branch is only reached when even the upgrader could not reconstruct a snapshot
+		// (e.g. the spec_file was unresolvable at upgrade time). We cannot honestly
+		// Reconfigure without the ACTUAL prior configuration, so when the resolved spec
+		// really changed, force a REPLACEMENT to apply the change via a full, truthful
+		// create/deploy (which also persists resolved_spec). No drift ⇒ nothing to do.
 		if legacyReplaceRequired(oldSpec, newHash, &state) {
 			resp.RequiresReplace = append(resp.RequiresReplace, path.Root("spec_hash"))
 		}

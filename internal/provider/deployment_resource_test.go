@@ -283,3 +283,84 @@ func TestDeleteRejectsUnverifiedLegacyState(t *testing.T) {
 		t.Fatalf("expected migration diagnostic, got %q", resp.Diagnostics.Errors()[0].Summary())
 	}
 }
+
+// TestUpgradeStateBackfillsResolvedSpec covers item 2 (iter-26 review): the v0→v1 state
+// upgrader must reconstruct a resolved_spec snapshot for legacy spec_file state BEFORE
+// any plan/refresh runs, converting an unverifiable identity into a verified one without
+// any unsafe deletion — this is what breaks the legacy migration deadlock.
+func TestUpgradeStateBackfillsResolvedSpec(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-01")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	up := r.UpgradeState(context.Background())
+	u, ok := up[0]
+	if !ok || u.PriorSchema == nil {
+		t.Fatal("expected a v0 state upgrader with a PriorSchema")
+	}
+	// Legacy v0 state: spec_file set, NO resolved_spec snapshot.
+	prior := tfsdk.State{Schema: *u.PriorSchema}
+	legacy := &deploymentModel{SpecFile: types.StringValue(path), ResolvedSpec: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	if diags := prior.Set(context.Background(), legacy); diags.HasError() {
+		t.Fatalf("build prior state: %v", diags)
+	}
+	sr := resource.SchemaResponse{}
+	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)
+	resp := &resource.UpgradeStateResponse{State: tfsdk.State{Schema: sr.Schema}}
+	u.StateUpgrader(context.Background(), resource.UpgradeStateRequest{State: &prior}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("upgrade errored: %v", resp.Diagnostics)
+	}
+	var upgraded deploymentModel
+	if diags := resp.State.Get(context.Background(), &upgraded); diags.HasError() {
+		t.Fatalf("read upgraded state: %v", diags)
+	}
+	if upgraded.ResolvedSpec.IsNull() || upgraded.ResolvedSpec.ValueString() == "" {
+		t.Fatal("upgrader must backfill resolved_spec for legacy spec_file state")
+	}
+	// The backfilled snapshot must now make stateSpec VERIFIED so Read/Delete no longer
+	// treat this state as unverifiable — the deadlock is broken.
+	_, _, verified, err := r.stateSpec(context.Background(), &upgraded)
+	if err != nil {
+		t.Fatalf("stateSpec after upgrade: %v", err)
+	}
+	if !verified {
+		t.Fatal("state must be VERIFIED after resolved_spec backfill")
+	}
+}
+
+// TestUpgradeStateUnresolvableStaysFailSafe covers the edge case where the legacy
+// spec_file can no longer be resolved (e.g. removed): the upgrader must NOT error the
+// whole refresh; it leaves resolved_spec empty (still fail-safe) and emits a warning.
+func TestUpgradeStateUnresolvableStaysFailSafe(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	r := &DeploymentResource{}
+	up := r.UpgradeState(context.Background())
+	u := up[0]
+	prior := tfsdk.State{Schema: *u.PriorSchema}
+	legacy := &deploymentModel{SpecFile: types.StringValue("/nonexistent/spec.yaml"),
+		ResolvedSpec: types.StringNull(), Hosts: types.ListNull(types.StringType),
+		Variables: types.MapNull(types.StringType)}
+	if diags := prior.Set(context.Background(), legacy); diags.HasError() {
+		t.Fatalf("build prior state: %v", diags)
+	}
+	sr := resource.SchemaResponse{}
+	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)
+	resp := &resource.UpgradeStateResponse{State: tfsdk.State{Schema: sr.Schema}}
+	u.StateUpgrader(context.Background(), resource.UpgradeStateRequest{State: &prior}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("upgrade must not hard-error on unresolvable spec: %v", resp.Diagnostics)
+	}
+	if resp.Diagnostics.WarningsCount() == 0 {
+		t.Fatal("upgrade must warn when it cannot reconstruct the snapshot")
+	}
+	var upgraded deploymentModel
+	resp.State.Get(context.Background(), &upgraded)
+	if !upgraded.ResolvedSpec.IsNull() && upgraded.ResolvedSpec.ValueString() != "" {
+		t.Fatal("unresolvable legacy state must keep resolved_spec empty (fail-safe)")
+	}
+}
