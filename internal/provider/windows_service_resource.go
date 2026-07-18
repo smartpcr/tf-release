@@ -25,7 +25,12 @@ var (
 	_ deploymentPattern                = (*windowsServiceModel)(nil)
 )
 
-// NewWindowsServiceResource is the factory registered with the provider.
+// NewWindowsServiceResource is the factory for the typed WindowsServiceResource.
+// It is RETAINED as an additive projection over labdeploy_deployment (operator KEEP
+// pin) but is intentionally NOT registered in provider.Resources(): the authorized
+// public contract is labdeploy_deployment + labdeploy_e2e_test only (DESIGN §5.2-5.3,
+// architecture.md §1). Re-register in provider.go to expose it (open question:
+// typed-resource-unregister-compromise).
 func NewWindowsServiceResource() resource.Resource { return &WindowsServiceResource{} }
 
 // WindowsServiceResource is the strongly-typed, single-target surface for the
