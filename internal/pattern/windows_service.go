@@ -130,7 +130,9 @@ if(-not $exists){
   else{               & sc.exe create $svc binPath= $bin start= %s DisplayName= %s }
   if($LASTEXITCODE -ne 0){ exit %d }
 } else {
-  & sc.exe config $svc binPath= $bin start= %s
+  if($env:LD_SVC_PW){ & sc.exe config $svc binPath= $bin start= %s DisplayName= %s obj= $obj password= $env:LD_SVC_PW }
+  elseif($obj){       & sc.exe config $svc binPath= $bin start= %s DisplayName= %s obj= $obj }
+  else{               & sc.exe config $svc binPath= $bin start= %s DisplayName= %s obj= LocalSystem }
   if($LASTEXITCODE -ne 0){ exit %d }
 }
 & sc.exe description $svc %s
@@ -142,7 +144,10 @@ exit 0`,
 		startTypeArg(st), psq(display),
 		startTypeArg(st), psq(display),
 		ExitSvcInstall,
-		startTypeArg(st), ExitSvcInstall,
+		startTypeArg(st), psq(display),
+		startTypeArg(st), psq(display),
+		startTypeArg(st), psq(display),
+		ExitSvcInstall,
 		descArg, ExitSvcInstall, recovery)
 	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, env, 120)
 	if err != nil {

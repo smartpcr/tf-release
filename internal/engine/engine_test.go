@@ -653,6 +653,37 @@ func TestReconfigureRestoreUsesPriorHealthCheck(t *testing.T) { // RBK-06: resto
 	}
 }
 
+func TestReconfigureRunsPostInstall(t *testing.T) { // config-only update must execute post_install
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpecPostInstall(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// A post_install-only change routes through Reconfigure; the hook MUST run so
+	// the value Terraform records is actually applied (not silently skipped).
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("reconfigure returned nil status")
+	}
+	order := strings.Join(f.log, ">")
+	if !strings.Contains(order, "POSTINSTALL") {
+		t.Fatalf("reconfigure must run the post_install hook, got %v", f.log)
+	}
+	for _, pair := range [][2]string{{"CONFIGURE", "POSTINSTALL"}, {"POSTINSTALL", "START"}} {
+		if strings.Index(order, pair[0]) > strings.Index(order, pair[1]) {
+			t.Fatalf("post_install order violated (%s before %s): %v", pair[0], pair[1], f.log)
+		}
+	}
+}
+
 func TestHealthFailureRollsBack(t *testing.T) { // RBK-01
 	p1 := []byte("v1")
 	url1, sum1, done1 := testArtifactServer(t, p1)

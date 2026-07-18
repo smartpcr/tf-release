@@ -10,7 +10,9 @@ if(-not $exists){
   else{               & sc.exe create $svc binPath= $bin start= auto DisplayName= 'Contoso Payments' }
   if($LASTEXITCODE -ne 0){ exit 46 }
 } else {
-  & sc.exe config $svc binPath= $bin start= auto
+  if($env:LD_SVC_PW){ & sc.exe config $svc binPath= $bin start= auto DisplayName= 'Contoso Payments' obj= $obj password= $env:LD_SVC_PW }
+  elseif($obj){       & sc.exe config $svc binPath= $bin start= auto DisplayName= 'Contoso Payments' obj= $obj }
+  else{               & sc.exe config $svc binPath= $bin start= auto DisplayName= 'Contoso Payments' obj= LocalSystem }
   if($LASTEXITCODE -ne 0){ exit 46 }
 }
 & sc.exe description $svc 'Handles payments'

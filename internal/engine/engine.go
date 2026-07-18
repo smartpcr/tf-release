@@ -785,23 +785,39 @@ func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Tra
 	// exception: DESIGN §9.3 sequences its post_install AFTER switch in <cur>, so
 	// the ConsoleApp pattern owns that hook (in Configure) — running it here too
 	// would execute post_install twice.
-	if hook := s.Pattern.PostInstall; hook != "" && s.Pattern.Type != spec.PatternConsoleApp {
-		var r transport.Result
-		var xerr error
-		if t.OS() == spec.OSWindows {
-			r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Env: rc.Env, TimeoutSec: 600,
-				Script: fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(p.Release), hook)})
-		} else {
-			r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Env: rc.Env, TimeoutSec: 600,
-				Script: fmt.Sprintf("cd %s && %s", shq(p.Release), hook)})
-		}
-		if xerr != nil {
-			return wrapTransportErr(xerr, host, "STAGE")
-		}
-		if r.ExitCode != 0 {
-			return coded("ERR_SERVICE_INSTALL", host, "STAGE",
-				fmt.Errorf("post_install exit=%d: %s", r.ExitCode, strings.TrimSpace(r.Stderr+r.Stdout)))
-		}
+	if err := e.runPostInstall(ctx, t, s, p.Release, rc, host); err != nil {
+		return err
+	}
+	return nil
+}
+
+// runPostInstall executes the pattern's post_install hook in the given release
+// directory (DESIGN §6.4). It is a no-op when no hook is configured or for the
+// console_app pattern (which sequences its own hook after switchover). It is
+// invoked both from staging (fresh/upgrade deploys) and from Reconfigure, so a
+// configuration-only update that changes post_install actually runs the new hook
+// rather than silently recording it in Terraform state.
+func (e *Engine) runPostInstall(ctx context.Context, t transport.Transport, s *spec.Deployment,
+	releasePath string, rc pattern.ReleaseCtx, host string) error {
+	hook := s.Pattern.PostInstall
+	if hook == "" || s.Pattern.Type == spec.PatternConsoleApp {
+		return nil
+	}
+	var r transport.Result
+	var xerr error
+	if t.OS() == spec.OSWindows {
+		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Env: rc.Env, TimeoutSec: 600,
+			Script: fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(releasePath), hook)})
+	} else {
+		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Env: rc.Env, TimeoutSec: 600,
+			Script: fmt.Sprintf("cd %s && %s", shq(releasePath), hook)})
+	}
+	if xerr != nil {
+		return wrapTransportErr(xerr, host, "STAGE")
+	}
+	if r.ExitCode != 0 {
+		return coded("ERR_SERVICE_INSTALL", host, "STAGE",
+			fmt.Errorf("post_install exit=%d: %s", r.ExitCode, strings.TrimSpace(r.Stderr+r.Stdout)))
 	}
 	return nil
 }
@@ -1320,6 +1336,14 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		}
 		if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
 			return coded("ERR_SERVICE_INSTALL", host, "CONFIGURE", err)
+		}
+		// Run the post_install hook against the (already staged) release so a
+		// configuration-only update that changes post_install actually executes it,
+		// rather than Terraform recording a value the machine never applied. rc.Spec
+		// is the deployment being (re)applied — the new one on the forward path, the
+		// prior one on the restore path.
+		if err := e.runPostInstall(ctx, t, rc.Spec, rp.Release, rc, host); err != nil {
+			return err
 		}
 		if err := sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rc) }); err != nil {
 			return err
