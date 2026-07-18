@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -110,14 +111,71 @@ func TestExactlyOneOfSpecValidatorWiredIntoResource(t *testing.T) {
 	}
 }
 
-// TestDeploymentSchemaRoundTrip proves Scenario "Schema round-trip": a fully-populated
-// deployment model written into state through the resource schema reads back with every
-// attribute intact — no arguments or computed attributes are dropped or mutated.
+// TestDeploymentSchemaRoundTrip proves Scenario "Schema round-trip". It enforces two
+// distinct guarantees so the doc-claim ("no arguments or computed attributes are dropped
+// or mutated") is actually backed by assertions rather than merely asserted in prose:
+//
+//  1. Surface completeness: every attribute DESIGN §5.2 mandates is present in the
+//     resource schema, and nothing outside §5.2's public surface — save the documented
+//     internal `resolved_spec` — leaks in. reflect.DeepEqual on the model alone is
+//     structurally blind to this: it only round-trips deploymentModel against the schema
+//     the model is written into, so an attribute missing from BOTH model and schema (as
+//     the computed `name` is today) would sail through as a false green — a floor, not a
+//     ceiling. This check turns any dropped or renamed §5.2 attribute into a failure.
+//  2. Value fidelity: a fully-populated model written into state reads back unmutated.
 func TestDeploymentSchemaRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	sr := resource.SchemaResponse{}
 	(&DeploymentResource{}).Schema(ctx, resource.SchemaRequest{}, &sr)
 
+	// (1) Surface completeness against DESIGN §5.2.
+	wantPublic := []string{
+		// Arguments (DESIGN §5.2).
+		"spec",
+		"spec_file",
+		"variables",
+		"version_override",
+		"destroy_mode",
+		// Computed (DESIGN §5.2).
+		"id",
+		"name",
+		"deployed_version",
+		"previous_version",
+		"hosts",
+		"release_path",
+		"service_status",
+		"spec_hash",
+	}
+	// resolved_spec is an internal-only computed attribute (see deployment_resource.go),
+	// deliberately outside §5.2's public surface. It is allow-listed here so the exact-
+	// surface comparison does not misreport it as an unsanctioned addition.
+	allowed := map[string]bool{"resolved_spec": true}
+	for _, n := range wantPublic {
+		allowed[n] = true
+	}
+
+	var missing []string
+	for _, n := range wantPublic {
+		if _, ok := sr.Schema.Attributes[n]; !ok {
+			missing = append(missing, n)
+		}
+	}
+	var unexpected []string
+	for n := range sr.Schema.Attributes {
+		if !allowed[n] {
+			unexpected = append(unexpected, n)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(unexpected)
+	if len(missing) > 0 {
+		t.Errorf("schema drops DESIGN §5.2 attribute(s) %v; the public surface silently deviates from the spec", missing)
+	}
+	if len(unexpected) > 0 {
+		t.Errorf("schema exposes attribute(s) %v outside DESIGN §5.2 (and the internal allow-list)", unexpected)
+	}
+
+	// (2) Value fidelity: a fully-populated model round-trips through state unmutated.
 	original := &deploymentModel{
 		ID:              types.StringValue("dep-123"),
 		Spec:            types.StringValue("kind: Deployment"),
