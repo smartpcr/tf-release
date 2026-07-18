@@ -104,7 +104,10 @@ func (p *LabDeployProvider) Configure(ctx context.Context, req provider.Configur
 			v := dt.WinRMUseHTTPS.ValueBool()
 			t.WinRM.UseHTTPS = &v
 		}
-		t.WinRM.InsecureSkipVerify = dt.WinRMInsecure.ValueBool()
+		if !dt.WinRMInsecure.IsNull() && !dt.WinRMInsecure.IsUnknown() {
+			v := dt.WinRMInsecure.ValueBool()
+			t.WinRM.InsecureSkipVerify = &v
+		}
 		if !dt.Hosts.IsNull() {
 			var hosts []string
 			resp.Diagnostics.Append(dt.Hosts.ElementsAs(ctx, &hosts, false)...)

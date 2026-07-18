@@ -283,7 +283,10 @@ func MergeTargetDefaults(t *Target, def *Target) {
 	if t.WinRM.UseHTTPS == nil {
 		t.WinRM.UseHTTPS = def.WinRM.UseHTTPS
 	}
-	if !t.WinRM.InsecureSkipVerify {
+	// Only inherit the default when the resource left insecure_skip_verify unset
+	// (nil). An explicit `false` is a deliberate secure choice and must NOT be
+	// overwritten by a default of `true`.
+	if t.WinRM.InsecureSkipVerify == nil {
 		t.WinRM.InsecureSkipVerify = def.WinRM.InsecureSkipVerify
 	}
 }

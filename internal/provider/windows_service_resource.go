@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -226,7 +227,7 @@ func (m *windowsServiceModel) buildDeployment(ctx context.Context, pd *providerD
 		Username:      m.Username.ValueString(),
 		PasswordEnv:   m.PasswordEnv.ValueString(),
 		WinRMUseHTTPS: m.WinRMUseHTTPS,
-		WinRMInsecure: m.WinRMInsecureSkipVerify.ValueBool(),
+		WinRMInsecure: m.WinRMInsecureSkipVerify,
 	})
 
 	version := m.Artifact.Version.ValueString()
@@ -276,12 +277,12 @@ func (r *WindowsServiceResource) prepare(ctx context.Context, m *windowsServiceM
 	}
 	std, err := newSingleTargetDeployment(d)
 	if err != nil {
-		diags.AddError("Invalid windows_service configuration", err.Error())
+		diags.AddError(wsDiagSummary("ERR_SPEC_INVALID", "invalid windows_service configuration", err), err.Error())
 		return nil, diags
 	}
 	hash, err := hashDeployment(d)
 	if err != nil {
-		diags.AddError("internal", fmt.Sprintf("spec hash: %v", err))
+		diags.AddError("[ERR_SPEC_INVALID] windows_service spec hash failed", fmt.Sprintf("spec hash: %v", err))
 		return nil, diags
 	}
 	m.ID = types.StringValue(std.id())
@@ -304,7 +305,7 @@ func (r *WindowsServiceResource) Create(ctx context.Context, req resource.Create
 	st, warns, err := std.apply(ctx)
 	appendWarnings(&resp.Diagnostics, warns)
 	if err != nil {
-		resp.Diagnostics.AddError("Deploy failed", err.Error())
+		resp.Diagnostics.AddError(wsDiagSummary("ERR_SERVICE_INSTALL", "windows_service deploy failed", err), err.Error())
 		return
 	}
 	fillWSStatus(&plan, st)
@@ -325,7 +326,7 @@ func (r *WindowsServiceResource) Update(ctx context.Context, req resource.Update
 	st, warns, err := std.apply(ctx)
 	appendWarnings(&resp.Diagnostics, warns)
 	if err != nil {
-		resp.Diagnostics.AddError("Deploy failed", err.Error())
+		resp.Diagnostics.AddError(wsDiagSummary("ERR_SERVICE_INSTALL", "windows_service update failed", err), err.Error())
 		return
 	}
 	fillWSStatus(&plan, st)
@@ -348,7 +349,7 @@ func (r *WindowsServiceResource) Read(ctx context.Context, req resource.ReadRequ
 	if err != nil {
 		// DESIGN §10.4: refresh MUST fail loudly on transport errors — an
 		// unreachable target is not a deleted resource. Retain prior state.
-		resp.Diagnostics.AddError("labdeploy read failed", err.Error())
+		resp.Diagnostics.AddError(wsDiagSummary("ERR_CONNECT", "windows_service read failed", err), err.Error())
 		return
 	}
 	if st == nil { // manifest absent ⇒ resource gone
@@ -372,7 +373,7 @@ func (r *WindowsServiceResource) Delete(ctx context.Context, req resource.Delete
 	}
 	std, err := newSingleTargetDeployment(d)
 	if err != nil {
-		resp.Diagnostics.AddError("Invalid windows_service configuration", err.Error())
+		resp.Diagnostics.AddError(wsDiagSummary("ERR_SPEC_INVALID", "invalid windows_service configuration", err), err.Error())
 		return
 	}
 	mode := state.DestroyMode.ValueString()
@@ -382,7 +383,7 @@ func (r *WindowsServiceResource) Delete(ctx context.Context, req resource.Delete
 	warns, err := std.destroy(ctx, mode)
 	appendWarnings(&resp.Diagnostics, warns)
 	if err != nil {
-		resp.Diagnostics.AddError("Destroy failed", err.Error())
+		resp.Diagnostics.AddError(wsDiagSummary("ERR_SERVICE_STOP", "windows_service destroy failed", err), err.Error())
 		return
 	}
 }
@@ -390,11 +391,25 @@ func (r *WindowsServiceResource) Delete(ctx context.Context, req resource.Delete
 // ImportState is unsupported in v1 (DESIGN §5.2): the typed attributes cannot be
 // reconstructed from the target manifest alone.
 func (r *WindowsServiceResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	resp.Diagnostics.AddError("Import not supported",
+	resp.Diagnostics.AddError("[ERR_SPEC_INVALID] windows_service import not supported",
 		"labdeploy_windows_service cannot be imported (DESIGN §5.2); re-apply the configuration instead.")
 }
 
 // --- helpers ----------------------------------------------------------------
+
+// wsDiagSummary formats a diagnostic Summary per DESIGN §12: exactly
+// "[<CODE>] <short>". Deploy/read/destroy failures bubble up from the engine as
+// *engine.CodedError carrying the taxonomy code; use it when present, otherwise
+// fall back to the operation-appropriate code so the contract still holds for
+// pre-flight (spec-construction) errors that never reached the engine.
+func wsDiagSummary(fallback, short string, err error) string {
+	code := fallback
+	var ce *engine.CodedError
+	if errors.As(err, &ce) && ce.Code != "" {
+		code = ce.Code
+	}
+	return fmt.Sprintf("[%s] %s", code, short)
+}
 
 func appendWarnings(diags *diag.Diagnostics, warns []string) {
 	for _, w := range warns {

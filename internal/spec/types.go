@@ -58,7 +58,7 @@ type Credentials struct {
 
 type WinRMOpts struct {
 	UseHTTPS           *bool `json:"use_https,omitempty" yaml:"use_https,omitempty"`
-	InsecureSkipVerify bool  `json:"insecure_skip_verify,omitempty" yaml:"insecure_skip_verify,omitempty"`
+	InsecureSkipVerify *bool `json:"insecure_skip_verify,omitempty" yaml:"insecure_skip_verify,omitempty"`
 	TimeoutSeconds     int   `json:"timeout_seconds,omitempty" yaml:"timeout_seconds,omitempty"`
 }
 

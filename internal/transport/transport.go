@@ -126,8 +126,9 @@ func NewTransport(t *spec.Target, host string) (Transport, error) {
 			return nil, fmt.Errorf("winrm requires os windows")
 		}
 		https := t.WinRM.UseHTTPS == nil || *t.WinRM.UseHTTPS
+		insecure := t.WinRM.InsecureSkipVerify != nil && *t.WinRM.InsecureSkipVerify
 		return newWinRM(host, t.EffectivePort(), t.Credentials.Username, password,
-			https, t.WinRM.InsecureSkipVerify, t.WinRM.TimeoutSeconds,
+			https, insecure, t.WinRM.TimeoutSeconds,
 			t.EffectiveConnectRetries()), nil
 	case spec.TransportSSH:
 		key := ""

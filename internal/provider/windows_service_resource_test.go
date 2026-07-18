@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	fwschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
 
@@ -251,5 +253,65 @@ func TestWSImportUnsupported(t *testing.T) {
 	r.ImportState(context.Background(), fwresource.ImportStateRequest{ID: "x"}, resp)
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("ImportState must be unsupported in v1")
+	}
+}
+
+// TestWSInsecureSkipVerifyPreservesExplicitFalse locks evaluator item 2: an
+// explicit winrm_insecure_skip_verify=false is a deliberate secure choice and
+// must NOT be overwritten by a provider default_target of true, while a null
+// (unset) value still inherits the default.
+func TestWSInsecureSkipVerifyPreservesExplicitFalse(t *testing.T) {
+	insecureDefault := true
+	pd := &providerData{DefaultTarget: &spec.Target{
+		WinRM: spec.WinRMOpts{InsecureSkipVerify: &insecureDefault},
+	}}
+
+	// explicit false ⇒ stays false (secure) after the merge.
+	mFalse := validWSModel(t)
+	mFalse.WinRMInsecureSkipVerify = types.BoolValue(false)
+	dFalse, diags := mFalse.buildDeployment(context.Background(), pd)
+	if diags.HasError() {
+		t.Fatalf("build (explicit false): %v", diags)
+	}
+	if dFalse.Target.WinRM.InsecureSkipVerify == nil || *dFalse.Target.WinRM.InsecureSkipVerify {
+		t.Fatalf("explicit insecure_skip_verify=false must survive the default merge, got %v", dFalse.Target.WinRM.InsecureSkipVerify)
+	}
+
+	// null (unset) ⇒ inherits the default (true).
+	mNull := validWSModel(t)
+	mNull.WinRMInsecureSkipVerify = types.BoolNull()
+	dNull, diags := mNull.buildDeployment(context.Background(), pd)
+	if diags.HasError() {
+		t.Fatalf("build (null): %v", diags)
+	}
+	if dNull.Target.WinRM.InsecureSkipVerify == nil || !*dNull.Target.WinRM.InsecureSkipVerify {
+		t.Fatalf("unset insecure_skip_verify must inherit default(true), got %v", dNull.Target.WinRM.InsecureSkipVerify)
+	}
+}
+
+// TestWSDiagnosticsCoded locks evaluator item 3 / DESIGN §12: every diagnostic
+// Summary is exactly "[<CODE>] <short>", and the code is sourced from the
+// engine's CodedError when present.
+func TestWSDiagnosticsCoded(t *testing.T) {
+	r := &WindowsServiceResource{}
+	resp := &fwresource.ImportStateResponse{}
+	r.ImportState(context.Background(), fwresource.ImportStateRequest{ID: "x"}, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("import must error")
+	}
+	sum := resp.Diagnostics[0].Summary()
+	if !strings.HasPrefix(sum, "[ERR_") || !strings.Contains(sum, "] ") {
+		t.Fatalf("diagnostic summary must be `[<CODE>] <short>`, got %q", sum)
+	}
+
+	// wsDiagSummary surfaces the coded error's taxonomy code over the fallback.
+	got := wsDiagSummary("ERR_SERVICE_INSTALL", "windows_service deploy failed",
+		&engine.CodedError{Code: "ERR_CHECKSUM_MISMATCH", Err: fmt.Errorf("bad sum")})
+	if got != "[ERR_CHECKSUM_MISMATCH] windows_service deploy failed" {
+		t.Fatalf("wsDiagSummary should surface the coded error's code, got %q", got)
+	}
+	// falls back to the supplied code when the error is uncoded.
+	if got := wsDiagSummary("ERR_SPEC_INVALID", "invalid config", fmt.Errorf("plain")); got != "[ERR_SPEC_INVALID] invalid config" {
+		t.Fatalf("wsDiagSummary fallback wrong, got %q", got)
 	}
 }

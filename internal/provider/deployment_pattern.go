@@ -74,7 +74,7 @@ type targetInput struct {
 	PasswordEnv   string
 	PrivateKeyEnv string
 	WinRMUseHTTPS types.Bool
-	WinRMInsecure bool
+	WinRMInsecure types.Bool
 }
 
 // buildTarget projects the flat connection attributes onto a spec.Target with
@@ -95,7 +95,12 @@ func buildTarget(in targetInput) spec.Target {
 		v := in.WinRMUseHTTPS.ValueBool()
 		t.WinRM.UseHTTPS = &v
 	}
-	t.WinRM.InsecureSkipVerify = in.WinRMInsecure
+	// Preserve the tri-state: null ⇒ leave nil so a default target can supply it;
+	// an explicit true/false is a deliberate choice that must survive the merge.
+	if !in.WinRMInsecure.IsNull() && !in.WinRMInsecure.IsUnknown() {
+		v := in.WinRMInsecure.ValueBool()
+		t.WinRM.InsecureSkipVerify = &v
+	}
 	return t
 }
 
@@ -165,12 +170,12 @@ func finalizeDeployment(d *spec.Deployment, pd *providerData) (string, diag.Diag
 		d.Target.Transport = spec.TransportWinRM
 	}
 	if err := spec.ValidateDeployment(d); err != nil {
-		diags.AddError("Invalid windows_service configuration", err.Error())
+		diags.AddError("[ERR_SPEC_INVALID] invalid windows_service configuration", err.Error())
 		return "", diags
 	}
 	hash, err := hashDeployment(d)
 	if err != nil {
-		diags.AddError("internal", fmt.Sprintf("spec hash: %v", err))
+		diags.AddError("[ERR_SPEC_INVALID] windows_service spec hash failed", fmt.Sprintf("spec hash: %v", err))
 		return "", diags
 	}
 	return hash, diags
