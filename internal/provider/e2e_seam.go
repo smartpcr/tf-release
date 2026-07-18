@@ -115,57 +115,17 @@ func NewDeploymentResourceWithDeadlineCapture() (*DeploymentResource, *DeadlineC
 	return r, cap
 }
 
-// e2eScriptedEngine is a deployEngine returning scripted results so the Stage 5.3
-// acceptance suite can drive the REAL provider Read/Create/ModifyPlan reconciliation
-// paths (RemoveResource on absence, the !failed drift marker, loud read errors, and
-// insecure-transport WARN surfacing) without a live transport (DESIGN §10.4, §11).
-// Nothing about the reconciliation outcome is fabricated: the provider's own Read,
-// ModifyPlan, apply, and warning-surfacing code decides the result from these inputs.
-type e2eScriptedEngine struct {
-	status *engine.Status // ReadStatus/Update result; nil ⇒ absent manifest
-	err    error          // when set, ReadStatus/Update/Destroy fail loudly
-	warns  []string       // surfaced verbatim via Warns()
-}
-
-func (e e2eScriptedEngine) Update(_ context.Context, d *spec.Deployment, _ *spec.Deployment) (*engine.Status, error) {
-	if e.err != nil {
-		return nil, e.err
-	}
-	if e.status != nil {
-		return e.status, nil
-	}
-	return &engine.Status{DeployedVersion: d.Artifact.Version, ReleasePath: "C:/labdeploy/releases/" + d.Artifact.Version,
-		ServiceStatus: "running", Hosts: d.Target.Hosts}, nil
-}
-
-func (e e2eScriptedEngine) ReadStatus(_ context.Context, _ *spec.Deployment) (*engine.Status, error) {
-	return e.status, e.err
-}
-
-func (e e2eScriptedEngine) Destroy(_ context.Context, _ *spec.Deployment, _ string) error {
-	return e.err
-}
-func (e e2eScriptedEngine) Warns() []string { return e.warns }
-
-// NewDeploymentResourceReadAbsent returns a resource whose engine reports an absent
-// manifest (ReadStatus → nil,nil), so the REAL Read RemoveResource's the resource and
-// the next plan is a fresh create (Stage 5.3 scenario 1 / DESIGN §10.4).
-func NewDeploymentResourceReadAbsent() *DeploymentResource {
-	return &DeploymentResource{newEngine: func() deployEngine { return e2eScriptedEngine{status: nil} }}
-}
-
-// NewDeploymentResourceReadStatus returns a resource whose ReadStatus yields the given
-// status (e.g. a "<version>!failed" deployed_version produced by engine.ReconcileManifest),
-// so the REAL Read persists it and a subsequent ModifyPlan forces a converging plan
-// (Stage 5.3 scenario 2 / DESIGN §10.4).
-func NewDeploymentResourceReadStatus(st *engine.Status) *DeploymentResource {
-	return &DeploymentResource{newEngine: func() deployEngine { return e2eScriptedEngine{status: st} }}
-}
-
-// NewDeploymentResourceApplyWarnings returns a resource whose apply (Update) succeeds and
-// whose engine surfaces the given warnings, so the REAL Create turns them into
-// terraform-plugin-framework WARN diagnostics (Stage 5.3 scenario 4 / DESIGN §11). Callers
-// seed the warns from engine.InsecureTransportWarnings so the wording is not duplicated.
-func NewDeploymentResourceApplyWarnings(warns []string) *DeploymentResource {
-	return &DeploymentResource{newEngine: func() deployEngine { return e2eScriptedEngine{warns: warns} }}
+// NewDeploymentResourceWithTransport returns a DeploymentResource wired to the REAL
+// engine.New() whose per-host transport factory is the caller-supplied newT. Driving
+// Read/Create against it runs the GENUINE engine reconciliation and deploy paths
+// (ReadStatus → Connect → ReadManifest → ReconcileManifest → pattern.Status; apply →
+// Update → Deploy → preflight/warnInsecureTransport → …) against a scripted fake
+// transport, so the drift outcome (RemoveResource on an absent manifest, the "!failed"
+// deployed_version marker, a loud Read ERROR on a failed dial) and the insecure-transport
+// WARN are produced by the impl reading scripted Result values — nothing is injected at
+// the engine boundary (DESIGN §10.4, §11, §17). This is the Stage 5.3 acceptance seam.
+func NewDeploymentResourceWithTransport(newT func(*spec.Target, string) (transport.Transport, error)) *DeploymentResource {
+	eng := engine.New()
+	eng.NewTransport = newT
+	return &DeploymentResource{newEngine: func() deployEngine { return realEngine{eng} }}
 }

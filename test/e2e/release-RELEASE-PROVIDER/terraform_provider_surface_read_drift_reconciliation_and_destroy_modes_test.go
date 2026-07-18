@@ -15,10 +15,13 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/provider"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
 // readDriftDeploymentModel mirrors the (unexported) provider.deploymentModel tfsdk
@@ -52,22 +55,20 @@ func readDriftNullTimeouts() timeouts.Value {
 	})}
 }
 
-// readDriftWSSpecYAML is a valid inline winrm/windows deployment spec. Because it is set
-// as the inline `spec` attribute (with resolved_spec null), stateSpec treats it as a
-// faithful verbatim, VERIFIED deployed identity — so Read is allowed to treat a missing
-// manifest as a genuine absence (DESIGN §10.4).
-func readDriftWSSpecYAML(version string) string {
+// rdSpecYAML builds a valid inline windows_service deployment spec; the transportBlock
+// argument is the only thing that varies across scenarios. Set as the inline `spec`
+// attribute (resolved_spec null), stateSpec treats it as a faithful verbatim VERIFIED
+// deployed identity, so Read may treat a missing manifest as a genuine absence
+// (DESIGN §10.4).
+func rdSpecYAML(transportBlock string) string {
 	return fmt.Sprintf(`apiVersion: labdeploy/v1
 kind: Deployment
 metadata: { name: sample-svc }
 target:
-  transport: winrm
-  hosts: ["lab-01"]
-  os: windows
-  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+%s
 artifact:
   type: zip
-  version: %s
+  version: 1.0.0
   checksum: "sha256:%064d"
   source: { type: http, url: "http://example.test/a.zip" }
 pattern:
@@ -77,15 +78,41 @@ pattern:
 health_check:
   type: http
   http: { url: "http://localhost:8080/health" }
+  initial_delay_seconds: 1
+  interval_seconds: 1
+  timeout_seconds: 3
 strategy: { keep_releases: 2, rollback_on_failure: true }
-`, version, 0)
+`, transportBlock, 0)
+}
+
+func rdWinSvcSpecYAML() string {
+	return rdSpecYAML(`  transport: winrm
+  hosts: ["lab-01"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }`)
+}
+
+func rdWinRMInsecureSpecYAML() string {
+	return rdSpecYAML(`  transport: winrm
+  hosts: ["lab-01"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+  winrm: { insecure_skip_verify: true }`)
+}
+
+func rdSSHUnpinnedSpecYAML() string {
+	return rdSpecYAML(`  transport: ssh
+  hosts: ["lab-01"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+  ssh: { host_key: "" }`)
 }
 
 // readDriftVerifiedModel returns a Read-ready state model whose inline `spec` makes
 // stateSpec VERIFIED, so Read may honestly reconcile drift against the manifest.
-func readDriftVerifiedModel(version string) *readDriftDeploymentModel {
+func readDriftVerifiedModel(specYAML string) *readDriftDeploymentModel {
 	return &readDriftDeploymentModel{
-		Spec:         types.StringValue(readDriftWSSpecYAML(version)),
+		Spec:         types.StringValue(specYAML),
 		SpecFile:     types.StringNull(),
 		ResolvedSpec: types.StringNull(),
 		SpecHash:     types.StringNull(),
@@ -110,25 +137,44 @@ func readDriftReadReqResp(r *provider.DeploymentResource, m *readDriftDeployment
 	return resource.ReadRequest{State: st}, &resource.ReadResponse{State: st}, nil
 }
 
+func rdParsedSpec(specYAML string) (*spec.Deployment, error) {
+	d, _, err := spec.ParseDeployment(specYAML, nil, "")
+	return d, err
+}
+
+// rdWriteManifest places a manifest INTO the fake host at exactly the path the engine's
+// ReadStatus will read, via the REAL engine.WriteManifest write path, so the failed-op
+// reconciliation reads a scripted-fake-transport Result (not an injected status).
+func rdWriteManifest(f *rdFakeHost, d *spec.Deployment, m *engine.Manifest) error {
+	p := layout.NewPaths(d.Target.OS, d.Pattern.EffectiveInstallRoot(d.Target.OS), d.Metadata.Name, d.Artifact.Version)
+	return engine.WriteManifest(context.Background(), f, p, m)
+}
+
 // --- scenario state -----------------------------------------------------------
 
 type readDriftState struct {
-	resource     *provider.DeploymentResource
-	readResp     *resource.ReadResponse
-	refreshed    *readDriftDeploymentModel
-	planResp     *resource.ModifyPlanResponse
-	createResp   *resource.CreateResponse
-	warnSetting  string
-	expectedWarn []string
+	fake       *rdFakeHost
+	resource   *provider.DeploymentResource
+	specYAML   string
+	origRaw    tftypes.Value
+	readResp   *resource.ReadResponse
+	refreshed  *readDriftDeploymentModel
+	createResp *resource.CreateResponse
 }
 
-// runRead drives the REAL DeploymentResource.Read on a verified model and captures the
-// response + refreshed state (when not removed).
-func (s *readDriftState) runRead(version string) error {
-	req, resp, err := readDriftReadReqResp(s.resource, readDriftVerifiedModel(version))
+func (s *readDriftState) newResourceOverFake() {
+	s.resource = provider.NewDeploymentResourceWithTransport(
+		func(_ *spec.Target, _ string) (transport.Transport, error) { return s.fake, nil })
+}
+
+// runRead drives the REAL DeploymentResource.Read (→ engine.ReadStatus → fake transport)
+// and captures the response, the (unchanged) input state raw, and the refreshed state.
+func (s *readDriftState) runRead() error {
+	req, resp, err := readDriftReadReqResp(s.resource, readDriftVerifiedModel(s.specYAML))
 	if err != nil {
 		return err
 	}
+	s.origRaw = req.State.Raw
 	s.resource.Read(context.Background(), req, resp)
 	s.readResp = resp
 	if !resp.State.Raw.IsNull() {
@@ -144,48 +190,51 @@ func (s *readDriftState) runRead(version string) error {
 // --- scenario 1: absent manifest removes resource -----------------------------
 
 func (s *readDriftState) givenVerifiedMissingManifest() error {
-	// Real engine seam whose ReadStatus reports an absent manifest (nil,nil).
-	s.resource = provider.NewDeploymentResourceReadAbsent()
+	s.specYAML = rdWinSvcSpecYAML()
+	s.fake = newRDFakeHost("lab-01") // no manifest file written ⇒ readSmallFile returns exit 3
+	s.newResourceOverFake()
 	return nil
 }
 
 // --- scenario 2: failed op marker forces plan change --------------------------
 
 func (s *readDriftState) givenVerifiedFailedLastOperation() error {
-	// Drive the REAL drift-reconciliation impl: a manifest whose last_operation.result
-	// is "failed" reconciles to a "<current_version>!failed" deployed_version. The suffix
-	// is produced by engine.ReconcileManifest, not fabricated by the test.
+	s.specYAML = rdWinSvcSpecYAML()
+	s.fake = newRDFakeHost("lab-01")
+	s.fake.svc = "Running" // the service is installed so the Status probe succeeds
+	d, err := rdParsedSpec(s.specYAML)
+	if err != nil {
+		return fmt.Errorf("parse spec: %w", err)
+	}
+	// Script a manifest whose last_operation.result==failed onto the fake host through
+	// the real WriteManifest path. ReadStatus → ReadManifest reads it back, and
+	// ReconcileManifest (impl) marks deployed_version "1.0.0!failed".
 	m := &engine.Manifest{
-		CurrentVersion: "1.0.0",
-		LastOperation:  engine.LastOp{Type: "deploy", Result: "failed", Started: "2026-01-01T00:00:00Z"},
+		Schema:          1,
+		App:             d.Metadata.Name,
+		Pattern:         string(d.Pattern.Type),
+		CurrentVersion:  "1.0.0",
+		ProviderVersion: "test",
+		LastOperation:   engine.LastOp{Type: "deploy", Result: "failed", Started: "2026-01-01T00:00:00Z"},
 	}
-	present, deployedVersion, _ := engine.ReconcileManifest(m)
-	if !present {
-		return fmt.Errorf("a present manifest must reconcile as present")
+	if err := rdWriteManifest(s.fake, d, m); err != nil {
+		return fmt.Errorf("seed manifest: %w", err)
 	}
-	if !strings.HasSuffix(deployedVersion, engine.FailedMarker) {
-		return fmt.Errorf("engine.ReconcileManifest must mark a failed op with %q, got %q", engine.FailedMarker, deployedVersion)
-	}
-	s.resource = provider.NewDeploymentResourceReadStatus(&engine.Status{
-		DeployedVersion: deployedVersion, ServiceStatus: "stopped", Hosts: []string{"lab-01"},
-	})
+	s.newResourceOverFake()
 	return nil
 }
 
 // --- scenario 3: unreachable target is a loud Read error ----------------------
 
 func (s *readDriftState) givenVerifiedDialFailure() error {
-	// Real engine wired to a fake transport whose Connect returns transport.ErrConnect,
-	// so ReadStatus fails through the real wrapTransportErr taxonomy path.
-	s.resource = provider.NewDeploymentResourceWithConnectError()
+	s.specYAML = rdWinSvcSpecYAML()
+	s.fake = newRDFakeHost("lab-01")
+	s.fake.fail["connect"] = true // Connect returns transport.ErrConnect (a failed dial)
+	s.newResourceOverFake()
 	return nil
 }
 
-// --- shared When for the Read scenarios ---------------------------------------
-
-func (s *readDriftState) whenReadRefreshRuns() error {
-	return s.runRead("1.0.0")
-}
+func (s *readDriftState) whenReadRefreshRuns() error { return s.runRead() }
 
 // --- Then steps (Read scenarios) ----------------------------------------------
 
@@ -213,7 +262,8 @@ func (s *readDriftState) thenDeployedVersionFailedSuffix() error {
 	if s.refreshed == nil {
 		return fmt.Errorf("failed-marker Read must retain state, not remove the resource")
 	}
-	if got := s.refreshed.DeployedVersion.ValueString(); !strings.HasSuffix(got, engine.FailedMarker) {
+	got := s.refreshed.DeployedVersion.ValueString()
+	if !strings.HasSuffix(got, engine.FailedMarker) {
 		return fmt.Errorf("deployed_version must carry the %q suffix, got %q", engine.FailedMarker, got)
 	}
 	return nil
@@ -230,7 +280,7 @@ func (s *readDriftState) thenSubsequentPlanNonEmpty() error {
 	sr := resource.SchemaResponse{}
 	s.resource.Schema(ctx, resource.SchemaRequest{}, &sr)
 
-	plan := readDriftVerifiedModel("1.0.0")
+	plan := readDriftVerifiedModel(s.specYAML)
 	p := tfsdk.Plan{Schema: sr.Schema}
 	if d := p.Set(ctx, plan); d.HasError() {
 		return fmt.Errorf("build plan: %v", d)
@@ -277,43 +327,45 @@ func (s *readDriftState) thenReadErrorNotWarning() error {
 	return nil
 }
 
-func (s *readDriftState) thenPriorStateIntact() error {
+func (s *readDriftState) thenPriorStateUnchanged() error {
+	// Not merely non-null: the refreshed state must be BYTE-IDENTICAL to the prior state
+	// — a failed refresh must leave state exactly as it was, never partially overwritten.
 	if s.readResp.State.Raw.IsNull() {
 		return fmt.Errorf("unreachable target must LEAVE prior state intact — the resource must NOT be removed")
 	}
+	if !s.readResp.State.Raw.Equal(s.origRaw) {
+		return fmt.Errorf("unreachable target must leave prior state UNCHANGED; state raw differs after Read:\n prior=%v\n after=%v",
+			s.origRaw, s.readResp.State.Raw)
+	}
 	return nil
 }
 
-// --- scenario 4: exactly one insecure-transport warning -----------------------
+// --- scenario 4: exactly one insecure-transport warning through a real apply ---
 
 func (s *readDriftState) givenInsecureTransport(setting string) error {
-	var target spec.Target
 	switch setting {
 	case "winrm_insecure_skip":
-		insecure := true
-		target = spec.Target{Transport: spec.TransportWinRM, WinRM: spec.WinRMOpts{InsecureSkipVerify: &insecure}}
+		s.specYAML = rdWinRMInsecureSpecYAML()
 	case "ssh_unpinned_hostkey":
-		target = spec.Target{Transport: spec.TransportSSH, SSH: spec.SSHOpts{HostKey: ""}}
+		s.specYAML = rdSSHUnpinnedSpecYAML()
 	default:
 		return fmt.Errorf("unknown insecure setting %q", setting)
 	}
-	// Seed the surfaced warnings from the REAL single source of truth so the wording is
-	// not duplicated by the test (DESIGN §11).
-	warns := engine.InsecureTransportWarnings(&spec.Deployment{Target: target})
-	if len(warns) != 1 {
-		return fmt.Errorf("precondition: expected exactly one engine insecure warning for %q, got %v", setting, warns)
-	}
-	s.warnSetting = setting
-	s.expectedWarn = warns
-	s.resource = provider.NewDeploymentResourceApplyWarnings(warns)
+	s.fake = newRDFakeHost("lab-01")
+	s.newResourceOverFake()
 	return nil
 }
 
+// whenApplyRuns drives the REAL DeploymentResource.Create → apply → engine.Update →
+// Deploy → deploySingle against the scripted fake host. The full happy-path deploy runs,
+// and the DESIGN §11 insecure-transport notice is emitted BY THE ENGINE during preflight
+// (warnInsecureTransport), then surfaced by the provider as a framework WARN diagnostic —
+// proven by a real apply, not injected.
 func (s *readDriftState) whenApplyRuns() error {
 	ctx := context.Background()
 	sr := resource.SchemaResponse{}
 	s.resource.Schema(ctx, resource.SchemaRequest{}, &sr)
-	plan := readDriftVerifiedModel("1.0.0")
+	plan := readDriftVerifiedModel(s.specYAML)
 	p := tfsdk.Plan{Schema: sr.Schema}
 	if d := p.Set(ctx, plan); d.HasError() {
 		return fmt.Errorf("build plan: %v", d)
@@ -328,19 +380,22 @@ func (s *readDriftState) thenExactlyOneWarnNaming(names string) error {
 	if s.createResp == nil {
 		return fmt.Errorf("apply was not driven")
 	}
-	if got := s.createResp.Diagnostics.WarningsCount(); got != 1 {
-		return fmt.Errorf("apply must emit exactly one WARN diagnostic, got %d (%v)", got, s.createResp.Diagnostics.Warnings())
+	naming := 0
+	for _, w := range s.createResp.Diagnostics.Warnings() {
+		if strings.Contains(w.Detail(), names) || strings.Contains(w.Summary(), names) {
+			naming++
+		}
 	}
-	w := s.createResp.Diagnostics.Warnings()[0]
-	if !strings.Contains(w.Detail(), names) {
-		return fmt.Errorf("WARN diagnostic must name the insecure setting %q, got detail %q", names, w.Detail())
+	if naming != 1 {
+		return fmt.Errorf("apply must emit exactly one WARN diagnostic naming %q, got %d (all warnings: %v)",
+			names, naming, s.createResp.Diagnostics.Warnings())
 	}
 	return nil
 }
 
 func (s *readDriftState) thenApplyNoError() error {
 	if s.createResp.Diagnostics.HasError() {
-		return fmt.Errorf("insecure apply must not error, got %v", s.createResp.Diagnostics.Errors())
+		return fmt.Errorf("insecure apply must succeed (a real deploy), got %v", s.createResp.Diagnostics.Errors())
 	}
 	return nil
 }
@@ -370,7 +425,7 @@ func InitializeScenario_terraform_provider_surface_read_drift_reconciliation_and
 	ctx.Step(`^deployed_version carries the "!failed" suffix$`, st.thenDeployedVersionFailedSuffix)
 	ctx.Step(`^the subsequent plan is non-empty and converging$`, st.thenSubsequentPlanNonEmpty)
 	ctx.Step(`^the Read refresh returns an ERROR diagnostic and not a warning$`, st.thenReadErrorNotWarning)
-	ctx.Step(`^the prior state is left intact and the resource is not removed$`, st.thenPriorStateIntact)
+	ctx.Step(`^the prior state is left intact and the resource is not removed$`, st.thenPriorStateUnchanged)
 
 	// Scenario 4
 	ctx.Step(`^a deployment whose transport enables the insecure setting "([^"]*)"$`, st.givenInsecureTransport)
