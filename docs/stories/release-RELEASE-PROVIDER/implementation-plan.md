@@ -270,8 +270,8 @@ storyId: "release:RELEASE-PROVIDER"
 - phase-single-target-deployment-patterns/stage-windows-service-pattern
 
 ### Test Scenarios
-- [ ] Scenario: Dotnet binPath golden -- Given `launcher=dotnet_dll`, When the S4 script is generated, Then the binPath is the quoted `"<dotnet_exe>" "<release>\<dll>" <args>` form matching the committed golden [proof: golden; deps: none -- committed fixtures under internal/pattern/testdata]
-- [ ] Scenario: Node install_deps preflight -- Given `install_deps=true` with no `package-lock.json`, When Preflight/Configure run via a fake transport, Then it yields `ERR_SERVICE_INSTALL` naming the lockfile [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
+- [x] Scenario: Dotnet binPath golden -- Given `launcher=dotnet_dll`, When the S4 script is generated, Then the binPath is the quoted `"<dotnet_exe>" "<release>\<dll>" <args>` form matching the committed golden [proof: golden; deps: none -- committed fixtures under internal/pattern/testdata]
+- [x] Scenario: Node install_deps preflight -- Given `install_deps=true` with no `package-lock.json`, When Preflight/Configure run via a fake transport, Then it yields `ERR_SERVICE_INSTALL` naming the lockfile [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
 
 # Phase 5: Terraform Provider Surface
 

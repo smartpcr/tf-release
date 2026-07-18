@@ -214,7 +214,70 @@ exit 0`, psq(rc.P.Release), ExitSvcInstall, ExitSvcInstall)
 	return nil
 }
 
-// wrapped rewrites the node spec into a winsw WindowsService ReleaseCtx.
+// node_modules snapshot helpers make a Reconfigure `npm ci` rollback-safe.
+// `npm ci` DELETES and rebuilds node_modules in place (DESIGN §9.4), so a
+// mid-install failure would otherwise leave the ACTIVE release without a
+// runnable dependency tree — and the engine's config-only rollback cannot
+// restore files. BackupDeps snapshots the live tree BEFORE npm ci, RestoreDeps
+// puts it back if the reconfigure fails, and CommitDeps discards the snapshot
+// once the reconfigure has fully succeeded. All three no-op when install_deps
+// is false (npm ci never runs, so there is nothing to protect).
+func (n *NodeWebApp) BackupDeps(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
+	if !rc.Spec.Pattern.InstallDeps {
+		return nil
+	}
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+Set-Location %s
+try {
+  if(Test-Path 'node_modules.bak'){ Remove-Item -Recurse -Force -ErrorAction Stop 'node_modules.bak' }
+  if(Test-Path 'node_modules'){ Rename-Item -ErrorAction Stop 'node_modules' 'node_modules.bak' }
+} catch { Write-Error "node_modules backup failed: $_"; exit %d }
+exit 0`, psq(rc.P.Release), ExitSvcInstall)
+	return n.runDepsMaint(ctx, t, script, 300)
+}
+
+// RestoreDeps rolls the node_modules snapshot back over any partial tree left by
+// a failed `npm ci`, so the prior application is runnable again.
+func (n *NodeWebApp) RestoreDeps(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
+	if !rc.Spec.Pattern.InstallDeps {
+		return nil
+	}
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+Set-Location %s
+try {
+  if(Test-Path 'node_modules.bak'){
+    if(Test-Path 'node_modules'){ Remove-Item -Recurse -Force -ErrorAction Stop 'node_modules' }
+    Rename-Item -ErrorAction Stop 'node_modules.bak' 'node_modules'
+  }
+} catch { Write-Error "node_modules restore failed: $_"; exit %d }
+exit 0`, psq(rc.P.Release), ExitSvcInstall)
+	return n.runDepsMaint(ctx, t, script, 300)
+}
+
+// CommitDeps discards the node_modules snapshot after a successful reconfigure.
+func (n *NodeWebApp) CommitDeps(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
+	if !rc.Spec.Pattern.InstallDeps {
+		return nil
+	}
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+Set-Location %s
+try {
+  if(Test-Path 'node_modules.bak'){ Remove-Item -Recurse -Force -ErrorAction Stop 'node_modules.bak' }
+} catch { Write-Error "node_modules snapshot cleanup failed: $_"; exit %d }
+exit 0`, psq(rc.P.Release), ExitSvcInstall)
+	return n.runDepsMaint(ctx, t, script, 120)
+}
+
+func (n *NodeWebApp) runDepsMaint(ctx context.Context, t transport.Transport, script string, timeout int) error {
+	r, err := runPS(ctx, t, t.Host(), "STAGE", script, nil, timeout)
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return failFrom(t.Host(), "STAGE", r)
+	}
+	return nil
+}
 func (n *NodeWebApp) wrapped(rc ReleaseCtx) ReleaseCtx {
 	p := rc.Spec.Pattern
 	nodeExe := p.NodeExe
@@ -317,12 +380,26 @@ func (d *DotnetAPI) wrapped(rc ReleaseCtx) ReleaseCtx {
 	return out
 }
 
+// dllBinPath renders the launcher=dotnet_dll service binPath in the normative
+// DESIGN §9.4 form `\"<dotnet_exe>\" \"<cur>\<dll>\" <args>`. The dll path is
+// ALWAYS quoted (independent of whether it contains spaces) so the SCM parses
+// `<dotnet_exe> <dll>` as two distinct tokens; user args keep the standard
+// quote-only-when-needed rendering via quoteArgs.
+func (d *DotnetAPI) dllBinPath(rc ReleaseCtx) string {
+	p := rc.Spec.Pattern
+	dotnet := p.DotnetExe
+	if dotnet == "" {
+		dotnet = "dotnet"
+	}
+	dll := rc.P.Current + `\` + strings.TrimLeft(p.DLL, `\/`)
+	return `\"` + dotnet + `\" \"` + dll + `\"` + quoteArgs(p.Args)
+}
+
 func (d *DotnetAPI) Configure(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
 	w := d.wrapped(rc)
 	p := rc.Spec.Pattern
 	if p.Launcher == "dotnet_dll" && w.Spec.Pattern.Wrapper == "none" {
-		return d.ws.configureWithBinPath(ctx, t, w,
-			`\"`+w.Spec.Pattern.Exe+`\"`+quoteArgs(w.Spec.Pattern.Args), "")
+		return d.ws.configureWithBinPath(ctx, t, w, d.dllBinPath(rc), "")
 	}
 	if w.Spec.Pattern.Wrapper == "winsw" {
 		return d.ws.configureWinsw(ctx, t, w)

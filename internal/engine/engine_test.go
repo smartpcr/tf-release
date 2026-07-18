@@ -37,6 +37,16 @@ type fakeHost struct {
 	healthGate       func() bool              // optional dynamic health failure (true => fail)
 	healthScriptGate func(script string) bool // optional health failure keyed on the executed script (true => fail)
 	log              []string                 // executed step markers, in order
+
+	// node_modules filesystem model (DESIGN §9.4 npm ci rollback safety). nm is
+	// the CONTENT TOKEN of the live node_modules ("" = absent, "partial" = the
+	// broken tree a failed npm ci leaves behind); nmBak is the snapshot token.
+	// nodeNeedsDeps records that this app was installed with install_deps=true, so
+	// it cannot start without a good node_modules tree — this is what couples a
+	// prior-app restart to a successful restore.
+	nm            string
+	nmBak         string
+	nodeNeedsDeps bool
 }
 
 func newFakeHost(name string) *fakeHost {
@@ -233,6 +243,12 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		if f.fail["start"] {
 			return transport.Result{ExitCode: 44, Stderr: "start timeout"}, nil
 		}
+		// A node app installed with install_deps cannot start against a missing or
+		// broken (partial) node_modules tree — this couples a successful start to a
+		// successful dependency restore during rollback.
+		if f.nodeNeedsDeps && (f.nm == "" || f.nm == "partial") {
+			return transport.Result{ExitCode: 44, Stderr: "cannot start: node_modules missing or corrupt"}, nil
+		}
 		f.mark("START")
 		f.svc = "Running"
 		return ok(""), nil
@@ -256,6 +272,55 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
 		return transport.Result{}, fmt.Errorf("runner transport blew up")
+
+	case strings.Contains(s, "Rename-Item -ErrorAction Stop 'node_modules' 'node_modules.bak'"): // NodeWebApp.BackupDeps
+		if f.fail["depbackup"] {
+			return transport.Result{ExitCode: 46, Stderr: "node_modules backup failed: access denied"}, nil
+		}
+		// Snapshot the live tree: move node_modules → node_modules.bak.
+		f.nmBak, f.nm = f.nm, ""
+		f.mark("DEPBACKUP")
+		return ok(""), nil
+	case strings.Contains(s, "Rename-Item -ErrorAction Stop 'node_modules.bak' 'node_modules'"): // NodeWebApp.RestoreDeps
+		if f.fail["deprestore"] {
+			return transport.Result{ExitCode: 46, Stderr: "node_modules restore failed: access denied"}, nil
+		}
+		// Restore the snapshot over any partial tree: node_modules.bak → node_modules.
+		if f.nmBak != "" {
+			f.nm, f.nmBak = f.nmBak, ""
+		}
+		f.mark("DEPRESTORE")
+		return ok(""), nil
+	case strings.Contains(s, "node_modules.bak"): // NodeWebApp.CommitDeps (discard snapshot)
+		f.nmBak = ""
+		f.mark("DEPCOMMIT")
+		return ok(""), nil
+
+	case strings.Contains(s, "npm ci --omit=dev"): // node_web_app InstallDeps (STAGE)
+		// npm ci DELETES node_modules first, then rebuilds. Model that: a failure
+		// leaves a "partial" (broken) tree; success yields a fresh good tree.
+		if f.fail["npmci"] {
+			f.nm = "partial"
+			return transport.Result{ExitCode: 46, Stderr: "npm ci failed"}, nil
+		}
+		f.nm = "fresh"
+		f.nodeNeedsDeps = true
+		f.mark("NPMCI")
+		return ok(""), nil
+
+	case strings.Contains(s, "node not found on PATH"): // node_web_app pattern preflight
+		if f.fail["nodepreflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "node not found on PATH"}, nil
+		}
+		f.mark("NODE_PREFLIGHT")
+		return ok(""), nil
+
+	case strings.Contains(s, "--list-runtimes"): // dotnet_api pattern preflight
+		if f.fail["dotnetpreflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "Microsoft.AspNetCore.App runtime missing"}, nil
+		}
+		f.mark("DOTNET_PREFLIGHT")
+		return ok(""), nil
 
 	case strings.Contains(s, "LDPOSTINSTALL"): // post_install hook
 		if f.fail["postinstall"] {

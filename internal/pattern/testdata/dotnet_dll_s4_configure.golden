@@ -1,0 +1,22 @@
+$ErrorActionPreference='Continue'
+$svc='WebApi'
+$bin='\"C:\Program Files\dotnet\dotnet.exe\" \"C:\deploy\web-api\current\WebApi.dll\" --environment Production'
+
+& sc.exe query $svc *> $null
+$exists = ($LASTEXITCODE -ne 1060)
+if(-not $exists){
+  if($env:LD_SVC_PW){ & sc.exe create $svc binPath= $bin start= auto DisplayName= 'Contoso Web API' obj= $obj password= $env:LD_SVC_PW }
+  elseif($obj){       & sc.exe create $svc binPath= $bin start= auto DisplayName= 'Contoso Web API' obj= $obj }
+  else{               & sc.exe create $svc binPath= $bin start= auto DisplayName= 'Contoso Web API' }
+  if($LASTEXITCODE -ne 0){ exit 46 }
+} else {
+  if($env:LD_SVC_PW){ & sc.exe config $svc binPath= $bin start= auto DisplayName= 'Contoso Web API' obj= $obj password= $env:LD_SVC_PW }
+  elseif($obj){       & sc.exe config $svc binPath= $bin start= auto DisplayName= 'Contoso Web API' obj= $obj }
+  else{               & sc.exe config $svc binPath= $bin start= auto DisplayName= 'Contoso Web API' obj= LocalSystem }
+  if($LASTEXITCODE -ne 0){ exit 46 }
+}
+& sc.exe description $svc 'Web API'
+if($LASTEXITCODE -ne 0){ exit 46 }
+& sc.exe failure "WebApi" reset= 86400 actions= restart/5000/restart/5000/restart/5000
+if($LASTEXITCODE -ne 0){ exit 46 }
+exit 0

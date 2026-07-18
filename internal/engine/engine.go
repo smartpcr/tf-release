@@ -129,14 +129,26 @@ func (e *Engine) Update(ctx context.Context, s, prior *spec.Deployment) (*Status
 }
 
 // reconfigurable reports whether a same-artifact configuration change should be
-// applied via Reconfigure rather than Deploy. Reconfigure is single-host and, in
-// this stage, defined for the windows_service pattern; anything else defers to
-// Deploy. artifactUnchanged gates it so version upgrades always deploy.
+// applied via Reconfigure rather than Deploy. Reconfigure is single-host and
+// defined for the SCM-registered service patterns (windows_service and the
+// node_web_app / dotnet_api patterns that delegate their Configure/Stop/Start/
+// Status verbs to WindowsService); anything else defers to Deploy.
+// artifactUnchanged gates it so version upgrades always deploy.
+//
+// node_web_app is included even when install_deps toggles: Reconfigure runs the
+// pattern Preflight (node/dotnet tool checks) and, for node_web_app, re-runs
+// InstallDeps (`npm ci --omit=dev`) at the pre-activation point, so a same-
+// artifact install_deps=false→true change actually installs dependencies instead
+// of being swallowed by Deploy's unchanged-artifact idempotency short-circuit.
 func reconfigurable(s, prior *spec.Deployment) bool {
 	if prior == nil || s == nil {
 		return false
 	}
-	if s.Pattern.Type != spec.PatternWindowsService {
+	switch s.Pattern.Type {
+	case spec.PatternWindowsService, spec.PatternNodeWebApp, spec.PatternDotnetAPI:
+		// applied via Preflight + Stop/Configure/Start (+ node InstallDeps) on the
+		// deployed release, all handled by Reconfigure.
+	default:
 		return false
 	}
 	if len(s.Target.Hosts) != 1 {
@@ -798,11 +810,6 @@ func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Tra
 		if xerr := sl.timed(ctx, "EXTRACT", func() error { return e.extract(ctx, t, p) }); xerr != nil {
 			return xerr
 		}
-		if n, ok := pat.(*pattern.NodeWebApp); ok {
-			if derr := n.InstallDeps(ctx, t, rc); derr != nil {
-				return derr
-			}
-		}
 		if merr := e.writeReleaseMarker(ctx, t, p, s); merr != nil {
 			return coded("ERR_CONNECT", host, "STAGE", merr)
 		}
@@ -812,6 +819,19 @@ func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Tra
 		sl.emit(ctx, "STAGE", stageStart)
 		tflog.Info(ctx, "release cached; skipping fetch/extract",
 			map[string]interface{}{"host": host, "version": s.Artifact.Version})
+	}
+	// node_web_app dependency install (`npm ci --omit=dev`) runs for BOTH freshly
+	// extracted AND cached releases (DESIGN §9.4). A cached release previously
+	// deployed with install_deps=false must still get its deps installed (and its
+	// package-lock.json validated) when this apply flips install_deps=true — so
+	// InstallDeps cannot live only on the fresh-extract path. It no-ops for other
+	// patterns and when install_deps=false. On a freshly-created release a failure
+	// trips the incomplete-release cleanup (createdRelease=true); on a cached
+	// release we did not create the tree survives for inspection.
+	if n, ok := pat.(*pattern.NodeWebApp); ok {
+		if derr := n.InstallDeps(ctx, t, rc); derr != nil {
+			return derr
+		}
 	}
 	// RENDER: files land in the release dir every apply (DESIGN §6.4). A failure
 	// here on a freshly-created release trips the incomplete-release cleanup.
@@ -1361,6 +1381,14 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
 	newRC := releaseCtxVersion(s, rp, m.CurrentVersion)
 	newRC.EmitStep = sl.emit
+	// Pattern preflight MUST run before any mutation (DESIGN §8.1): a same-artifact
+	// change to node_exe, or a launcher=exe→dotnet_dll switch, must validate the new
+	// tooling (node --version / dotnet --list-runtimes contains Microsoft.AspNetCore.App)
+	// BEFORE we stop and reconfigure the running service — otherwise the service could
+	// be torn down and re-registered against a launcher the target cannot run.
+	if err := sl.timed(ctx, "PREFLIGHT", func() error { return e.preflight(ctx, t, s, rp, pat, newRC) }); err != nil {
+		return nil, err
+	}
 	started := time.Now().UTC()
 	writeManifest := func(result string) *Manifest {
 		return &Manifest{
@@ -1421,6 +1449,10 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		okManifest *Manifest
 		okStatus   string
 	)
+	// node is non-nil for node_web_app; depsBackedUp tracks whether we snapshotted
+	// node_modules before `npm ci` so the rollback path can restore it.
+	node, _ := pat.(*pattern.NodeWebApp)
+	depsBackedUp := false
 	forward := func() error {
 		// Run post_install ONLY when the hook actually CHANGED for this same-artifact
 		// reconfigure, at the pre-activation point (after CONFIGURE, before START) so
@@ -1429,10 +1461,37 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		// not re-executed (its effect already landed when the artifact was staged),
 		// and because only the forward path supplies preStart the PRIOR hook is never
 		// re-run while rolling back.
+		// preStart runs at the pre-activation point (after STOP+CONFIGURE, before
+		// START) so the service is stopped (no locked node_modules) yet started with
+		// the new dependencies/hook in place. Two things happen here, in deploy order:
+		//   1. node_web_app InstallDeps (`npm ci --omit=dev`) — self-gates on
+		//      install_deps, so a same-artifact install_deps=false→true toggle actually
+		//      installs deps (and validates package-lock.json) instead of no-op'ing.
+		//   2. a CHANGED post_install hook — an UNCHANGED hook is not re-executed (its
+		//      effect already landed at stage time). Only the forward path supplies
+		//      preStart, so neither re-runs while rolling back.
+		_, isNode := pat.(*pattern.NodeWebApp)
+		postInstallChanged := s.Pattern.PostInstall != prior.Pattern.PostInstall
 		var preStart func() error
-		if s.Pattern.PostInstall != prior.Pattern.PostInstall {
+		if isNode || postInstallChanged {
 			preStart = func() error {
-				return e.runPostInstall(ctx, t, s, rp.Release, newRC, host)
+				if node != nil {
+					// Snapshot node_modules BEFORE npm ci so a partial install can be
+					// rolled back to a runnable tree (self-gates on install_deps).
+					if s.Pattern.InstallDeps {
+						if berr := sl.timed(ctx, "STAGE", func() error { return node.BackupDeps(ctx, t, newRC) }); berr != nil {
+							return berr
+						}
+						depsBackedUp = true
+					}
+					if derr := sl.timed(ctx, "STAGE", func() error { return node.InstallDeps(ctx, t, newRC) }); derr != nil {
+						return derr
+					}
+				}
+				if postInstallChanged {
+					return e.runPostInstall(ctx, t, s, rp.Release, newRC, host)
+				}
+				return nil
 			}
 		}
 		if err := activate(newRC, &s.HealthCheck, preStart); err != nil {
@@ -1450,14 +1509,28 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		return nil
 	}
 	if ferr := forward(); ferr != nil {
-		// Any failure after we began mutating (STOP/CONFIGURE/START/HEALTH/FINALIZE/
-		// Status): restore the PRIOR configuration — the settings Terraform still
-		// holds in state — validated against the PRIOR health check, so the machine
-		// is not left stopped or running rejected settings.
+		// Rollback (DESIGN §10.2 restore): restore the PRIOR configuration — the
+		// settings Terraform still holds in state — validated against the PRIOR
+		// health check, so the machine is not left stopped or running rejected
+		// settings.
 		priorRC := releaseCtxVersion(prior, rp, m.CurrentVersion)
 		priorRC.EmitStep = sl.emit
 		rbStart := time.Now()
-		rerr := activate(priorRC, &prior.HealthCheck, nil)
+		// A partial `npm ci` may have left the ACTIVE release without a runnable
+		// dependency tree — restore the node_modules snapshot BEFORE restoring the
+		// prior service configuration, so the prior app comes up against its
+		// original dependencies. If the snapshot restore ITSELF fails, the prior
+		// dependency tree is UNRECOVERABLE: do NOT attempt to start the prior
+		// configuration (it would come up against a broken/absent node_modules and
+		// could still report healthy under health_check=none) — escalate straight
+		// to ERR_ROLLBACK_FAILED so the operator is forced to repair.
+		var rerr error
+		if depsBackedUp {
+			rerr = node.RestoreDeps(ctx, t, newRC)
+		}
+		if rerr == nil {
+			rerr = activate(priorRC, &prior.HealthCheck, nil)
+		}
 		if rerr == nil {
 			// Prior configuration restored and healthy — re-finalize the manifest to
 			// record the rolled-back reconfigure (version/checksum unchanged).
@@ -1480,6 +1553,14 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		// Surface the original error so the apply fails and Terraform retains the
 		// (now accurate) prior state.
 		return nil, fmt.Errorf("%w; prior configuration restored (healthy)", ferr)
+	}
+	// Reconfigure succeeded end-to-end: discard the node_modules snapshot (the new
+	// dependency tree is live and healthy). Cleanup is best-effort — a leftover
+	// backup dir wastes disk but does not affect correctness.
+	if depsBackedUp {
+		if cerr := node.CommitDeps(ctx, t, newRC); cerr != nil {
+			e.warnf("node_modules backup cleanup failed on %s: %v", host, cerr)
+		}
 	}
 	out := statusFrom(okManifest, host, okStatus)
 	out.DeployedVersion = deployedVer
