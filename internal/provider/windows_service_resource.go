@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -413,8 +414,21 @@ func wsDiagSummary(fallback, short string, err error) string {
 
 func appendWarnings(diags *diag.Diagnostics, warns []string) {
 	for _, w := range warns {
-		diags.AddWarning("labdeploy", w)
+		diags.AddWarning(wsWarnSummary(w), w)
 	}
+}
+
+// wsWarnSummary formats a warning diagnostic Summary per DESIGN §12
+// ("[<CODE>] <short>"). Engine warnings are free-form and carry no taxonomy
+// code, so they default to the stable WARN code; if a warning already embeds a
+// bracketed code (e.g. "[ERR_ROLLBACK_FAILED] ..."), that code is surfaced.
+func wsWarnSummary(w string) string {
+	if strings.HasPrefix(w, "[") {
+		if i := strings.Index(w, "]"); i > 1 {
+			return fmt.Sprintf("[%s] windows_service warning", w[1:i])
+		}
+	}
+	return "[WARN] windows_service warning"
 }
 
 func fillWSStatus(m *windowsServiceModel, st *engine.Status) {

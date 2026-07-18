@@ -246,7 +246,16 @@ func TestWSTransportFallbackWinRM(t *testing.T) {
 	}
 }
 
-// TestWSImportUnsupported: import returns an error (v1 unsupported).
+// TestWSWarnSummaryCoded locks evaluator item 3 / DESIGN §12: warning
+// diagnostics also use the "[<CODE>] <short>" Summary form.
+func TestWSWarnSummaryCoded(t *testing.T) {
+	if got := wsWarnSummary("prune failed on lab-01: boom"); got != "[WARN] windows_service warning" {
+		t.Fatalf("uncoded warning must default to [WARN], got %q", got)
+	}
+	if got := wsWarnSummary("[ERR_ROLLBACK_FAILED] could not restore prev"); got != "[ERR_ROLLBACK_FAILED] windows_service warning" {
+		t.Fatalf("embedded code must be surfaced, got %q", got)
+	}
+}
 func TestWSImportUnsupported(t *testing.T) {
 	r := &WindowsServiceResource{}
 	resp := &fwresource.ImportStateResponse{}
