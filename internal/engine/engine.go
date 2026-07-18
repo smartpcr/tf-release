@@ -1297,19 +1297,6 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 	newRC := releaseCtxVersion(s, rp, m.CurrentVersion)
 	newRC.EmitStep = sl.emit
 	started := time.Now().UTC()
-	// activate runs CONFIGURE → START → HEALTH for a given release context; it is
-	// used both to apply the new settings and to restore the prior ones on failure.
-	activate := func(rc pattern.ReleaseCtx) error {
-		if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
-			return coded("ERR_SERVICE_INSTALL", host, "CONFIGURE", err)
-		}
-		if err := sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rc) }); err != nil {
-			return err
-		}
-		return sl.timed(ctx, "HEALTH", func() error {
-			return RunHealthCheck(ctx, t, &s.HealthCheck, rp.Current, rc.Env)
-		})
-	}
 	writeManifest := func(result string) *Manifest {
 		return &Manifest{
 			Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
@@ -1320,51 +1307,83 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 				Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 		}
 	}
-	// STOP first so changed environment/arguments/start type actually take effect
-	// on the running process, not just on disk. A STOP failure is before any
-	// mutation, so there is nothing to roll back.
-	if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, newRC) }); err != nil {
-		return nil, err
+	// activate follows DESIGN §10.2: STOP → CONFIGURE → START → HEALTH for a given
+	// release context and health check. It is used both to apply the new settings
+	// and to RESTORE the prior ones — the restore path MUST stop the service that is
+	// running the rejected configuration before re-applying the prior settings, or
+	// the prior environment/arguments would be written but never activated. The
+	// health check is passed in so the restored configuration is validated against
+	// the PRIOR health check, not the new one.
+	activate := func(rc pattern.ReleaseCtx, hc *spec.HealthCheck) error {
+		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
+			return coded("ERR_SERVICE_STOP", host, "STOP", err)
+		}
+		if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
+			return coded("ERR_SERVICE_INSTALL", host, "CONFIGURE", err)
+		}
+		if err := sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rc) }); err != nil {
+			return err
+		}
+		return sl.timed(ctx, "HEALTH", func() error {
+			return RunHealthCheck(ctx, t, hc, rp.Current, rc.Env)
+		})
 	}
-	if aerr := activate(newRC); aerr != nil {
-		// Reconfiguration failed after STOP. Restore the PRIOR configuration — the
-		// settings Terraform still holds in state — and health-check it so the
-		// machine is not left stopped or running rejected settings.
+	// forward applies the NEW configuration AND finalizes it. FINALIZE and the
+	// post-finalize Status read are part of the transaction: if either fails the
+	// machine must not be left on the new configuration while Terraform retains the
+	// prior state, so their failure triggers the same rollback as a health failure.
+	var (
+		okManifest *Manifest
+		okStatus   string
+	)
+	forward := func() error {
+		if err := activate(newRC, &s.HealthCheck); err != nil {
+			return err
+		}
+		nm := writeManifest("success")
+		if err := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, rp, nm) }); err != nil {
+			return coded("ERR_CONNECT", host, "FINALIZE", err)
+		}
+		st, serr := pat.Status(ctx, t, newRC)
+		if serr != nil {
+			return wrapTransportErr(serr, host, "READ")
+		}
+		okManifest, okStatus = nm, st
+		return nil
+	}
+	if ferr := forward(); ferr != nil {
+		// Any failure after we began mutating (STOP/CONFIGURE/START/HEALTH/FINALIZE/
+		// Status): restore the PRIOR configuration — the settings Terraform still
+		// holds in state — validated against the PRIOR health check, so the machine
+		// is not left stopped or running rejected settings.
 		priorRC := releaseCtxVersion(prior, rp, m.CurrentVersion)
 		priorRC.EmitStep = sl.emit
 		rbStart := time.Now()
-		rerr := activate(priorRC)
+		rerr := activate(priorRC, &prior.HealthCheck)
+		if rerr == nil {
+			// Prior configuration restored and healthy — re-finalize the manifest to
+			// record the rolled-back reconfigure (version/checksum unchanged).
+			rbm := writeManifest("rolled_back")
+			rerr = sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, rp, rbm) })
+		}
 		sl.emit(ctx, "ROLLBACK", rbStart)
 		if rerr != nil {
-			// DESIGN §10.6: restoration failed — persist a failed manifest and
-			// surface ERR_ROLLBACK_FAILED; the machine needs manual intervention.
-			fnm := writeManifest("failed")
-			if fmErr := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, rp, fnm) }); fmErr != nil {
-				e.warnf("failed-manifest write on %s: %v", host, fmErr)
+			// DESIGN §10.6: restoration (or its manifest write) failed — persist the
+			// required deploy/failed marker and SURFACE a persistence failure so the
+			// operator is forced to repair, rather than only warning. finalizeFailed
+			// writes last_operation.type=deploy, result=failed.
+			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s: reconfigure failed and restore of prior configuration failed; reconfigure error: %v; restore error: %v",
+				host, ferr, rerr)
+			if fmErr := e.finalizeFailed(ctx, sl, t, s, rp, m.CurrentVersion, started, "failed"); fmErr != nil {
+				detail = fmt.Errorf("%v; failed-marker persistence ALSO failed (manual repair required): %v", detail, fmErr)
 			}
-			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK",
-				fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s: reconfigure failed and restore of prior configuration failed; reconfigure error: %v; restore error: %v",
-					host, aerr, rerr))
+			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
 		}
-		// Prior configuration restored and healthy: re-finalize the manifest to
-		// record the rolled-back reconfigure, then surface the original error so
-		// the apply fails and Terraform retains the (now accurate) prior state.
-		rbm := writeManifest("rolled_back")
-		if fmErr := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, rp, rbm) }); fmErr != nil {
-			e.warnf("rollback-manifest write on %s: %v", host, fmErr)
-		}
-		return nil, fmt.Errorf("%w; prior configuration restored (healthy)", aerr)
+		// Surface the original error so the apply fails and Terraform retains the
+		// (now accurate) prior state.
+		return nil, fmt.Errorf("%w; prior configuration restored (healthy)", ferr)
 	}
-	// Success — re-finalize the manifest (version/checksum are unchanged).
-	nm := writeManifest("success")
-	if err := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, rp, nm) }); err != nil {
-		return nil, coded("ERR_CONNECT", host, "FINALIZE", err)
-	}
-	st, serr := pat.Status(ctx, t, newRC)
-	if serr != nil {
-		return nil, wrapTransportErr(serr, host, "READ")
-	}
-	out := statusFrom(nm, host, st)
+	out := statusFrom(okManifest, host, okStatus)
 	out.DeployedVersion = deployedVer
 	return out, nil
 }

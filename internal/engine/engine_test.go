@@ -26,16 +26,17 @@ import (
 // ----------------------------------------------------------------------------
 
 type fakeHost struct {
-	host       string
-	files      map[string][]byte // path -> content (case-sensitive; engine is consistent)
-	dirs       map[string]bool
-	dirTS      map[string]int64 // optional per-dir mtime ticks for deterministic prune
-	current    string           // junction target
-	svc        string           // "", "Stopped", "Running"
-	fail       map[string]bool  // step toggles: "switch","health","start","extract"
-	failN      map[string]int   // one-shot step failures: fail the first N calls, then succeed
-	healthGate func() bool      // optional dynamic health failure (true => fail)
-	log        []string         // executed step markers, in order
+	host             string
+	files            map[string][]byte // path -> content (case-sensitive; engine is consistent)
+	dirs             map[string]bool
+	dirTS            map[string]int64         // optional per-dir mtime ticks for deterministic prune
+	current          string                   // junction target
+	svc              string                   // "", "Stopped", "Running"
+	fail             map[string]bool          // step toggles: "switch","health","start","extract"
+	failN            map[string]int           // one-shot step failures: fail the first N calls, then succeed
+	healthGate       func() bool              // optional dynamic health failure (true => fail)
+	healthScriptGate func(script string) bool // optional health failure keyed on the executed script (true => fail)
+	log              []string                 // executed step markers, in order
 }
 
 func newFakeHost(name string) *fakeHost {
@@ -247,7 +248,7 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "Invoke-WebRequest"): // health http
-		if f.fail["health"] || (f.healthGate != nil && f.healthGate()) {
+		if f.fail["health"] || (f.healthGate != nil && f.healthGate()) || (f.healthScriptGate != nil && f.healthScriptGate(s)) {
 			return transport.Result{ExitCode: 1, Stdout: "connection refused"}, nil
 		}
 		f.mark("HEALTH")
@@ -613,8 +614,42 @@ func TestReconfigureRollbackFailedSurfaces(t *testing.T) { // RBK-05: restore al
 		t.Fatalf("error must be ERR_ROLLBACK_FAILED with unknown-state detail, got %v", err)
 	}
 	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
-	if !strings.Contains(mj, `"result": "failed"`) {
-		t.Fatalf("failed manifest (§10.6) not written: %s", mj)
+	if !strings.Contains(mj, `"result": "failed"`) || !strings.Contains(mj, `"type": "deploy"`) {
+		t.Fatalf("failed manifest (§10.6 deploy/failed marker) not written: %s", mj)
+	}
+}
+
+func TestReconfigureRestoreUsesPriorHealthCheck(t *testing.T) { // RBK-06: restore validated against prior check
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum) // new health check → http://localhost:8080/health
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	prior := winSvcSpec(t, url, sum)
+	prior.HealthCheck.HTTP.URL = "http://localhost:9090/health" // prior check differs
+	f.log = nil
+	// Health passes ONLY for the PRIOR check's endpoint (:9090); the new check's
+	// endpoint (:8080) fails. Restoration therefore succeeds only if it is validated
+	// against prior.HealthCheck — if the engine reused the new check, the restore
+	// health would fail and this would surface ERR_ROLLBACK_FAILED instead.
+	f.healthScriptGate = func(script string) bool { return strings.Contains(script, "8080") }
+	st, err := eng.Reconfigure(context.Background(), d, prior)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when new-config HEALTH fails, got status %+v", st)
+	}
+	if strings.Contains(err.Error(), "ERR_ROLLBACK_FAILED") {
+		t.Fatalf("restore validated against the WRONG (new) health check: %v", err)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("restore against prior health check must succeed, got %v", err)
+	}
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "rolled_back"`) {
+		t.Fatalf("rolled-back manifest not finalized: %s", mj)
 	}
 }
 
