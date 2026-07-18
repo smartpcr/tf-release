@@ -935,24 +935,45 @@ func TestDeploymentIDDeterministicSHA1(t *testing.T) {
 	}
 }
 
-// TestDiagSummaryCoded is the unit-level contract for the Summary formatter: a coded
-// engine error surfaces its taxonomy code, a bare error falls back, and a deadline
-// (even wrapped) maps to ERR_TIMEOUT — every result is the exact "[<CODE>] <short>" shape.
+// TestDiagSummaryCoded is the unit-level contract for the Summary formatter and the
+// DESIGN §8.1-vs-§12 timeout taxonomy. Classification keys on the OPERATION CONTEXT:
+//   - outer resource context expired            → ERR_TIMEOUT (TF/runner timeout)
+//   - outer context LIVE + coded engine error   → the engine's taxonomy code
+//   - outer context LIVE + nested transport      → ERR_CONNECT even though the error's
+//     Unwrap chain carries context.DeadlineExceeded (a dial/WinRM child deadline)
+//   - non-coded pre-flight error                → the operation fallback code
+//
+// Every result is the exact "[<CODE>] <short>" shape.
 func TestDiagSummaryCoded(t *testing.T) {
+	liveCtx := context.Background()
+	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+	defer cancel()
+	if expiredCtx.Err() != context.DeadlineExceeded {
+		t.Fatalf("test setup: expiredCtx must be DeadlineExceeded, got %v", expiredCtx.Err())
+	}
 	cases := []struct {
 		name     string
+		ctx      context.Context
 		fallback string
 		err      error
 		want     string
 	}{
-		{"coded", "ERR_SPEC_INVALID", &engine.CodedError{Code: "ERR_CONNECT", Err: fmt.Errorf("x")}, "[ERR_CONNECT] deploy failed"},
-		{"fallback", "ERR_SPEC_INVALID", fmt.Errorf("plain"), "[ERR_SPEC_INVALID] deploy failed"},
-		{"deadline", "ERR_CONNECT", context.DeadlineExceeded, "[ERR_TIMEOUT] deploy failed"},
-		{"wrapped-deadline", "ERR_CONNECT", &engine.CodedError{Code: "ERR_CONNECT", Err: fmt.Errorf("d: %w", context.DeadlineExceeded)}, "[ERR_TIMEOUT] deploy failed"},
+		{"coded", liveCtx, "ERR_SPEC_INVALID", &engine.CodedError{Code: "ERR_CONNECT", Err: fmt.Errorf("x")}, "[ERR_CONNECT] deploy failed"},
+		{"fallback", liveCtx, "ERR_SPEC_INVALID", fmt.Errorf("plain"), "[ERR_SPEC_INVALID] deploy failed"},
+		// Live outer context + nested transport/dial deadline: STAYS ERR_CONNECT.
+		{"live-ctx-nested-transport-deadline", liveCtx, "ERR_CONNECT",
+			&engine.CodedError{Code: "ERR_CONNECT", Err: fmt.Errorf("dial: %w", context.DeadlineExceeded)},
+			"[ERR_CONNECT] deploy failed"},
+		{"live-ctx-bare-deadline", liveCtx, "ERR_CONNECT", context.DeadlineExceeded, "[ERR_CONNECT] deploy failed"},
+		// Expired outer resource context ⇒ ERR_TIMEOUT regardless of the wrapped code.
+		{"expired-ctx-timeout", expiredCtx, "ERR_CONNECT",
+			&engine.CodedError{Code: "ERR_CONNECT", Err: fmt.Errorf("d: %w", context.DeadlineExceeded)},
+			"[ERR_TIMEOUT] deploy failed"},
+		{"expired-ctx-plain-err", expiredCtx, "ERR_CONNECT", fmt.Errorf("plain"), "[ERR_TIMEOUT] deploy failed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := diagSummary(tc.fallback, "deploy failed", tc.err); got != tc.want {
+			if got := diagSummary(tc.ctx, tc.fallback, "deploy failed", tc.err); got != tc.want {
 				t.Fatalf("diagSummary = %q, want %q", got, tc.want)
 			}
 		})
@@ -1085,14 +1106,16 @@ func TestCreateSurfacesCodedDeployError(t *testing.T) {
 	}
 }
 
-// TestCreateDeadlineSurfacesTimeout proves item-1 of the iter-3 review: a resource
-// deadline expiry maps to ERR_TIMEOUT (the DESIGN §12 code reserved for TF timeouts),
-// even when the engine re-wraps context.DeadlineExceeded under an ERR_CONNECT
-// transport error — diagSummary prioritises the deadline over the wrapped code.
-func TestCreateDeadlineSurfacesTimeout(t *testing.T) {
+// TestCreateNestedTransportDeadlineIsConnect proves the DESIGN §8.1 side of the
+// timeout taxonomy end-to-end: when the OUTER resource operation context is still
+// live but the engine surfaces a nested dial/transport child deadline (an ERR_CONNECT
+// CodedError whose Unwrap chain carries context.DeadlineExceeded), Create must keep
+// the ERR_CONNECT code — the child deadline is a connectivity failure, not a TF timeout.
+func TestCreateNestedTransportDeadlineIsConnect(t *testing.T) {
 	t.Setenv("LABDEPLOY_PASSWORD", "pw")
 	// Engine surfaces the deadline the way wrapTransportErr does: an ERR_CONNECT
-	// CodedError whose Unwrap chain still carries context.DeadlineExceeded.
+	// CodedError whose Unwrap chain still carries context.DeadlineExceeded. runCreate's
+	// outer context uses the default 30m create timeout, so it is LIVE here.
 	fake := &fakeErrEngine{err: &engine.CodedError{Code: "ERR_CONNECT", Host: "lab-01",
 		Step: "PREFLIGHT", Err: fmt.Errorf("dial: %w", context.DeadlineExceeded)}}
 	r := &DeploymentResource{newEngine: func() deployEngine { return fake }}
@@ -1104,10 +1127,73 @@ func TestCreateDeadlineSurfacesTimeout(t *testing.T) {
 		t.Fatal("Create must surface the deploy failure")
 	}
 	sum := resp.Diagnostics.Errors()[0].Summary()
-	if !strings.HasPrefix(sum, "[ERR_TIMEOUT] ") {
-		t.Fatalf("deadline expiry Summary must begin with [ERR_TIMEOUT], got %q", sum)
+	if !strings.HasPrefix(sum, "[ERR_CONNECT] ") {
+		t.Fatalf("nested transport deadline under a live resource context must stay [ERR_CONNECT], got %q", sum)
 	}
 }
+
+// TestCreateResourceDeadlineIsTimeout proves the DESIGN §12 side of the taxonomy
+// end-to-end: when the OUTER Terraform resource-operation deadline (the create
+// timeout block) actually expires, Create maps the failure to ERR_TIMEOUT. The
+// engine blocks until the operation context is Done, so the classifier observes the
+// expired resource context (not merely a DeadlineExceeded buried in the error).
+func TestCreateResourceDeadlineIsTimeout(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	r := &DeploymentResource{newEngine: func() deployEngine { return &blockingEngine{} }}
+	ctx := context.Background()
+	sr := resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, &sr)
+	p := tfsdk.Plan{Schema: sr.Schema}
+	plan := &deploymentModel{Spec: types.StringValue(wsSpecYAML("1.0.0")), SpecFile: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType),
+		Timeouts: shortTimeouts(t, "1ms")}
+	if d := p.Set(ctx, plan); d.HasError() {
+		t.Fatalf("build plan: %v", d)
+	}
+	resp := &resource.CreateResponse{State: tfsdk.State{Schema: sr.Schema}}
+	r.Create(ctx, resource.CreateRequest{Plan: p}, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Create must surface the resource-timeout failure")
+	}
+	sum := resp.Diagnostics.Errors()[0].Summary()
+	if !strings.HasPrefix(sum, "[ERR_TIMEOUT] ") {
+		t.Fatalf("expired resource context must map to [ERR_TIMEOUT], got %q", sum)
+	}
+}
+
+// shortTimeouts builds a timeouts.Value whose create attribute is the given duration
+// string (e.g. "1ms"), so a test can drive an operation context that expires promptly.
+func shortTimeouts(t *testing.T, create string) timeouts.Value {
+	t.Helper()
+	obj, d := types.ObjectValue(
+		map[string]attr.Type{"create": types.StringType, "update": types.StringType, "delete": types.StringType},
+		map[string]attr.Value{"create": types.StringValue(create), "update": types.StringNull(), "delete": types.StringNull()},
+	)
+	if d.HasError() {
+		t.Fatalf("build timeouts: %v", d)
+	}
+	return timeouts.Value{Object: obj}
+}
+
+// blockingEngine blocks each engine call until the operation context is Done, then
+// returns that context's error — modelling a real transport whose in-flight operation
+// is aborted when the outer resource deadline fires.
+type blockingEngine struct{}
+
+func (*blockingEngine) Update(ctx context.Context, _, _ *spec.Deployment) (*engine.Status, error) {
+	<-ctx.Done()
+	return nil, fmt.Errorf("deploy aborted: %w", ctx.Err())
+}
+func (*blockingEngine) ReadStatus(ctx context.Context, _ *spec.Deployment) (*engine.Status, error) {
+	<-ctx.Done()
+	return nil, fmt.Errorf("read aborted: %w", ctx.Err())
+}
+func (*blockingEngine) Destroy(ctx context.Context, _ *spec.Deployment, _ string) error {
+	<-ctx.Done()
+	return fmt.Errorf("destroy aborted: %w", ctx.Err())
+}
+func (*blockingEngine) Warns() []string { return nil }
 
 // TestModifyPlanImmutablePathsRequireReplace is the T9 plan-level proof that a change
 // to EACH immutable path — pattern.type, service_name, and target.os (target.hosts is

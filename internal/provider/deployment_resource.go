@@ -371,7 +371,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	}
 	newSpec, newHash, defaultsContributed, err := r.resolveSpecDetail(ctx, &plan)
 	if err != nil {
-		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec", err), err.Error())
+		resp.Diagnostics.AddError(diagSummary(ctx, "ERR_SPEC_INVALID", "invalid spec", err), err.Error())
 		return
 	}
 	plan.SpecHash = types.StringValue(newHash)
@@ -396,7 +396,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	if perr != nil {
 		// Corrupt persisted snapshot: fail loudly (consistent with stateSpec) rather than
 		// planning an update against an untrustworthy prior that could target the wrong host.
-		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec in state", perr), perr.Error())
+		resp.Diagnostics.AddError(diagSummary(ctx, "ERR_SPEC_INVALID", "invalid spec in state", perr), perr.Error())
 		return
 	}
 	if oldSpec == nil {
@@ -505,7 +505,7 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	if perr != nil {
 		// Corrupt persisted snapshot: surface it (consistent with stateSpec / ModifyPlan)
 		// rather than feeding a fabricated or nil prior into a blind Deploy.
-		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec in state", perr), perr.Error())
+		resp.Diagnostics.AddError(diagSummary(ctx, "ERR_SPEC_INVALID", "invalid spec in state", perr), perr.Error())
 		return
 	}
 	r.apply(ctx, &plan, prior, &resp.Diagnostics, func(m *deploymentModel) {
@@ -587,7 +587,7 @@ func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
 	prior *spec.Deployment, diags diagAppender, setState func(*deploymentModel)) {
 	d, hash, err := r.resolveSpec(ctx, plan)
 	if err != nil {
-		diags.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec", err), err.Error())
+		diags.AddError(diagSummary(ctx, "ERR_SPEC_INVALID", "invalid spec", err), err.Error())
 		return
 	}
 	eng := r.engine()
@@ -596,7 +596,7 @@ func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
 		diags.AddWarning(warnSummary(w), w)
 	}
 	if err != nil {
-		diags.AddError(diagSummary("ERR_CONNECT", "deploy failed", err), err.Error())
+		diags.AddError(diagSummary(ctx, "ERR_CONNECT", "deploy failed", err), err.Error())
 		return
 	}
 	plan.ID = types.StringValue(deploymentID(d))
@@ -615,7 +615,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	}
 	d, _, verified, err := r.stateSpec(ctx, &state)
 	if err != nil {
-		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec in state", err), err.Error())
+		resp.Diagnostics.AddError(diagSummary(ctx, "ERR_SPEC_INVALID", "invalid spec in state", err), err.Error())
 		return
 	}
 	eng := r.engine()
@@ -628,7 +628,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 		// drop). We surface an ERROR diagnostic but do NOT RemoveResource, so the
 		// prior state is retained — an unreachable target is not a deleted
 		// resource (evaluator item 4).
-		resp.Diagnostics.AddError(diagSummary("ERR_CONNECT", "read failed", err), err.Error())
+		resp.Diagnostics.AddError(diagSummary(ctx, "ERR_CONNECT", "read failed", err), err.Error())
 		return
 	}
 	if st == nil { // manifest absent
@@ -667,7 +667,7 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	defer cancel()
 	d, _, verified, err := r.stateSpec(ctx, &state)
 	if err != nil {
-		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec in state", err), err.Error())
+		resp.Diagnostics.AddError(diagSummary(ctx, "ERR_SPEC_INVALID", "invalid spec in state", err), err.Error())
 		return
 	}
 	if !verified {
@@ -684,7 +684,7 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	}
 	eng := r.engine()
 	if err := eng.Destroy(ctx, d, state.DestroyMode.ValueString()); err != nil {
-		resp.Diagnostics.AddError(diagSummary("ERR_CONNECT", "destroy failed", err), err.Error())
+		resp.Diagnostics.AddError(diagSummary(ctx, "ERR_CONNECT", "destroy failed", err), err.Error())
 		return
 	}
 	for _, w := range eng.Warns() {
@@ -704,16 +704,24 @@ func (r *DeploymentResource) ImportState(ctx context.Context, req resource.Impor
 
 // diagSummary formats a diagnostic Summary per DESIGN §12: exactly
 // "[<CODE>] <short>", using only codes from the closed §12 taxonomy table.
-// Priority: a resource/engine deadline (context.DeadlineExceeded, including when
-// the engine re-wrapped it as ERR_CONNECT) maps to ERR_TIMEOUT — the code §12
-// reserves for "runner.timeout_seconds / TF timeouts"; otherwise an
-// *engine.CodedError surfaces its taxonomy code (e.g. ERR_CONNECT); otherwise the
-// operation-appropriate fallback so the contract also holds for pre-flight
-// (spec/state) errors that never reached the engine.
-func diagSummary(fallback, short string, err error) string {
+//
+// Timeout taxonomy (DESIGN §8.1 vs §12): ERR_TIMEOUT is reserved for the OUTER
+// Terraform resource-operation deadline (the create/update/delete timeouts block,
+// or runner.timeout_seconds) expiring; a dial/transport/WinRM CHILD deadline that
+// fires while the outer operation context is still live is a connectivity failure
+// and MUST stay ERR_CONNECT. We therefore classify on the OPERATION CONTEXT ITSELF
+// (ctx.Err() == context.DeadlineExceeded at the CRUD boundary) rather than on
+// errors.Is(err, context.DeadlineExceeded) — the latter would wrongly reclassify a
+// nested transport deadline (which the engine surfaces as ERR_CONNECT) as a TF
+// timeout even when the resource context has not expired.
+//
+// When the outer context is live, an *engine.CodedError surfaces its taxonomy code
+// (e.g. ERR_CONNECT); otherwise the operation-appropriate fallback so the contract
+// also holds for pre-flight (spec/state) errors that never reached the engine.
+func diagSummary(ctx context.Context, fallback, short string, err error) string {
 	code := fallback
 	switch {
-	case err != nil && errors.Is(err, context.DeadlineExceeded):
+	case ctx != nil && ctx.Err() == context.DeadlineExceeded:
 		code = "ERR_TIMEOUT"
 	default:
 		var ce *engine.CodedError
