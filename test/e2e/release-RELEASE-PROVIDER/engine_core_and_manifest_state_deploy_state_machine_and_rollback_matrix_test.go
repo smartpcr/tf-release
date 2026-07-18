@@ -677,7 +677,28 @@ func (w *dsmWorld) unmatchedScripts() []string {
 	return out
 }
 
-func dsmManifestOf(f *dsmHost) string { return string(f.files[dsmManifestPath]) }
+// dsmAssertManifest decodes the manifest bytes the engine wrote for host f into
+// an engine.Manifest and checks CurrentVersion / LastOperation.Result on the
+// decoded struct. Asserting on the typed fields (rather than substring-matching
+// the serialized JSON) keeps these scenarios robust against any change to
+// WriteManifest's json.MarshalIndent layout -- indent width, compact output, or
+// a renamed/reordered field -- so a scenario only fails when the on-target state
+// is actually wrong.
+func dsmAssertManifest(f *dsmHost, wantVersion, wantResult string) error {
+	raw, has := f.files[dsmManifestPath]
+	if !has {
+		return fmt.Errorf("expected a manifest at %s, found none; log=%v", dsmManifestPath, f.log)
+	}
+	var m engine.Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("manifest at %s is not valid engine.Manifest JSON: %v (raw=%s)", dsmManifestPath, err, raw)
+	}
+	if m.CurrentVersion != wantVersion || m.LastOperation.Result != wantResult {
+		return fmt.Errorf("manifest must record current_version=%q result=%q, got current_version=%q result=%q",
+			wantVersion, wantResult, m.CurrentVersion, m.LastOperation.Result)
+	}
+	return nil
+}
 
 func dsmIsPreSwitch(step string) bool {
 	switch step {
@@ -797,9 +818,8 @@ func (w *dsmWorld) matrixStateMatches(outcome string) error {
 		if !strings.HasSuffix(f.current, `releases\1.0.0`) {
 			return fmt.Errorf("rollback must restore junction to 1.0.0, got %q", f.current)
 		}
-		m := dsmManifestOf(f)
-		if !strings.Contains(m, `"current_version": "1.0.0"`) || !strings.Contains(m, `"result": "rolled_back"`) {
-			return fmt.Errorf("rollback manifest must record 1.0.0 rolled_back: %s", m)
+		if err := dsmAssertManifest(f, "1.0.0", "rolled_back"); err != nil {
+			return fmt.Errorf("rollback manifest must record 1.0.0 rolled_back: %w", err)
 		}
 		return nil
 	}
@@ -833,9 +853,8 @@ func dsmAssertPrevIntact(f *dsmHost) error {
 	if !strings.HasSuffix(f.current, `releases\1.0.0`) {
 		return fmt.Errorf("pre-switch failure must keep junction at 1.0.0, got %q", f.current)
 	}
-	m := dsmManifestOf(f)
-	if !strings.Contains(m, `"current_version": "1.0.0"`) || !strings.Contains(m, `"result": "success"`) {
-		return fmt.Errorf("pre-switch failure must leave the 1.0.0 success manifest untouched: %s", m)
+	if err := dsmAssertManifest(f, "1.0.0", "success"); err != nil {
+		return fmt.Errorf("pre-switch failure must leave the 1.0.0 success manifest untouched: %w", err)
 	}
 	return nil
 }
