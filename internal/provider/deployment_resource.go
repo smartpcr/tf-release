@@ -83,20 +83,20 @@ func (r *DeploymentResource) ConfigValidators(_ context.Context) []resource.Conf
 }
 
 type deploymentModel struct {
-	ID              types.String `tfsdk:"id"`
-	Name            types.String `tfsdk:"name"`
-	Spec            types.String `tfsdk:"spec"`
-	SpecFile        types.String `tfsdk:"spec_file"`
-	Variables       types.Map    `tfsdk:"variables"`
-	VersionOverride types.String `tfsdk:"version_override"`
-	DestroyMode     types.String `tfsdk:"destroy_mode"`
-	SpecHash        types.String `tfsdk:"spec_hash"`
-	ResolvedSpec    types.String `tfsdk:"resolved_spec"`
-	DeployedVersion types.String `tfsdk:"deployed_version"`
-	PreviousVersion types.String `tfsdk:"previous_version"`
-	Hosts           types.List   `tfsdk:"hosts"`
-	ReleasePath     types.String `tfsdk:"release_path"`
-	ServiceStatus   types.String `tfsdk:"service_status"`
+	ID              types.String   `tfsdk:"id"`
+	Name            types.String   `tfsdk:"name"`
+	Spec            types.String   `tfsdk:"spec"`
+	SpecFile        types.String   `tfsdk:"spec_file"`
+	Variables       types.Map      `tfsdk:"variables"`
+	VersionOverride types.String   `tfsdk:"version_override"`
+	DestroyMode     types.String   `tfsdk:"destroy_mode"`
+	SpecHash        types.String   `tfsdk:"spec_hash"`
+	ResolvedSpec    types.String   `tfsdk:"resolved_spec"`
+	DeployedVersion types.String   `tfsdk:"deployed_version"`
+	PreviousVersion types.String   `tfsdk:"previous_version"`
+	Hosts           types.List     `tfsdk:"hosts"`
+	ReleasePath     types.String   `tfsdk:"release_path"`
+	ServiceStatus   types.String   `tfsdk:"service_status"`
 	Timeouts        timeouts.Value `tfsdk:"timeouts"`
 }
 
@@ -197,7 +197,7 @@ func (r *DeploymentResource) UpgradeState(ctx context.Context) map[int64]resourc
 func (r *DeploymentResource) backfillResolvedSpec(ctx context.Context, state *deploymentModel, diags *diag.Diagnostics) {
 	d, hash, defaultsContributed, err := r.resolveSpecDetail(ctx, state)
 	if err != nil {
-		diags.AddWarning("labdeploy state not fully migrated",
+		diags.AddWarning("[WARN] labdeploy state not fully migrated",
 			"could not reconstruct a resolved_spec snapshot for this legacy resource "+
 				"(the spec could not be resolved: "+err.Error()+"). Lifecycle operations "+
 				"remain fail-safe; run terraform apply once the spec is resolvable to persist "+
@@ -209,7 +209,7 @@ func (r *DeploymentResource) backfillResolvedSpec(ctx context.Context, state *de
 		// The source no longer matches what was deployed (edited alongside the provider
 		// upgrade) or there is no baseline to compare. Snapshotting now would record the
 		// DESIRED config as the deployed prior — a false, high-impact fabrication. Decline.
-		diags.AddWarning("labdeploy state not fully migrated",
+		diags.AddWarning("[WARN] labdeploy state not fully migrated",
 			"the current spec no longer matches the spec_hash recorded at the last apply "+
 				"(or no baseline spec_hash exists), so a resolved_spec snapshot cannot be "+
 				"trusted to reflect the DEPLOYED configuration. Leaving the snapshot unset so "+
@@ -224,7 +224,7 @@ func (r *DeploymentResource) backfillResolvedSpec(ctx context.Context, state *de
 		// on provider config the persisted hash never covered — the merged fields may
 		// never have been deployed. Decline so a provider-default change cannot fabricate
 		// the deployed identity during state migration.
-		diags.AddWarning("labdeploy state not fully migrated",
+		diags.AddWarning("[WARN] labdeploy state not fully migrated",
 			"the current spec relies on provider default_target values to fill one or more "+
 				"target fields, but spec_hash is computed before those defaults are merged, "+
 				"so it cannot prove the merged configuration was ever deployed. Leaving the "+
@@ -396,7 +396,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	if perr != nil {
 		// Corrupt persisted snapshot: fail loudly (consistent with stateSpec) rather than
 		// planning an update against an untrustworthy prior that could target the wrong host.
-		resp.Diagnostics.AddError(diagSummary("ERR_STATE_CORRUPT", "invalid spec in state", perr), perr.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec in state", perr), perr.Error())
 		return
 	}
 	if oldSpec == nil {
@@ -407,7 +407,7 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 		// original deployment. BLOCK the plan with an executable recovery instead of laundering
 		// the unverifiable merged identity into state.
 		if defaultsContributed {
-			resp.Diagnostics.AddError("labdeploy state migration required", recoveryUnverifiableDefaults)
+			resp.Diagnostics.AddError("[ERR_SPEC_INVALID] labdeploy state migration required", recoveryUnverifiableDefaults)
 			return
 		}
 		// Otherwise the v0→v1 state upgrader normally backfilled resolved_spec already; this
@@ -505,7 +505,7 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	if perr != nil {
 		// Corrupt persisted snapshot: surface it (consistent with stateSpec / ModifyPlan)
 		// rather than feeding a fabricated or nil prior into a blind Deploy.
-		resp.Diagnostics.AddError(diagSummary("ERR_STATE_CORRUPT", "invalid spec in state", perr), perr.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec in state", perr), perr.Error())
 		return
 	}
 	r.apply(ctx, &plan, prior, &resp.Diagnostics, func(m *deploymentModel) {
@@ -532,7 +532,7 @@ func (r *DeploymentResource) priorFromState(ctx context.Context, state *deployme
 			// Corrupt snapshot: do NOT fall back to the mutable spec_file (which could target
 			// the wrong identity) and do NOT return a nil "no prior" (which Update would treat
 			// as a blind first deploy). Surface it as state corruption.
-			return nil, fmt.Errorf("[ERR_STATE_CORRUPT] resolved_spec in state is not decodable: %w; %s", err, recoveryCorruptSnapshot)
+			return nil, fmt.Errorf("[ERR_SPEC_INVALID] resolved_spec in state is not decodable: %w; %s", err, recoveryCorruptSnapshot)
 		}
 		return &d, nil
 	}
@@ -572,7 +572,7 @@ func (r *DeploymentResource) stateSpec(ctx context.Context, state *deploymentMod
 	if rs := state.ResolvedSpec.ValueString(); rs != "" {
 		var sd spec.Deployment
 		if uerr := json.Unmarshal([]byte(rs), &sd); uerr != nil {
-			return nil, "", false, fmt.Errorf("[ERR_STATE_CORRUPT] resolved_spec in state is not decodable: %w; %s", uerr, recoveryCorruptSnapshot)
+			return nil, "", false, fmt.Errorf("[ERR_SPEC_INVALID] resolved_spec in state is not decodable: %w; %s", uerr, recoveryCorruptSnapshot)
 		}
 		return &sd, state.SpecHash.ValueString(), true, nil
 	}
@@ -615,7 +615,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 	}
 	d, _, verified, err := r.stateSpec(ctx, &state)
 	if err != nil {
-		resp.Diagnostics.AddError(diagSummary("ERR_STATE_CORRUPT", "invalid spec in state", err), err.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec in state", err), err.Error())
 		return
 	}
 	eng := r.engine()
@@ -638,7 +638,7 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 			// point at a DIFFERENT target — treating it as absence would drop state and
 			// orphan the still-deployed service. Retain state and demand an explicit
 			// migration instead of silently removing the resource.
-			resp.Diagnostics.AddError("labdeploy state migration required",
+			resp.Diagnostics.AddError("[ERR_SPEC_INVALID] labdeploy state migration required",
 				"a missing manifest here may be the result of a spec_file edit pointing at a "+
 					"different target rather than a real deletion, so removing state would orphan the "+
 					"still-deployed service. "+recoveryUnverifiableLegacy)
@@ -667,7 +667,7 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	defer cancel()
 	d, _, verified, err := r.stateSpec(ctx, &state)
 	if err != nil {
-		resp.Diagnostics.AddError(diagSummary("ERR_STATE_CORRUPT", "invalid spec in state", err), err.Error())
+		resp.Diagnostics.AddError(diagSummary("ERR_SPEC_INVALID", "invalid spec in state", err), err.Error())
 		return
 	}
 	if !verified {
@@ -676,7 +676,7 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 		// An immutable-field edit on disk (host, service_name, install_root) would make
 		// Destroy target the WRONG service and orphan the one actually deployed. Refuse to
 		// destroy an unverifiable identity; demand an explicit migration first.
-		resp.Diagnostics.AddError("labdeploy state migration required",
+		resp.Diagnostics.AddError("[ERR_SPEC_INVALID] labdeploy state migration required",
 			"the identity to destroy cannot be verified from state — it would be re-derived from "+
 				"the current spec_file, which may have been edited to point at a different target, so "+
 				"destroying now could orphan the deployed service. "+recoveryUnverifiableLegacy)
@@ -703,15 +703,23 @@ func (r *DeploymentResource) ImportState(ctx context.Context, req resource.Impor
 // ------------------------------ shared helpers ------------------------------
 
 // diagSummary formats a diagnostic Summary per DESIGN §12: exactly
-// "[<CODE>] <short>". Engine failures bubble up as *engine.CodedError carrying
-// the taxonomy code (e.g. ERR_CONNECT); surface it when present, otherwise fall
-// back to the operation-appropriate code so the contract also holds for
-// pre-flight (spec/state) errors that never reached the engine.
+// "[<CODE>] <short>", using only codes from the closed §12 taxonomy table.
+// Priority: a resource/engine deadline (context.DeadlineExceeded, including when
+// the engine re-wrapped it as ERR_CONNECT) maps to ERR_TIMEOUT — the code §12
+// reserves for "runner.timeout_seconds / TF timeouts"; otherwise an
+// *engine.CodedError surfaces its taxonomy code (e.g. ERR_CONNECT); otherwise the
+// operation-appropriate fallback so the contract also holds for pre-flight
+// (spec/state) errors that never reached the engine.
 func diagSummary(fallback, short string, err error) string {
 	code := fallback
-	var ce *engine.CodedError
-	if errors.As(err, &ce) && ce.Code != "" {
-		code = ce.Code
+	switch {
+	case err != nil && errors.Is(err, context.DeadlineExceeded):
+		code = "ERR_TIMEOUT"
+	default:
+		var ce *engine.CodedError
+		if errors.As(err, &ce) && ce.Code != "" {
+			code = ce.Code
+		}
 	}
 	return fmt.Sprintf("[%s] %s", code, short)
 }
@@ -752,7 +760,7 @@ func fillStatus(ctx context.Context, m *deploymentModel, st *engine.Status, diag
 	m.ServiceStatus = types.StringValue(st.ServiceStatus)
 	hosts, d := types.ListValueFrom(ctx, types.StringType, st.Hosts)
 	if d.HasError() {
-		diags.AddError("internal", fmt.Sprintf("hosts conversion: %v", d.Errors()))
+		diags.AddError("[ERR_SPEC_INVALID] internal error", fmt.Sprintf("hosts conversion: %v", d.Errors()))
 		return
 	}
 	m.Hosts = hosts
