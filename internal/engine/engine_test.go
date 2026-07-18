@@ -510,7 +510,7 @@ func TestReconfigureAppliesConfig(t *testing.T) { // IDP-02: config-only update 
 	// skips CONFIGURE. Reconfigure must transactionally STOP → CONFIGURE → START →
 	// HEALTH under the lock so the new config is activated on the running process,
 	// WITHOUT re-staging/switching (no FETCH/EXTRACT/SWITCH).
-	st, err := eng.Reconfigure(context.Background(), d)
+	st, err := eng.Reconfigure(context.Background(), d, d)
 	if err != nil {
 		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
 	}
@@ -547,12 +547,74 @@ func TestReconfigureAbsentIsNoop(t *testing.T) { // IDP-03: nothing deployed => 
 	defer done()
 	f := newFakeHost("lab-01")
 	eng := engineWith(f)
-	st, err := eng.Reconfigure(context.Background(), winSvcSpec(t, url, sum))
+	spec := winSvcSpec(t, url, sum)
+	st, err := eng.Reconfigure(context.Background(), spec, spec)
 	if err != nil {
 		t.Fatalf("reconfigure on absent deployment must be a no-op, got %v", err)
 	}
 	if st != nil {
 		t.Fatalf("reconfigure on absent deployment must return nil status, got %+v", st)
+	}
+}
+
+func TestReconfigureRestoresPriorOnFailure(t *testing.T) { // RBK-04: config-only update fails, prior restored
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Fail the FIRST CONFIGURE (the new settings) once; the restore CONFIGURE of
+	// the prior settings then succeeds. The reconfigure must roll the machine back
+	// to the prior configuration, health-check it, and surface the original error.
+	f.failN["configure"] = 1
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when CONFIGURE fails, got status %+v", st)
+	}
+	if st != nil {
+		t.Fatalf("failed reconfigure must return nil status, got %+v", st)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("error must report prior config restored, got %v", err)
+	}
+	// The manifest records the rolled-back reconfigure, version/checksum unchanged;
+	// this is written only on the restore-succeeded path.
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "rolled_back"`) || !strings.Contains(mj, `"current_version": "1.0.0"`) {
+		t.Fatalf("rolled-back manifest not finalized: %s", mj)
+	}
+}
+
+func TestReconfigureRollbackFailedSurfaces(t *testing.T) { // RBK-05: restore also fails => ERR_ROLLBACK_FAILED
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// HEALTH fails permanently: the new config fails HEALTH, and the restored prior
+	// config also fails HEALTH, so restoration cannot be confirmed. The engine must
+	// persist a failed manifest (§10.6) and surface ERR_ROLLBACK_FAILED.
+	f.fail["health"] = true
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when restore fails, got status %+v", st)
+	}
+	if !strings.Contains(err.Error(), "ERR_ROLLBACK_FAILED") || !strings.Contains(err.Error(), "MACHINE IN UNKNOWN STATE") {
+		t.Fatalf("error must be ERR_ROLLBACK_FAILED with unknown-state detail, got %v", err)
+	}
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "failed"`) {
+		t.Fatalf("failed manifest (§10.6) not written: %s", mj)
 	}
 }
 

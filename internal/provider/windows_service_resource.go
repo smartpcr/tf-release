@@ -339,7 +339,15 @@ func (r *WindowsServiceResource) Update(ctx context.Context, req resource.Update
 		err   error
 	)
 	if wsArtifactUnchanged(&plan, &state) {
-		st, warns, err = std.reconfigure(ctx)
+		// Prepare the PRIOR deployment from the current state so the engine can
+		// restore and health-check it if the reconfiguration fails after STOP,
+		// keeping the machine consistent with the state Terraform retains on error.
+		stdPrior, pdiags := r.prepare(ctx, &state)
+		resp.Diagnostics.Append(pdiags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		st, warns, err = std.reconfigure(ctx, stdPrior)
 	} else {
 		st, warns, err = std.apply(ctx)
 	}

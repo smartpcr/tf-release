@@ -57,9 +57,17 @@ func (s *singleTargetDeployment) apply(ctx context.Context) (*engine.Status, []s
 // description, start type, recovery, environment, arguments) without touching
 // artifact.version/checksum and would therefore hit the engine idempotency
 // short-circuit (DESIGN §10.1 step 2) if routed through apply/Deploy.
-func (s *singleTargetDeployment) reconfigure(ctx context.Context) (*engine.Status, []string, error) {
+//
+// prior carries the configuration Terraform still holds in state so the engine
+// can restore and health-check it if the reconfiguration fails after STOP,
+// keeping the machine consistent with the state Terraform retains on error.
+func (s *singleTargetDeployment) reconfigure(ctx context.Context, prior *singleTargetDeployment) (*engine.Status, []string, error) {
 	eng := engine.New()
-	st, err := eng.Reconfigure(ctx, s.dep)
+	var pd *spec.Deployment
+	if prior != nil {
+		pd = prior.dep
+	}
+	st, err := eng.Reconfigure(ctx, s.dep, pd)
 	return st, eng.Warnings, err
 }
 
