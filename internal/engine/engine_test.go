@@ -507,8 +507,9 @@ func TestReconfigureAppliesConfig(t *testing.T) { // IDP-02: config-only update 
 	}
 	f.log = nil
 	// Same artifact version/checksum: Deploy would be an idempotent no-op that
-	// skips CONFIGURE. Reconfigure must still reach CONFIGURE so mutable service
-	// settings land, WITHOUT re-staging/switching (no FETCH/EXTRACT/SWITCH/STOP).
+	// skips CONFIGURE. Reconfigure must transactionally STOP → CONFIGURE → START →
+	// HEALTH under the lock so the new config is activated on the running process,
+	// WITHOUT re-staging/switching (no FETCH/EXTRACT/SWITCH).
 	st, err := eng.Reconfigure(context.Background(), d)
 	if err != nil {
 		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
@@ -516,14 +517,27 @@ func TestReconfigureAppliesConfig(t *testing.T) { // IDP-02: config-only update 
 	if st == nil || st.DeployedVersion != "1.0.0" {
 		t.Fatalf("reconfigure status: %+v", st)
 	}
-	joined := strings.Join(f.log, ">")
-	if !strings.Contains(joined, "CONFIGURE") {
-		t.Fatalf("reconfigure must apply CONFIGURE, got %v", f.log)
-	}
-	for _, banned := range []string{"FETCH", "EXTRACT", "SWITCH", "STOP"} {
-		if strings.Contains(joined, banned) {
-			t.Fatalf("reconfigure must not %s, got %v", banned, f.log)
+	order := strings.Join(f.log, ">")
+	for _, must := range []string{"LOCK", "STOP", "CONFIGURE", "START", "HEALTH"} {
+		if !strings.Contains(order, must) {
+			t.Fatalf("reconfigure must run %s, got %v", must, f.log)
 		}
+	}
+	for _, pair := range [][2]string{{"LOCK", "STOP"}, {"STOP", "CONFIGURE"}, {"CONFIGURE", "START"}, {"START", "HEALTH"}} {
+		if strings.Index(order, pair[0]) > strings.Index(order, pair[1]) {
+			t.Fatalf("reconfigure step order violated (%s before %s): %v", pair[0], pair[1], f.log)
+		}
+	}
+	for _, banned := range []string{"FETCH", "EXTRACT", "SWITCH"} {
+		if strings.Contains(order, banned) {
+			t.Fatalf("reconfigure must not %s (same release), got %v", banned, f.log)
+		}
+	}
+	// The manifest is re-finalized transactionally with a reconfigure LastOp,
+	// version/checksum unchanged.
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"type": "reconfigure"`) || !strings.Contains(mj, `"current_version": "1.0.0"`) {
+		t.Fatalf("reconfigure manifest not finalized: %s", mj)
 	}
 }
 

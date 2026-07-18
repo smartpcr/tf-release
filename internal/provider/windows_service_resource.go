@@ -314,8 +314,9 @@ func (r *WindowsServiceResource) Create(ctx context.Context, req resource.Create
 }
 
 func (r *WindowsServiceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan windowsServiceModel
+	var plan, state windowsServiceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -324,27 +325,48 @@ func (r *WindowsServiceResource) Update(ctx context.Context, req resource.Update
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	st, warns, err := std.apply(ctx)
+	// A configuration-only change (same artifact version + checksum) makes a full
+	// Deploy an idempotent no-op (DESIGN §10.1 step 2) that never reaches CONFIGURE.
+	// Route it through the transactional, lock-protected reconfigure path (STOP →
+	// CONFIGURE → START → HEALTH) so the change is applied AND activated; route real
+	// artifact changes through the normal deploy state machine. EXACTLY ONE engine
+	// operation runs on either branch — never Deploy followed by a second operation
+	// that could fail after the manifest is finalized and leave Terraform state
+	// inconsistent with the machine.
+	var (
+		st    *engine.Status
+		warns []string
+		err   error
+	)
+	if wsArtifactUnchanged(&plan, &state) {
+		st, warns, err = std.reconfigure(ctx)
+	} else {
+		st, warns, err = std.apply(ctx)
+	}
 	appendWarnings(&resp.Diagnostics, warns)
 	if err != nil {
 		resp.Diagnostics.AddError(wsDiagSummary("ERR_SERVICE_INSTALL", "windows_service update failed", err), err.Error())
 		return
 	}
-	// A configuration-only change (same artifact version/checksum) makes the
-	// Deploy above an idempotent no-op (DESIGN §10.1 step 2) that never reaches
-	// the CONFIGURE step. Re-apply configuration so mutable settings (description,
-	// start type, recovery, environment) always reach the target on Update.
-	rst, rwarns, rerr := std.reconfigure(ctx)
-	appendWarnings(&resp.Diagnostics, rwarns)
-	if rerr != nil {
-		resp.Diagnostics.AddError(wsDiagSummary("ERR_SERVICE_INSTALL", "windows_service reconfigure failed", rerr), rerr.Error())
-		return
-	}
-	if rst != nil {
-		st = rst
-	}
 	fillWSStatus(&plan, st)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// wsArtifactUnchanged reports whether the planned artifact (effective version +
+// checksum) matches the prior state — i.e. the update touches only mutable service
+// configuration and not the deployed artifact, so a full Deploy would no-op.
+func wsArtifactUnchanged(plan, state *windowsServiceModel) bool {
+	if plan.Artifact == nil || state.Artifact == nil {
+		return false
+	}
+	effVersion := func(m *windowsServiceModel) string {
+		if o := m.VersionOverride.ValueString(); o != "" {
+			return o
+		}
+		return m.Artifact.Version.ValueString()
+	}
+	return effVersion(plan) == effVersion(state) &&
+		plan.Artifact.Checksum.ValueString() == state.Artifact.Checksum.ValueString()
 }
 
 func (r *WindowsServiceResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {

@@ -51,11 +51,12 @@ func (s *singleTargetDeployment) apply(ctx context.Context) (*engine.Status, []s
 	return st, eng.Warnings, err
 }
 
-// reconfigure re-applies pattern configuration to the current release without a
-// full re-deploy. It backs configuration-only Terraform updates, which change
-// mutable settings (service description, start type, recovery, environment)
-// without touching artifact.version/checksum and would therefore hit the engine
-// idempotency short-circuit (DESIGN §10.1 step 2) if routed through apply/Deploy.
+// reconfigure re-applies pattern configuration to the current release under the
+// app lock, transactionally (STOP → CONFIGURE → START → HEALTH). It backs
+// configuration-only Terraform updates, which change mutable settings (service
+// description, start type, recovery, environment, arguments) without touching
+// artifact.version/checksum and would therefore hit the engine idempotency
+// short-circuit (DESIGN §10.1 step 2) if routed through apply/Deploy.
 func (s *singleTargetDeployment) reconfigure(ctx context.Context) (*engine.Status, []string, error) {
 	eng := engine.New()
 	st, err := eng.Reconfigure(ctx, s.dep)

@@ -1218,18 +1218,24 @@ func (e *Engine) ReadStatus(ctx context.Context, s *spec.Deployment) (*Status, e
 	return out, nil
 }
 
-// Reconfigure re-applies pattern configuration (e.g. a Windows service's
-// description, start type, recovery actions, and environment) to the CURRENTLY
-// deployed release WITHOUT re-staging, switching, or restarting for a new
-// artifact. It exists because a configuration-only change — one that leaves
-// artifact.version and artifact.checksum untouched — hits Deploy's idempotency
-// short-circuit (DESIGN §10.1 step 2) and would otherwise never reach the
-// CONFIGURE step, silently skipping the mutable settings while Terraform still
-// records the new desired state. pattern.Configure is idempotent, so callers may
-// invoke this unconditionally after Deploy. Returns a nil status with a nil error
+// Reconfigure re-applies pattern configuration (a Windows service's description,
+// start type, recovery actions, arguments, and environment) to the CURRENTLY
+// deployed release and restarts it so the new settings take effect. It exists
+// because a configuration-only change — one that leaves artifact.version and
+// artifact.checksum untouched — hits Deploy's idempotency short-circuit
+// (DESIGN §10.1 step 2) and would otherwise never reach CONFIGURE, silently
+// skipping the mutable settings while Terraform records the new desired state.
+//
+// It is transactional and safe to run concurrently with other operations: it
+// holds the SAME per-app deploy lock (so it cannot race a deploy or destroy and
+// configure the wrong release), runs STOP → CONFIGURE → START → HEALTH so the new
+// configuration is actually active on the running process (not just written to
+// disk), and only then re-finalizes the manifest. A HEALTH failure surfaces as a
+// coded error rather than a silent success. Returns a nil status with a nil error
 // when nothing is deployed yet (there is nothing to reconfigure). Single-host.
 func (e *Engine) Reconfigure(ctx context.Context, s *spec.Deployment) (*Status, error) {
 	host := strings.ToLower(s.Target.Hosts[0])
+	sl := newStepLogger(s, host)
 	t, err := e.NewTransport(&s.Target, host)
 	if err != nil {
 		return nil, coded("ERR_SPEC_INVALID", host, "VALIDATE", err)
@@ -1254,19 +1260,67 @@ func (e *Engine) Reconfigure(ctx context.Context, s *spec.Deployment) (*Status, 
 	if warn != "" {
 		e.warnf("%s", warn)
 	}
-	// Configure the CURRENT deployed version's release (mirrors ReadStatus): the
-	// pattern context version MUST be the manifest's current_version so Configure
-	// targets the live binary path, not a desired version that is not yet on disk.
+	// Serialize against a concurrent deploy/destroy on the same app so we cannot
+	// configure a release that is being switched out from under us.
+	lstart := time.Now()
+	lk, lwarn, err := AcquireLock(ctx, t, p, lockOwner(), "reconfigure", s.Strategy.EffectiveLockTimeout())
+	sl.emit(ctx, "LOCK", lstart)
+	if err != nil {
+		return nil, err
+	}
+	if lwarn != "" {
+		e.warnf("%s", lwarn)
+	}
+	defer func() {
+		rctx, cancel := lockCleanupContext(ctx)
+		defer cancel()
+		ustart := time.Now()
+		if rerr := ReleaseLock(rctx, lk); rerr != nil {
+			e.warnf("lock release failed on %s: %v", host, rerr)
+		}
+		sl.emit(ctx, "UNLOCK", ustart)
+	}()
+	// Reconfigure the CURRENT deployed version's release (mirrors ReadStatus): the
+	// pattern context version MUST be the manifest's current_version so we target
+	// the live binary path, not a desired version that is not yet on disk.
 	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
 	rc := releaseCtxVersion(s, rp, m.CurrentVersion)
-	if err := pat.Configure(ctx, t, rc); err != nil {
+	rc.EmitStep = sl.emit
+	// STOP → CONFIGURE → START → HEALTH so changed environment/arguments/start type
+	// actually take effect on the running process, not just on disk.
+	started := time.Now().UTC()
+	if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
+		return nil, err
+	}
+	if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
 		return nil, coded("ERR_SERVICE_INSTALL", host, "CONFIGURE", err)
+	}
+	if err := sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rc) }); err != nil {
+		return nil, err
+	}
+	if err := sl.timed(ctx, "HEALTH", func() error {
+		return RunHealthCheck(ctx, t, &s.HealthCheck, rp.Current, rc.Env)
+	}); err != nil {
+		return nil, err
+	}
+	// Re-finalize the manifest transactionally so the recorded LastOp reflects the
+	// reconfigure (version/checksum are unchanged).
+	nm := &Manifest{
+		Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
+		CurrentVersion: m.CurrentVersion, PreviousVersion: m.PreviousVersion,
+		CurrentRelease: rp.Release, ArtifactChecksum: m.ArtifactChecksum,
+		ProviderVersion: ProviderVersion,
+		LastOperation: LastOp{Type: "reconfigure", Result: "success",
+			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
+	}
+	if err := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, rp, nm) }); err != nil {
+		return nil, coded("ERR_CONNECT", host, "FINALIZE", err)
 	}
 	st, serr := pat.Status(ctx, t, rc)
 	if serr != nil {
 		return nil, wrapTransportErr(serr, host, "READ")
 	}
-	out := statusFrom(m, host, st)
+	out := statusFrom(nm, host, st)
 	out.DeployedVersion = deployedVer
 	return out, nil
 }
