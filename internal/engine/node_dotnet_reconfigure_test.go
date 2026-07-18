@@ -120,12 +120,14 @@ func TestReconfigurableCoversNodeAndDotnet(t *testing.T) {
 		t.Error("multi-host must not be reconfigurable")
 	}
 
-	// Toggling install_deps requires the STAGE-phase npm ci, which Reconfigure
-	// does not run, so it must fall through to Deploy.
+	// Toggling install_deps is now reconfigurable: Reconfigure runs the pattern
+	// preflight AND re-runs InstallDeps (npm ci) at the pre-activation point, so the
+	// toggle actually installs deps instead of being swallowed by Deploy's
+	// unchanged-artifact idempotency short-circuit (iter3 item 1).
 	prior := nodeWebSpec(t, u, sum, false)
 	next := nodeWebSpec(t, u, sum, true)
-	if reconfigurable(next, prior) {
-		t.Error("install_deps toggle must fall through to Deploy (needs npm ci)")
+	if !reconfigurable(next, prior) {
+		t.Error("install_deps toggle must be reconfigurable so Reconfigure runs npm ci")
 	}
 	// install_deps unchanged (both true) is still reconfigurable.
 	if !reconfigurable(nodeWebSpec(t, u, sum, true), nodeWebSpec(t, u, sum, true)) {
@@ -226,3 +228,114 @@ func TestCachedNodeInstallDepsFailurePropagates(t *testing.T) {
 		t.Fatalf("cached npm ci failure must map to ERR_SERVICE_INSTALL, got: %v", err)
 	}
 }
+
+// Evaluator iter3 item 1: an install_deps false→true Update on an existing
+// HEALTHY manifest must actually run `npm ci` — the toggle used to be swallowed
+// by Deploy's unchanged-artifact idempotency short-circuit. It is now routed
+// through Reconfigure, which re-runs InstallDeps at the pre-activation point.
+func TestUpdateToggleInstallDepsRunsNpmCi(t *testing.T) {
+	payload := []byte("node zip toggle")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	// First deploy with install_deps=false ⇒ healthy manifest, node_modules NOT
+	// installed (no npm ci).
+	prior := nodeWebSpec(t, url, sum, false)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v\nlog=%v", err, f.log)
+	}
+	if strings.Contains(strings.Join(f.log, ">"), "NPMCI") {
+		t.Fatalf("install_deps=false first deploy must not run npm ci; log=%v", f.log)
+	}
+	f.log = nil
+
+	// Update flips install_deps=true on the SAME artifact. This must NOT be a
+	// silent no-op: npm ci has to execute.
+	next := nodeWebSpec(t, url, sum, true)
+	if _, err := eng.Update(context.Background(), next, prior); err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	order := strings.Join(f.log, ">")
+	if strings.Contains(order, "FETCH") {
+		t.Fatalf("same-artifact install_deps toggle must not re-stage the artifact; log=%v", f.log)
+	}
+	if !strings.Contains(order, "NPMCI") {
+		t.Fatalf("install_deps false→true Update must run npm ci; log=%v", f.log)
+	}
+	// npm ci must run while the service is stopped (after STOP, before START).
+	iStop := strings.Index(order, "STOP")
+	iNpm := strings.Index(order, "NPMCI")
+	iStart := strings.Index(order, "START")
+	if !(iStop >= 0 && iStop < iNpm && iNpm < iStart) {
+		t.Fatalf("npm ci must run after STOP and before START; order=%v", f.log)
+	}
+}
+
+// Evaluator iter3 item 2: Reconfigure MUST run the pattern preflight before any
+// mutation. A same-artifact node_exe change whose new tooling fails preflight
+// must abort BEFORE the service is stopped/reconfigured.
+func TestReconfigureRunsNodePreflightBeforeMutation(t *testing.T) {
+	payload := []byte("node zip preflight")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	prior := nodeWebSpec(t, url, sum, false)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v\nlog=%v", err, f.log)
+	}
+	f.log = nil
+	// Now the target's node tooling is broken: a same-artifact node_exe change must
+	// fail at PREFLIGHT before STOP/CONFIGURE touch the running service.
+	f.fail["nodepreflight"] = true
+	next := nodeWebSpec(t, url, sum, false)
+	next.Pattern.NodeExe = `C:\node20\node.exe`
+	_, err := eng.Update(context.Background(), next, prior)
+	if err == nil {
+		t.Fatalf("Update must fail when node preflight fails; log=%v", f.log)
+	}
+	if !strings.Contains(err.Error(), "ERR_PREFLIGHT") {
+		t.Fatalf("failed node preflight must surface ERR_PREFLIGHT, got: %v", err)
+	}
+	order := strings.Join(f.log, ">")
+	if strings.Contains(order, "STOP") || strings.Contains(order, "CONFIGURE") {
+		t.Fatalf("preflight must run BEFORE any mutation (no STOP/CONFIGURE); log=%v", f.log)
+	}
+}
+
+// dotnet_api Reconfigure must likewise run its aspnet-runtime preflight before
+// mutating: a launcher=exe→dotnet_dll change on a box missing the runtime aborts
+// before the service is stopped.
+func TestReconfigureRunsDotnetPreflightBeforeMutation(t *testing.T) {
+	payload := []byte("api preflight")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	prior := dotnetAPISpec(t, url, sum) // launcher=exe (no runtime probe)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v\nlog=%v", err, f.log)
+	}
+	f.log = nil
+	f.fail["dotnetpreflight"] = true
+	// Switch to launcher=dotnet_dll — now the aspnet-runtime probe runs and fails.
+	next := dotnetAPISpec(t, url, sum)
+	next.Pattern.Launcher = "dotnet_dll"
+	next.Pattern.Exe = ""
+	next.Pattern.DLL = "SampleApi.dll"
+	_, err := eng.Update(context.Background(), next, prior)
+	if err == nil {
+		t.Fatalf("Update must fail when dotnet preflight fails; log=%v", f.log)
+	}
+	if !strings.Contains(err.Error(), "ERR_PREFLIGHT") {
+		t.Fatalf("failed dotnet preflight must surface ERR_PREFLIGHT, got: %v", err)
+	}
+	if strings.Contains(strings.Join(f.log, ">"), "STOP") {
+		t.Fatalf("dotnet preflight must run BEFORE STOP; log=%v", f.log)
+	}
+}
+

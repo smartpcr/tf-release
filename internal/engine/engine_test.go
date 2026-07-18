@@ -264,6 +264,20 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		f.mark("NPMCI")
 		return ok(""), nil
 
+	case strings.Contains(s, "node not found on PATH"): // node_web_app pattern preflight
+		if f.fail["nodepreflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "node not found on PATH"}, nil
+		}
+		f.mark("NODE_PREFLIGHT")
+		return ok(""), nil
+
+	case strings.Contains(s, "--list-runtimes"): // dotnet_api pattern preflight
+		if f.fail["dotnetpreflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "Microsoft.AspNetCore.App runtime missing"}, nil
+		}
+		f.mark("DOTNET_PREFLIGHT")
+		return ok(""), nil
+
 	case strings.Contains(s, "LDPOSTINSTALL"): // post_install hook
 		if f.fail["postinstall"] {
 			return transport.Result{ExitCode: 9, Stderr: "hook failed"}, nil

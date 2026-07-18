@@ -135,21 +135,19 @@ func (e *Engine) Update(ctx context.Context, s, prior *spec.Deployment) (*Status
 // Status verbs to WindowsService); anything else defers to Deploy.
 // artifactUnchanged gates it so version upgrades always deploy.
 //
-// node_web_app is additionally excluded when install_deps toggles: enabling
-// dependency installation requires the STAGE-phase `npm ci` (which Reconfigure's
-// STOP→CONFIGURE→START→HEALTH transaction does not run), so that change must
-// fall through to Deploy — which now runs InstallDeps for cached releases too.
+// node_web_app is included even when install_deps toggles: Reconfigure runs the
+// pattern Preflight (node/dotnet tool checks) and, for node_web_app, re-runs
+// InstallDeps (`npm ci --omit=dev`) at the pre-activation point, so a same-
+// artifact install_deps=false→true change actually installs dependencies instead
+// of being swallowed by Deploy's unchanged-artifact idempotency short-circuit.
 func reconfigurable(s, prior *spec.Deployment) bool {
 	if prior == nil || s == nil {
 		return false
 	}
 	switch s.Pattern.Type {
-	case spec.PatternWindowsService, spec.PatternDotnetAPI:
-		// applied entirely via Configure/Stop/Start on the deployed release.
-	case spec.PatternNodeWebApp:
-		if s.Pattern.InstallDeps != prior.Pattern.InstallDeps {
-			return false
-		}
+	case spec.PatternWindowsService, spec.PatternNodeWebApp, spec.PatternDotnetAPI:
+		// applied via Preflight + Stop/Configure/Start (+ node InstallDeps) on the
+		// deployed release, all handled by Reconfigure.
 	default:
 		return false
 	}
@@ -1383,6 +1381,14 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
 	newRC := releaseCtxVersion(s, rp, m.CurrentVersion)
 	newRC.EmitStep = sl.emit
+	// Pattern preflight MUST run before any mutation (DESIGN §8.1): a same-artifact
+	// change to node_exe, or a launcher=exe→dotnet_dll switch, must validate the new
+	// tooling (node --version / dotnet --list-runtimes contains Microsoft.AspNetCore.App)
+	// BEFORE we stop and reconfigure the running service — otherwise the service could
+	// be torn down and re-registered against a launcher the target cannot run.
+	if err := sl.timed(ctx, "PREFLIGHT", func() error { return e.preflight(ctx, t, s, rp, pat, newRC) }); err != nil {
+		return nil, err
+	}
 	started := time.Now().UTC()
 	writeManifest := func(result string) *Manifest {
 		return &Manifest{
@@ -1451,10 +1457,29 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		// not re-executed (its effect already landed when the artifact was staged),
 		// and because only the forward path supplies preStart the PRIOR hook is never
 		// re-run while rolling back.
+		// preStart runs at the pre-activation point (after STOP+CONFIGURE, before
+		// START) so the service is stopped (no locked node_modules) yet started with
+		// the new dependencies/hook in place. Two things happen here, in deploy order:
+		//   1. node_web_app InstallDeps (`npm ci --omit=dev`) — self-gates on
+		//      install_deps, so a same-artifact install_deps=false→true toggle actually
+		//      installs deps (and validates package-lock.json) instead of no-op'ing.
+		//   2. a CHANGED post_install hook — an UNCHANGED hook is not re-executed (its
+		//      effect already landed at stage time). Only the forward path supplies
+		//      preStart, so neither re-runs while rolling back.
+		_, isNode := pat.(*pattern.NodeWebApp)
+		postInstallChanged := s.Pattern.PostInstall != prior.Pattern.PostInstall
 		var preStart func() error
-		if s.Pattern.PostInstall != prior.Pattern.PostInstall {
+		if isNode || postInstallChanged {
 			preStart = func() error {
-				return e.runPostInstall(ctx, t, s, rp.Release, newRC, host)
+				if n, ok := pat.(*pattern.NodeWebApp); ok {
+					if derr := sl.timed(ctx, "STAGE", func() error { return n.InstallDeps(ctx, t, newRC) }); derr != nil {
+						return derr
+					}
+				}
+				if postInstallChanged {
+					return e.runPostInstall(ctx, t, s, rp.Release, newRC, host)
+				}
+				return nil
 			}
 		}
 		if err := activate(newRC, &s.HealthCheck, preStart); err != nil {
