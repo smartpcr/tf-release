@@ -9,6 +9,8 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
 
 // wsSpecYAML is a minimal, valid single-host windows_service deployment at the
@@ -93,29 +95,39 @@ func TestPriorFromStateBackCompat(t *testing.T) {
 	}
 }
 
-// TestPriorFromStateLegacySpecFilePinsDeployedVersion covers item 2: legacy
-// spec_file state (no resolved_spec) that DOES record a deployed_version must
-// reconstruct a best-effort prior pinned to that version, so a same-version
-// configuration change routes through Reconfigure (which re-runs CONFIGURE)
-// instead of no-op'ing on Deploy's version/checksum short-circuit.
-func TestPriorFromStateLegacySpecFilePinsDeployedVersion(t *testing.T) {
+// TestPriorFromStateLegacySpecFileDeclines covers item 2: legacy spec_file state
+// (no resolved_spec) must NOT fabricate a prior from the on-disk file + recorded
+// deployed_version — that would falsely promise transactional restoration. It must
+// decline (nil) so ModifyPlan can force a truthful replacement instead.
+func TestPriorFromStateLegacySpecFileDeclines(t *testing.T) {
 	t.Setenv("LABDEPLOY_PASSWORD", "pw")
 	dir := t.TempDir()
 	path := filepath.Join(dir, "spec.yaml")
-	// The file on disk now holds 2.0.0 (a config edit may have bumped it), but the
-	// version actually deployed and recorded in state is 1.0.0.
 	if err := os.WriteFile(path, []byte(wsSpecYAML("2.0.0")), 0o600); err != nil {
 		t.Fatalf("write spec: %v", err)
 	}
 	r := &DeploymentResource{}
 	state := &deploymentModel{Spec: types.StringNull(), SpecFile: types.StringValue(path),
 		ResolvedSpec: types.StringNull(), DeployedVersion: types.StringValue("1.0.0")}
-	prior := r.priorFromState(context.Background(), state)
-	if prior == nil {
-		t.Fatalf("legacy spec_file with deployed_version must reconstruct a prior, got nil")
+	if prior := r.priorFromState(context.Background(), state); prior != nil {
+		t.Fatalf("legacy spec_file prior must decline (nil) even with deployed_version, got version %q", prior.Artifact.Version)
 	}
-	if prior.Artifact.Version != "1.0.0" {
-		t.Fatalf("legacy prior must pin to recorded deployed_version 1.0.0, got %q", prior.Artifact.Version)
+}
+
+// TestLegacyReplaceRequired covers item 2: when no faithful prior snapshot exists
+// (oldSpec==nil), a real spec change (spec_hash drift) forces a replacement, while an
+// unchanged spec forces nothing; a faithful prior (oldSpec!=nil) never triggers the
+// legacy migration path.
+func TestLegacyReplaceRequired(t *testing.T) {
+	stateHash := &deploymentModel{SpecHash: types.StringValue("old")}
+	if !legacyReplaceRequired(nil, "new", stateHash) {
+		t.Fatal("no snapshot + hash drift must require replacement")
+	}
+	if legacyReplaceRequired(nil, "old", stateHash) {
+		t.Fatal("no snapshot + no drift must NOT require replacement")
+	}
+	if legacyReplaceRequired(&spec.Deployment{}, "new", stateHash) {
+		t.Fatal("faithful prior must never take the legacy replacement path")
 	}
 }
 

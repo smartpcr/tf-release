@@ -170,11 +170,33 @@ func (r *DeploymentResource) ModifyPlan(ctx context.Context, req resource.Modify
 	// hiding immutable-field changes).
 	oldSpec := r.priorFromState(ctx, &state)
 	if oldSpec == nil {
-		return // no faithful prior recorded; let Update/Deploy proceed
+		// No faithful prior snapshot (state written before resolved_spec, from a
+		// spec_file whose on-disk contents cannot be trusted as the prior). We cannot
+		// honestly Reconfigure — that needs the ACTUAL prior configuration for
+		// changed-post_install detection, rollback restoration, and prior-health
+		// validation. When the resolved spec has actually changed, force a REPLACEMENT
+		// so the change is applied via a full, truthful create/deploy (which also
+		// persists resolved_spec, self-healing the legacy state for future updates).
+		// No drift ⇒ nothing to migrate.
+		if legacyReplaceRequired(oldSpec, newHash, &state) {
+			resp.RequiresReplace = append(resp.RequiresReplace, path.Root("spec_hash"))
+		}
+		return
 	}
 	if immutableKey(oldSpec) != immutableKey(newSpec) {
 		resp.RequiresReplace = append(resp.RequiresReplace, configuredSpecPath(&plan))
 	}
+}
+
+// legacyReplaceRequired reports whether an update must be handled as a truthful
+// REPLACEMENT because no faithful prior snapshot exists to reconfigure against.
+// oldSpec==nil means priorFromState could not reconstruct a trustworthy prior
+// (legacy spec_file state written before resolved_spec); newHash != the persisted
+// spec_hash means the resolved spec really changed. When both hold, forcing a
+// replacement is safer than feeding fabricated prior state to Reconfigure. No drift
+// ⇒ no change to apply, so no replacement.
+func legacyReplaceRequired(oldSpec *spec.Deployment, newHash string, state *deploymentModel) bool {
+	return oldSpec == nil && newHash != state.SpecHash.ValueString()
 }
 
 // configuredSpecPath returns the schema path of whichever spec attribute the
@@ -241,10 +263,10 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 // configuration change route correctly through Reconfigure (applying CONFIGURE and a
 // changed post_install) while a real artifact upgrade still routes to Deploy, and it
 // gives rollback the ACTUAL prior configuration to restore. Falls back to re-parsing
-// inline spec for state written before resolved_spec existed, and for legacy
-// spec_file state pins a best-effort prior to the recorded deployed_version so a
-// same-version configuration change still reconfigures rather than no-op'ing;
-// returns nil (→ safe Deploy) only when no prior at all can be reconstructed.
+// inline spec for state written before resolved_spec existed (still faithful verbatim);
+// returns nil for legacy spec_file state (whose on-disk contents cannot be trusted as
+// the prior) so ModifyPlan can force a truthful replacement rather than fabricate a
+// prior for Reconfigure.
 func (r *DeploymentResource) priorFromState(ctx context.Context, state *deploymentModel) *spec.Deployment {
 	if rs := state.ResolvedSpec.ValueString(); rs != "" {
 		var d spec.Deployment
@@ -260,22 +282,13 @@ func (r *DeploymentResource) priorFromState(ctx context.Context, state *deployme
 		}
 		return nil
 	}
-	// Legacy spec_file state: re-reading the file at Update time yields the CURRENT
-	// (possibly already-changed) contents, so the configuration cannot be trusted as
-	// the prior. But the artifact version that was actually deployed IS recorded in
-	// state (deployed_version). Reconstruct a best-effort prior pinned to that
-	// version so a SAME-version configuration change still routes through Reconfigure
-	// — which re-runs CONFIGURE — instead of falling to Deploy's version/checksum
-	// idempotency short-circuit and silently no-op'ing the change. A genuine version
-	// upgrade (deployed_version != desired) still compares unequal and routes to
-	// Deploy. Returns nil only when no deployed version is recorded (nothing to
-	// reconfigure against).
-	if dv := state.DeployedVersion.ValueString(); dv != "" {
-		if d, _, err := r.resolveSpec(ctx, state); err == nil {
-			d.Artifact.Version = dv
-			return d
-		}
-	}
+	// Legacy spec_file state (no resolved_spec): re-reading the file at Update time
+	// yields the CURRENT (possibly already-changed) contents, and only deployed_version
+	// is recorded — that is NOT the actual prior configuration. Fabricating a prior from
+	// it (desired config + old version) would make a changed post_install look unchanged,
+	// make rollback restore the DESIRED settings, and health-check against the new spec —
+	// a false promise of transactional restoration. So we decline (nil); ModifyPlan
+	// instead forces a truthful replacement when the spec has actually changed.
 	return nil
 }
 
