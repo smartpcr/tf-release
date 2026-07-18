@@ -185,18 +185,37 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	}
 	// Resolve the PRIOR spec from state so a same-artifact configuration change is
 	// routed through the transactional Reconfigure path instead of Deploy, whose
-	// idempotency short-circuit would otherwise skip it. A prior state that no
-	// longer parses is non-fatal: fall back to Deploy (prior == nil).
-	var prior *spec.Deployment
+	// idempotency short-circuit would otherwise skip it. Decoding errors are NOT
+	// swallowed — corrupt/incompatible state must surface rather than silently
+	// downgrade to a blind Deploy.
 	var state deploymentModel
-	if diag := req.State.Get(ctx, &state); !diag.HasError() {
-		if pd, _, err := r.resolveSpec(ctx, &state); err == nil {
-			prior = pd
-		}
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
+	prior := r.faithfulPriorSpec(ctx, &state)
 	r.apply(ctx, &plan, prior, &resp.Diagnostics, func(m *deploymentModel) {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 	})
+}
+
+// faithfulPriorSpec returns the prior deployment ONLY when the prior state can be
+// reconstructed faithfully — i.e. the spec was stored INLINE (persisted verbatim in
+// state). When the prior state used spec_file, the file on the runner may already
+// hold the NEW contents by Update time, so rereading it would make the prior look
+// identical to the desired spec: an artifact upgrade would be misrouted through
+// Reconfigure (skipping the fetch of the new artifact), a changed post_install hook
+// would look unchanged, and rollback would restore the wrong configuration. In that
+// case we return nil so Engine.Update falls back to a safe, always-correct Deploy.
+func (r *DeploymentResource) faithfulPriorSpec(ctx context.Context, state *deploymentModel) *spec.Deployment {
+	if state.Spec.IsNull() || state.Spec.ValueString() == "" {
+		return nil // spec_file (or empty) prior — historical contents unavailable
+	}
+	d, _, err := r.resolveSpec(ctx, state)
+	if err != nil {
+		return nil // unparseable prior state — force a safe Deploy
+	}
+	return d
 }
 
 func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,

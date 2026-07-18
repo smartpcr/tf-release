@@ -113,7 +113,17 @@ func isChecksumErr(err error) bool {
 // not cover) falls through to Deploy, which is itself idempotent.
 func (e *Engine) Update(ctx context.Context, s, prior *spec.Deployment) (*Status, error) {
 	if reconfigurable(s, prior) {
-		return e.Reconfigure(ctx, s, prior)
+		st, err := e.Reconfigure(ctx, s, prior)
+		if err != nil {
+			return nil, err
+		}
+		if st != nil {
+			return st, nil
+		}
+		// Reconfigure returns (nil, nil) when nothing is deployed yet (no manifest).
+		// A configuration-only "update" against an absent deployment is meaningless;
+		// fall through to a full Deploy rather than returning a nil status that the
+		// caller would dereference.
 	}
 	return e.Deploy(ctx, s)
 }

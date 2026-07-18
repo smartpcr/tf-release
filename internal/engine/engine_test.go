@@ -788,6 +788,28 @@ func TestUpdateRoutesNewArtifactThroughDeploy(t *testing.T) { // item 2: version
 	}
 }
 
+func TestUpdateFallsBackToDeployWhenManifestAbsent(t *testing.T) { // item 4: (nil,nil) must not surface
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	// Nothing deployed yet → the manifest is absent, so Reconfigure returns (nil,nil).
+	// Engine.Update must fall back to Deploy and return a NON-nil status (the provider
+	// dereferences it) rather than propagating the nil.
+	st, err := eng.Update(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("Update must fall back to Deploy (non-nil status) when nothing is deployed")
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), "FETCH") {
+		t.Fatalf("fallback Deploy must stage the artifact, got %v", f.log)
+	}
+}
+
 func TestHealthFailureRollsBack(t *testing.T) { // RBK-01
 	p1 := []byte("v1")
 	url1, sum1, done1 := testArtifactServer(t, p1)
