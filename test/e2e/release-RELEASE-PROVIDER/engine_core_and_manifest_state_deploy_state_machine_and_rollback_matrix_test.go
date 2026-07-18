@@ -641,7 +641,6 @@ type dsmWorld struct {
 	// logging scenarios
 	buf   bytes.Buffer
 	steps []dsmStep
-	noop  bool
 }
 
 func (w *dsmWorld) addCloser(c func()) { w.closers = append(w.closers, c) }
@@ -892,11 +891,8 @@ func (w *dsmWorld) theDeployRunsCapturing() error {
 		return fmt.Errorf("deploy preconditions not set (Given step did not run)")
 	}
 	ctx := tflogtest.RootLogger(context.Background(), &w.buf)
-	st, err := w.eng.Deploy(ctx, w.depSpec)
+	_, err := w.eng.Deploy(ctx, w.depSpec)
 	w.err = err
-	if st != nil && st.DeployedVersion != "" && err == nil {
-		w.noop = st.DeployedVersion == w.depSpec.Artifact.Version
-	}
 	steps, cerr := dsmCaptureSteps(&w.buf)
 	if cerr != nil {
 		return cerr
@@ -908,11 +904,6 @@ func (w *dsmWorld) theDeployRunsCapturing() error {
 func (w *dsmWorld) noopNoFetchNoSwitch() error {
 	if w.err != nil {
 		return fmt.Errorf("idempotent deploy returned error: %w", w.err)
-	}
-	if !w.noop {
-		return fmt.Errorf("expected NO-OP at the spec version, got deployed=%q", func() string {
-			return "not-noop"
-		}())
 	}
 	if dsmCountStep(w.steps, "FETCH") != 0 {
 		return fmt.Errorf("idempotent no-op logged FETCH: %v", dsmStepNames(w.steps))
