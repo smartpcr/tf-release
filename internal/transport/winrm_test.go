@@ -29,6 +29,10 @@ var (
 	reOpen   = regexp.MustCompile(`\[IO\.File\]::Open\('([^']*)'`)
 	reRemove = regexp.MustCompile(`Remove-Item -LiteralPath '([^']*)'`)
 	reRead   = regexp.MustCompile(`OpenRead\('([^']*)'\);\$fs\.Seek\((\d+),`)
+	// DESIGN §8.1: the first chunk CREATES the file via WriteAllBytes (payload),
+	// and a zero-byte upload creates an empty file via WriteAllBytes(empty buffer).
+	reWriteAll = regexp.MustCompile(`\[IO\.File\]::WriteAllBytes\('([^']*)',\[Convert\]::FromBase64String\('([^']*)'\)\)`)
+	reWriteNul = regexp.MustCompile(`\[IO\.File\]::WriteAllBytes\('([^']*)',\(New-Object byte\[\] 0\)\)`)
 )
 
 func (f *fakeWinRM) run(_ context.Context, command, _ string) (string, string, int, error) {
@@ -70,7 +74,16 @@ func (f *fakeWinRM) run(_ context.Context, command, _ string) (string, string, i
 			end = len(data)
 		}
 		return base64.StdEncoding.EncodeToString(data[off:end]) + "\n", "", 0, nil
-	case reMode.MatchString(script): // upload write (CreateNew / Append) or empty file
+	case reWriteNul.MatchString(script): // zero-byte create (WriteAllBytes empty buffer, DESIGN §8.1)
+		m := reWriteNul.FindStringSubmatch(script)
+		f.files[m[1]] = []byte{}
+		return "", "", 0, nil
+	case reWriteAll.MatchString(script): // first-chunk create/replace (WriteAllBytes, DESIGN §8.1)
+		m := reWriteAll.FindStringSubmatch(script)
+		payload, _ := base64.StdEncoding.DecodeString(m[2])
+		f.files[m[1]] = append([]byte(nil), payload...)
+		return "", "", 0, nil
+	case reMode.MatchString(script): // upload write (Append FileStream) or legacy CreateNew
 		path := reOpen.FindStringSubmatch(script)[1]
 		mode := reMode.FindStringSubmatch(script)[1]
 		var payload []byte
@@ -116,15 +129,22 @@ func TestWinRMUploadDownloadRoundTrip(t *testing.T) {
 		t.Fatalf("uploaded bytes mismatch: got %d want %d", len(fk.files[remote]), len(want))
 	}
 
-	// The generated write scripts must be CreateNew first, Append after.
-	var writes []string
+	// DESIGN §8.1: the first chunk CREATES via WriteAllBytes, subsequent chunks
+	// open a FileStream in Append mode.
+	var writeScripts []string
 	for _, s := range fk.scripts {
-		if reMode.MatchString(s) {
-			writes = append(writes, reMode.FindStringSubmatch(s)[1])
+		if reWriteAll.MatchString(s) || reMode.MatchString(s) {
+			writeScripts = append(writeScripts, s)
 		}
 	}
-	if len(writes) != 2 || writes[0] != "CreateNew" || writes[1] != "Append" {
-		t.Fatalf("write modes = %v, want [CreateNew Append]", writes)
+	if len(writeScripts) != 2 {
+		t.Fatalf("want 2 write scripts, got %d: %v", len(writeScripts), writeScripts)
+	}
+	if !reWriteAll.MatchString(writeScripts[0]) {
+		t.Fatalf("first chunk must create via WriteAllBytes: %s", writeScripts[0])
+	}
+	if m := reMode.FindStringSubmatch(writeScripts[1]); m == nil || m[1] != "Append" {
+		t.Fatalf("second chunk must be Append: %s", writeScripts[1])
 	}
 
 	// Download the same file back and compare.
@@ -220,11 +240,12 @@ func TestWinRMConnectAuthNotRetried(t *testing.T) {
 	}
 }
 
-// uploadChunkScript renders the exact CreateNew / Append FileStream forms.
+// uploadChunkScript renders the normative WriteAllBytes-create / Append forms
+// (DESIGN §8.1).
 func TestUploadChunkScriptForms(t *testing.T) {
 	first := uploadChunkScript(`C:\a\b.bin`, "QUJD", true)
-	if !strings.Contains(first, "[IO.FileMode]::CreateNew") {
-		t.Fatalf("first chunk must use CreateNew: %s", first)
+	if !strings.Contains(first, "[IO.File]::WriteAllBytes(") {
+		t.Fatalf("first chunk must create via WriteAllBytes (DESIGN §8.1): %s", first)
 	}
 	rest := uploadChunkScript(`C:\a\b.bin`, "QUJD", false)
 	if !strings.Contains(rest, "[IO.FileMode]::Append") {

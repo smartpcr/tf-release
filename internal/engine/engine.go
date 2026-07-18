@@ -103,6 +103,55 @@ func isChecksumErr(err error) bool {
 	return false
 }
 
+// Update is the entry point for a resource Update (DESIGN §10.2). When the desired
+// spec leaves the artifact (version + checksum) unchanged from prior — a
+// configuration-only change — Deploy's idempotency short-circuit (§10.1 step 2)
+// would skip CONFIGURE and silently drop the new mutable settings while Terraform
+// records them. For a single-target windows_service that case is routed through the
+// transactional, rollback-safe Reconfigure path so the change is actually applied.
+// Every other case (a new/changed artifact, or a pattern/topology Reconfigure does
+// not cover) falls through to Deploy, which is itself idempotent.
+func (e *Engine) Update(ctx context.Context, s, prior *spec.Deployment) (*Status, error) {
+	if reconfigurable(s, prior) {
+		st, err := e.Reconfigure(ctx, s, prior)
+		if err != nil {
+			return nil, err
+		}
+		if st != nil {
+			return st, nil
+		}
+		// Reconfigure returns (nil, nil) when nothing is deployed yet (no manifest).
+		// A configuration-only "update" against an absent deployment is meaningless;
+		// fall through to a full Deploy rather than returning a nil status that the
+		// caller would dereference.
+	}
+	return e.Deploy(ctx, s)
+}
+
+// reconfigurable reports whether a same-artifact configuration change should be
+// applied via Reconfigure rather than Deploy. Reconfigure is single-host and, in
+// this stage, defined for the windows_service pattern; anything else defers to
+// Deploy. artifactUnchanged gates it so version upgrades always deploy.
+func reconfigurable(s, prior *spec.Deployment) bool {
+	if prior == nil || s == nil {
+		return false
+	}
+	if s.Pattern.Type != spec.PatternWindowsService {
+		return false
+	}
+	if len(s.Target.Hosts) != 1 {
+		return false
+	}
+	return artifactUnchanged(s, prior)
+}
+
+// artifactUnchanged reports whether two specs point at the same artifact — the
+// signal that a change is configuration-only.
+func artifactUnchanged(s, prior *spec.Deployment) bool {
+	return s.Artifact.Version == prior.Artifact.Version &&
+		s.Artifact.Checksum == prior.Artifact.Checksum
+}
+
 // Deploy is the entry point for Create and Update (DESIGN §10.1/§10.2).
 func (e *Engine) Deploy(ctx context.Context, s *spec.Deployment) (*Status, error) {
 	if s.Pattern.Type == spec.PatternClusterGeneric {
@@ -258,6 +307,7 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 		// is NOT actually clean, so we surface ERR_ROLLBACK_FAILED rather than
 		// falsely report a cleaned target (evaluator iter2 item 6).
 		rcNew := releaseCtx(s, p)
+		rcNew.EmitStep = sl.forHost(host).emit
 		var cleanupErrs []error
 		if err := pat.Stop(ctx, t, rcNew); err != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("stop: %w", err))
@@ -307,6 +357,7 @@ func (e *Engine) rollbackSingle(ctx context.Context, sl stepLogger, t transport.
 	// (DESIGN §9.1). Otherwise Configure would bake the new version's LD_VERSION
 	// into the restored previous-version service's SCM Environment value.
 	rcPrev := releaseCtxVersion(s, pp, prev)
+	rcPrev.EmitStep = sl.forHost(host).emit
 	rb := func() error {
 		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rcPrev) }); err != nil {
 			return err
@@ -783,23 +834,39 @@ func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Tra
 	// exception: DESIGN §9.3 sequences its post_install AFTER switch in <cur>, so
 	// the ConsoleApp pattern owns that hook (in Configure) — running it here too
 	// would execute post_install twice.
-	if hook := s.Pattern.PostInstall; hook != "" && s.Pattern.Type != spec.PatternConsoleApp {
-		var r transport.Result
-		var xerr error
-		if t.OS() == spec.OSWindows {
-			r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Env: rc.Env, TimeoutSec: 600,
-				Script: fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(p.Release), hook)})
-		} else {
-			r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Env: rc.Env, TimeoutSec: 600,
-				Script: fmt.Sprintf("cd %s && %s", shq(p.Release), hook)})
-		}
-		if xerr != nil {
-			return wrapTransportErr(xerr, host, "STAGE")
-		}
-		if r.ExitCode != 0 {
-			return coded("ERR_SERVICE_INSTALL", host, "STAGE",
-				fmt.Errorf("post_install exit=%d: %s", r.ExitCode, strings.TrimSpace(r.Stderr+r.Stdout)))
-		}
+	if err := e.runPostInstall(ctx, t, s, p.Release, rc, host); err != nil {
+		return err
+	}
+	return nil
+}
+
+// runPostInstall executes the pattern's post_install hook in the given release
+// directory (DESIGN §6.4). It is a no-op when no hook is configured or for the
+// console_app pattern (which sequences its own hook after switchover). It is
+// invoked both from staging (fresh/upgrade deploys) and from Reconfigure, so a
+// configuration-only update that changes post_install actually runs the new hook
+// rather than silently recording it in Terraform state.
+func (e *Engine) runPostInstall(ctx context.Context, t transport.Transport, s *spec.Deployment,
+	releasePath string, rc pattern.ReleaseCtx, host string) error {
+	hook := s.Pattern.PostInstall
+	if hook == "" || s.Pattern.Type == spec.PatternConsoleApp {
+		return nil
+	}
+	var r transport.Result
+	var xerr error
+	if t.OS() == spec.OSWindows {
+		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Env: rc.Env, TimeoutSec: 600,
+			Script: fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(releasePath), hook)})
+	} else {
+		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Env: rc.Env, TimeoutSec: 600,
+			Script: fmt.Sprintf("cd %s && %s", shq(releasePath), hook)})
+	}
+	if xerr != nil {
+		return wrapTransportErr(xerr, host, "STAGE")
+	}
+	if r.ExitCode != 0 {
+		return coded("ERR_SERVICE_INSTALL", host, "STAGE",
+			fmt.Errorf("post_install exit=%d: %s", r.ExitCode, strings.TrimSpace(r.Stderr+r.Stdout)))
 	}
 	return nil
 }
@@ -820,6 +887,7 @@ func (e *Engine) cleanupIncompleteRelease(ctx context.Context, t transport.Trans
 func (e *Engine) switchOn(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
 	p layout.Paths, pat pattern.Pattern, rc pattern.ReleaseCtx) error {
 	sl = sl.forHost(t.Host())
+	rc.EmitStep = sl.emit
 	if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
 		return err
 	}
@@ -1215,6 +1283,209 @@ func (e *Engine) ReadStatus(ctx context.Context, s *spec.Deployment) (*Status, e
 	return out, nil
 }
 
+// Reconfigure re-applies pattern configuration (a Windows service's description,
+// start type, recovery actions, arguments, and environment) to the CURRENTLY
+// deployed release and restarts it so the new settings take effect. It exists
+// because a configuration-only change — one that leaves artifact.version and
+// artifact.checksum untouched — hits Deploy's idempotency short-circuit
+// (DESIGN §10.1 step 2) and would otherwise never reach CONFIGURE, silently
+// skipping the mutable settings while Terraform records the new desired state.
+//
+// It is transactional, concurrency-safe, and rollback-safe. It acquires the SAME
+// per-app deploy lock BEFORE it reads the manifest (so a concurrent deploy/destroy
+// cannot complete between the manifest read and our mutations and leave us
+// configuring — and re-finalizing — a stale release), then runs STOP → CONFIGURE →
+// START → HEALTH so the new configuration is actually active on the running
+// process (not just written to disk), and only then re-finalizes the manifest.
+// If any step after STOP fails, it restores the PRIOR configuration (the settings
+// Terraform still records in state) and health-checks it, so the machine is never
+// left stopped or running rejected settings; the original error is surfaced so the
+// apply fails and state stays accurate. If restoration itself fails it persists a
+// failed manifest (DESIGN §10.6) and returns ERR_ROLLBACK_FAILED. Returns a nil
+// status with a nil error when nothing is deployed yet. Single-host.
+func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*Status, error) {
+	host := strings.ToLower(s.Target.Hosts[0])
+	sl := newStepLogger(s, host)
+	if prior == nil {
+		prior = s
+	}
+	t, err := e.NewTransport(&s.Target, host)
+	if err != nil {
+		return nil, coded("ERR_SPEC_INVALID", host, "VALIDATE", err)
+	}
+	pat, verr := pattern.For(s.Pattern.Type)
+	if verr != nil {
+		return nil, coded("ERR_UNSUPPORTED", host, "VALIDATE", verr)
+	}
+	if err := t.Connect(ctx); err != nil {
+		return nil, wrapTransportErr(err, host, "CONNECT")
+	}
+	defer t.Close()
+	// The lock and manifest live at the app root (version-independent), so we can
+	// build the lock paths and acquire the lock BEFORE reading the manifest.
+	p := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, s.Artifact.Version)
+	lstart := time.Now()
+	lk, lwarn, err := AcquireLock(ctx, t, p, lockOwner(), "reconfigure", s.Strategy.EffectiveLockTimeout())
+	sl.emit(ctx, "LOCK", lstart)
+	if err != nil {
+		return nil, err
+	}
+	if lwarn != "" {
+		e.warnf("%s", lwarn)
+	}
+	defer func() {
+		rctx, cancel := lockCleanupContext(ctx)
+		defer cancel()
+		ustart := time.Now()
+		if rerr := ReleaseLock(rctx, lk); rerr != nil {
+			e.warnf("lock release failed on %s: %v", host, rerr)
+		}
+		sl.emit(ctx, "UNLOCK", ustart)
+	}()
+	// Now that we hold the lock, read the manifest under it — nothing can change
+	// current_version/checksum out from under us for the rest of this operation.
+	m, err := ReadManifest(ctx, t, p)
+	if err != nil {
+		return nil, coded("ERR_CONNECT", host, "PREFLIGHT", err)
+	}
+	present, deployedVer, warn := ReconcileManifest(m)
+	if !present {
+		return nil, nil
+	}
+	if warn != "" {
+		e.warnf("%s", warn)
+	}
+	// Reconfigure the CURRENT deployed version's release (mirrors ReadStatus): the
+	// pattern context version MUST be the manifest's current_version so we target
+	// the live binary path, not a desired version that is not yet on disk.
+	rp := layout.NewPaths(s.Target.OS, s.Pattern.EffectiveInstallRoot(s.Target.OS), s.Metadata.Name, m.CurrentVersion)
+	newRC := releaseCtxVersion(s, rp, m.CurrentVersion)
+	newRC.EmitStep = sl.emit
+	started := time.Now().UTC()
+	writeManifest := func(result string) *Manifest {
+		return &Manifest{
+			Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
+			CurrentVersion: m.CurrentVersion, PreviousVersion: m.PreviousVersion,
+			CurrentRelease: rp.Release, ArtifactChecksum: m.ArtifactChecksum,
+			ProviderVersion: ProviderVersion,
+			LastOperation: LastOp{Type: "reconfigure", Result: result,
+				Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
+		}
+	}
+	// activate follows DESIGN §10.2: STOP → CONFIGURE → START → HEALTH for a given
+	// release context and health check. It is used both to apply the new settings
+	// and to RESTORE the prior ones — the restore path MUST stop the service that is
+	// running the rejected configuration before re-applying the prior settings, or
+	// the prior environment/arguments would be written but never activated. The
+	// health check is passed in so the restored configuration is validated against
+	// the PRIOR health check, not the new one.
+	//
+	// preStart, when non-nil, runs at the pre-activation point (after CONFIGURE,
+	// before START). Only the forward path supplies it, and only to run a CHANGED
+	// post_install hook — the restore path passes nil so the PRIOR hook is never
+	// re-executed while rolling back.
+	activate := func(rc pattern.ReleaseCtx, hc *spec.HealthCheck, preStart func() error) error {
+		// STOP and CONFIGURE return the pattern error UNWRAPPED — exactly as the
+		// Deploy path (switchOn) and the START/HEALTH steps below already do.
+		// pat.Stop / pat.Configure yield a correctly-coded *pattern.StepError:
+		// ERR_SERVICE_STOP / ERR_SERVICE_INSTALL for a remote exit-code failure, but
+		// ERR_CONNECT when the transport drops mid-step. Re-coding them here with a
+		// blanket coded(...) would override that ERR_CONNECT — diverging from the
+		// DESIGN §12 taxonomy (a stable contract for pipelines & tests) and from the
+		// Deploy path, where the identical failure keeps its original code — and would
+		// double the "[ERR_SERVICE_STOP] [ERR_SERVICE_STOP]" prefix on a genuine
+		// service failure.
+		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
+			return err
+		}
+		if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
+			return err
+		}
+		if preStart != nil {
+			if err := preStart(); err != nil {
+				return err
+			}
+		}
+		if err := sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rc) }); err != nil {
+			return err
+		}
+		return sl.timed(ctx, "HEALTH", func() error {
+			return RunHealthCheck(ctx, t, hc, rp.Current, rc.Env)
+		})
+	}
+	// forward applies the NEW configuration AND finalizes it. FINALIZE and the
+	// post-finalize Status read are part of the transaction: if either fails the
+	// machine must not be left on the new configuration while Terraform retains the
+	// prior state, so their failure triggers the same rollback as a health failure.
+	var (
+		okManifest *Manifest
+		okStatus   string
+	)
+	forward := func() error {
+		// Run post_install ONLY when the hook actually CHANGED for this same-artifact
+		// reconfigure, at the pre-activation point (after CONFIGURE, before START) so
+		// it runs before the new configuration is activated — matching its
+		// after-extract/before-switchover semantics on deploy. An UNCHANGED hook is
+		// not re-executed (its effect already landed when the artifact was staged),
+		// and because only the forward path supplies preStart the PRIOR hook is never
+		// re-run while rolling back.
+		var preStart func() error
+		if s.Pattern.PostInstall != prior.Pattern.PostInstall {
+			preStart = func() error {
+				return e.runPostInstall(ctx, t, s, rp.Release, newRC, host)
+			}
+		}
+		if err := activate(newRC, &s.HealthCheck, preStart); err != nil {
+			return err
+		}
+		nm := writeManifest("success")
+		if err := sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, rp, nm) }); err != nil {
+			return coded("ERR_CONNECT", host, "FINALIZE", err)
+		}
+		st, serr := pat.Status(ctx, t, newRC)
+		if serr != nil {
+			return wrapTransportErr(serr, host, "READ")
+		}
+		okManifest, okStatus = nm, st
+		return nil
+	}
+	if ferr := forward(); ferr != nil {
+		// Any failure after we began mutating (STOP/CONFIGURE/START/HEALTH/FINALIZE/
+		// Status): restore the PRIOR configuration — the settings Terraform still
+		// holds in state — validated against the PRIOR health check, so the machine
+		// is not left stopped or running rejected settings.
+		priorRC := releaseCtxVersion(prior, rp, m.CurrentVersion)
+		priorRC.EmitStep = sl.emit
+		rbStart := time.Now()
+		rerr := activate(priorRC, &prior.HealthCheck, nil)
+		if rerr == nil {
+			// Prior configuration restored and healthy — re-finalize the manifest to
+			// record the rolled-back reconfigure (version/checksum unchanged).
+			rbm := writeManifest("rolled_back")
+			rerr = sl.timed(ctx, "FINALIZE", func() error { return WriteManifest(ctx, t, rp, rbm) })
+		}
+		sl.emit(ctx, "ROLLBACK", rbStart)
+		if rerr != nil {
+			// DESIGN §10.6: restoration (or its manifest write) failed — persist the
+			// required deploy/failed marker and SURFACE a persistence failure so the
+			// operator is forced to repair, rather than only warning. finalizeFailed
+			// writes last_operation.type=deploy, result=failed.
+			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s: reconfigure failed and restore of prior configuration failed; reconfigure error: %v; restore error: %v",
+				host, ferr, rerr)
+			if fmErr := e.finalizeFailed(ctx, sl, t, s, rp, m.CurrentVersion, started, "failed"); fmErr != nil {
+				detail = fmt.Errorf("%v; failed-marker persistence ALSO failed (manual repair required): %v", detail, fmErr)
+			}
+			return nil, coded("ERR_ROLLBACK_FAILED", host, "ROLLBACK", detail)
+		}
+		// Surface the original error so the apply fails and Terraform retains the
+		// (now accurate) prior state.
+		return nil, fmt.Errorf("%w; prior configuration restored (healthy)", ferr)
+	}
+	out := statusFrom(okManifest, host, okStatus)
+	out.DeployedVersion = deployedVer
+	return out, nil
+}
+
 // Destroy honors destroy_mode purge|unregister|abandon (DESIGN §10.6).
 func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) error {
 	if mode == "abandon" {
@@ -1256,6 +1527,10 @@ func (e *Engine) Destroy(ctx context.Context, s *spec.Deployment, mode string) e
 		}
 	}()
 	rc := releaseCtx(s, p)
+	// Uninstall calls Stop internally, which may escalate to FORCE_KILL; wire the
+	// step sink so that escalation emits a structured FORCE_KILL record on the
+	// destroy path too (DESIGN §9.2 S2 / WSV-07), not only on deploy/rollback.
+	rc.EmitStep = newStepLogger(s, host).emit
 	if err := pat.Uninstall(ctx, t, rc, mode == "purge"); err != nil {
 		return err
 	}

@@ -104,7 +104,10 @@ func (p *LabDeployProvider) Configure(ctx context.Context, req provider.Configur
 			v := dt.WinRMUseHTTPS.ValueBool()
 			t.WinRM.UseHTTPS = &v
 		}
-		t.WinRM.InsecureSkipVerify = dt.WinRMInsecure.ValueBool()
+		if !dt.WinRMInsecure.IsNull() && !dt.WinRMInsecure.IsUnknown() {
+			v := dt.WinRMInsecure.ValueBool()
+			t.WinRM.InsecureSkipVerify = &v
+		}
 		if !dt.Hosts.IsNull() {
 			var hosts []string
 			resp.Diagnostics.Append(dt.Hosts.ElementsAs(ctx, &hosts, false)...)
@@ -117,6 +120,17 @@ func (p *LabDeployProvider) Configure(ctx context.Context, req provider.Configur
 }
 
 func (p *LabDeployProvider) Resources(_ context.Context) []func() resource.Resource {
+	// Public provider contract: DESIGN §5.2-5.3 and architecture.md:49 authorize
+	// exactly two resources — labdeploy_deployment and labdeploy_e2e_test. Stage 4.2
+	// (implementation-plan.md §Stage 4.2) is scoped to the windows_service pattern-layer
+	// S-steps + goldens, NOT a new public Terraform resource.
+	//
+	// The typed WindowsServiceResource (NewWindowsServiceResource, in
+	// windows_service_resource.go) is RETAINED on disk as an additive convenience
+	// projection over labdeploy_deployment (operator KEEP pin), but is intentionally
+	// NOT registered here so the runtime provider surface matches the authorized
+	// contract. Re-registering is a one-line change if the operator pins it public
+	// (open question: typed-resource-unregister-compromise).
 	return []func() resource.Resource{
 		NewDeploymentResource,
 		NewE2ETestResource,

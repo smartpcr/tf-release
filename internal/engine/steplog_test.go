@@ -269,6 +269,101 @@ func TestStepLogUpdateCachedRollback(t *testing.T) {
 	}
 }
 
+// TestStepLogForceKillEscalation — DESIGN §9.2 S2 / WSV-07: when a service
+// ignores the graceful stop, the escalation must be observable as its OWN
+// structured `FORCE_KILL` step record (with the full app/host/step/version/
+// duration_ms field set), not merely tagged inside the wrapping STOP step or
+// visible only on error. This drives a cached update whose graceful stop times
+// out; the force-kill succeeds and the deploy completes, so the FORCE_KILL step
+// is emitted on the SUCCESS path.
+func TestStepLogForceKillEscalation(t *testing.T) {
+	payload := []byte("v2 zip bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	f.svc = "Running"          // an existing deployment is running
+	f.fail["stopgrace"] = true // it ignores Stop-Service ⇒ force-kill escalation
+	seedManifest(t, f, `C:\deploy\sample-svc\manifest.json`, &Manifest{
+		Schema: 1, App: "sample-svc", Pattern: "windows_service",
+		CurrentVersion: "1.0.0", ArtifactChecksum: "sha256:old",
+		CurrentRelease:  `C:\deploy\sample-svc\releases\1.0.0`,
+		ProviderVersion: ProviderVersion,
+		LastOperation:   LastOp{Type: "deploy", Result: "success"},
+	})
+	seedReleaseMarker(t, f, `C:\deploy\sample-svc\releases\2.0.0`, "2.0.0", sum)
+
+	eng := engineWith(f)
+	var buf bytes.Buffer
+	ctx := tflogtest.RootLogger(context.Background(), &buf)
+	if _, err := eng.Deploy(ctx, winSvcSpecVersion(t, url, sum, "2.0.0")); err != nil {
+		t.Fatalf("deploy with force-kill escalation should succeed: %v\nlog=%v", err, f.log)
+	}
+
+	steps := captureSteps(t, &buf)
+	names := stepNames(steps)
+	// The graceful STOP is still logged, AND a distinct FORCE_KILL step appears.
+	if countStep(steps, "STOP") == 0 {
+		t.Fatalf("expected a STOP step record: %v", names)
+	}
+	if countStep(steps, "FORCE_KILL") == 0 {
+		t.Fatalf("successful force-kill escalation must emit a structured FORCE_KILL step (WSV-07): %v", names)
+	}
+	// The FORCE_KILL record must carry the full structured field set with the
+	// operation's target version/host (captureSteps already fails on a missing
+	// or non-numeric field).
+	for _, se := range steps {
+		if se.step != "FORCE_KILL" {
+			continue
+		}
+		if se.app != "sample-svc" || se.host != "lab-01" || se.version != "2.0.0" {
+			t.Fatalf("FORCE_KILL step wrong fields: %+v", se)
+		}
+	}
+	// The simulated host actually executed the force-kill (taskkill) path.
+	joined := strings.Join(f.log, ",")
+	if !strings.Contains(joined, "FORCE_KILL") {
+		t.Fatalf("force-kill script was not executed on the host: %v", f.log)
+	}
+}
+
+// TestStepLogDestroyForceKill — DESIGN §9.2 S2 / WSV-07 on the DESTROY path:
+// Uninstall stops the service first and may escalate to force-kill; that
+// escalation must also emit a structured FORCE_KILL step record, not just on
+// deploy/rollback.
+func TestStepLogDestroyForceKill(t *testing.T) {
+	payload := []byte("v1")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("deploy: %v\nlog=%v", err, f.log)
+	}
+	// The deployed service is Running; make it ignore the graceful stop so the
+	// destroy path's Uninstall→Stop escalates to force-kill.
+	f.fail["stopgrace"] = true
+
+	var buf bytes.Buffer
+	ctx := tflogtest.RootLogger(context.Background(), &buf)
+	if err := eng.Destroy(ctx, d, "purge"); err != nil {
+		t.Fatalf("destroy with force-kill escalation should succeed: %v\nlog=%v", err, f.log)
+	}
+
+	steps := captureSteps(t, &buf)
+	if countStep(steps, "FORCE_KILL") == 0 {
+		t.Fatalf("destroy-path force-kill escalation must emit a structured FORCE_KILL step (WSV-07): %v", stepNames(steps))
+	}
+	for _, se := range steps {
+		if se.step == "FORCE_KILL" && (se.app != "sample-svc" || se.host != "lab-01") {
+			t.Fatalf("destroy FORCE_KILL step wrong fields: %+v", se)
+		}
+	}
+	if !strings.Contains(strings.Join(f.log, ","), "FORCE_KILL") {
+		t.Fatalf("force-kill script was not executed on the destroy path: %v", f.log)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // seed helpers
 // ---------------------------------------------------------------------------

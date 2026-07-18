@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
@@ -21,6 +22,20 @@ type ReleaseCtx struct {
 	P           layout.Paths
 	Spec        *spec.Deployment
 	Env         map[string]string // merged builtin+user (DESIGN §9.1)
+	// EmitStep, when non-nil, records an ADDITIONAL structured step into the
+	// engine's step log. A pattern verb the engine wraps as a single step (e.g.
+	// STOP) uses this to surface an observable sub-step — notably the
+	// windows_service FORCE_KILL escalation (DESIGN §9.2 S2 / WSV-07) — so the
+	// escalation is visible on success, not only via an error's step tag. `start`
+	// is the sub-step's begin time; the engine emits duration from it.
+	EmitStep func(ctx context.Context, step string, start time.Time)
+}
+
+// emitStep is a nil-safe helper for pattern verbs to record a sub-step.
+func (rc ReleaseCtx) emitStep(ctx context.Context, step string, start time.Time) {
+	if rc.EmitStep != nil {
+		rc.EmitStep(ctx, step, start)
+	}
 }
 
 // Coded exit markers a pattern's remote scripts use (DESIGN §12 table).

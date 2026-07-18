@@ -26,16 +26,17 @@ import (
 // ----------------------------------------------------------------------------
 
 type fakeHost struct {
-	host       string
-	files      map[string][]byte // path -> content (case-sensitive; engine is consistent)
-	dirs       map[string]bool
-	dirTS      map[string]int64 // optional per-dir mtime ticks for deterministic prune
-	current    string          // junction target
-	svc        string          // "", "Stopped", "Running"
-	fail       map[string]bool // step toggles: "switch","health","start","extract"
-	failN      map[string]int  // one-shot step failures: fail the first N calls, then succeed
-	healthGate func() bool     // optional dynamic health failure (true => fail)
-	log        []string        // executed step markers, in order
+	host             string
+	files            map[string][]byte // path -> content (case-sensitive; engine is consistent)
+	dirs             map[string]bool
+	dirTS            map[string]int64         // optional per-dir mtime ticks for deterministic prune
+	current          string                   // junction target
+	svc              string                   // "", "Stopped", "Running"
+	fail             map[string]bool          // step toggles: "switch","health","start","extract"
+	failN            map[string]int           // one-shot step failures: fail the first N calls, then succeed
+	healthGate       func() bool              // optional dynamic health failure (true => fail)
+	healthScriptGate func(script string) bool // optional health failure keyed on the executed script (true => fail)
+	log              []string                 // executed step markers, in order
 }
 
 func newFakeHost(name string) *fakeHost {
@@ -50,9 +51,9 @@ func (f *fakeHost) Connect(ctx context.Context) error {
 	}
 	return nil
 }
-func (f *fakeHost) Close() error                      { return nil }
-func (f *fakeHost) OS() spec.OSKind                   { return spec.OSWindows }
-func (f *fakeHost) Host() string                      { return f.host }
+func (f *fakeHost) Close() error    { return nil }
+func (f *fakeHost) OS() spec.OSKind { return spec.OSWindows }
+func (f *fakeHost) Host() string    { return f.host }
 
 var reRead = regexp.MustCompile(`ReadAllBytes\('([^']+)'\)`)
 var reWrite = regexp.MustCompile(`WriteAllBytes\('([^']+)',\[Convert\]::FromBase64String\('([^']*)'\)\)`)
@@ -204,11 +205,24 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		return ok(""), nil
 
-	case strings.Contains(s, "Stop-Service"): // Stop
+	case strings.Contains(s, "Stop-Service"): // S1 graceful Stop
 		f.mark("STOP")
+		if f.fail["stopgrace"] {
+			// service ignores the graceful stop ⇒ escalate to FORCE_KILL
+			// (windows_service Stop returns the sentinel exit 100).
+			return transport.Result{ExitCode: 100}, nil
+		}
 		if f.svc == "Running" {
 			f.svc = "Stopped"
 		}
+		return ok(""), nil
+
+	case strings.Contains(s, "taskkill /PID"): // S2 FORCE_KILL escalation
+		f.mark("FORCE_KILL")
+		if f.fail["forcekill"] {
+			return transport.Result{ExitCode: 43, Stderr: "still running after kill"}, nil
+		}
+		f.svc = "Stopped"
 		return ok(""), nil
 
 	case strings.Contains(s, "Start-Service"): // Start
@@ -234,7 +248,7 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "Invoke-WebRequest"): // health http
-		if f.fail["health"] || (f.healthGate != nil && f.healthGate()) {
+		if f.fail["health"] || (f.healthGate != nil && f.healthGate()) || (f.healthScriptGate != nil && f.healthScriptGate(s)) {
 			return transport.Result{ExitCode: 1, Stdout: "connection refused"}, nil
 		}
 		f.mark("HEALTH")
@@ -479,6 +493,320 @@ func TestIdempotentNoop(t *testing.T) { // IDP-01
 	joined := strings.Join(f.log, ">")
 	if strings.Contains(joined, "EXTRACT") || strings.Contains(joined, "SWITCH") || strings.Contains(joined, "STOP") {
 		t.Fatalf("second apply must be a no-op, got %v", f.log)
+	}
+}
+
+func TestReconfigureAppliesConfig(t *testing.T) { // IDP-02: config-only update reaches CONFIGURE
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Same artifact version/checksum: Deploy would be an idempotent no-op that
+	// skips CONFIGURE. Reconfigure must transactionally STOP → CONFIGURE → START →
+	// HEALTH under the lock so the new config is activated on the running process,
+	// WITHOUT re-staging/switching (no FETCH/EXTRACT/SWITCH).
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if st == nil || st.DeployedVersion != "1.0.0" {
+		t.Fatalf("reconfigure status: %+v", st)
+	}
+	order := strings.Join(f.log, ">")
+	for _, must := range []string{"LOCK", "STOP", "CONFIGURE", "START", "HEALTH"} {
+		if !strings.Contains(order, must) {
+			t.Fatalf("reconfigure must run %s, got %v", must, f.log)
+		}
+	}
+	for _, pair := range [][2]string{{"LOCK", "STOP"}, {"STOP", "CONFIGURE"}, {"CONFIGURE", "START"}, {"START", "HEALTH"}} {
+		if strings.Index(order, pair[0]) > strings.Index(order, pair[1]) {
+			t.Fatalf("reconfigure step order violated (%s before %s): %v", pair[0], pair[1], f.log)
+		}
+	}
+	for _, banned := range []string{"FETCH", "EXTRACT", "SWITCH"} {
+		if strings.Contains(order, banned) {
+			t.Fatalf("reconfigure must not %s (same release), got %v", banned, f.log)
+		}
+	}
+	// The manifest is re-finalized transactionally with a reconfigure LastOp,
+	// version/checksum unchanged.
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"type": "reconfigure"`) || !strings.Contains(mj, `"current_version": "1.0.0"`) {
+		t.Fatalf("reconfigure manifest not finalized: %s", mj)
+	}
+}
+
+func TestReconfigureAbsentIsNoop(t *testing.T) { // IDP-03: nothing deployed => nil status, no error
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	spec := winSvcSpec(t, url, sum)
+	st, err := eng.Reconfigure(context.Background(), spec, spec)
+	if err != nil {
+		t.Fatalf("reconfigure on absent deployment must be a no-op, got %v", err)
+	}
+	if st != nil {
+		t.Fatalf("reconfigure on absent deployment must return nil status, got %+v", st)
+	}
+}
+
+func TestReconfigureRestoresPriorOnFailure(t *testing.T) { // RBK-04: config-only update fails, prior restored
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Fail the FIRST CONFIGURE (the new settings) once; the restore CONFIGURE of
+	// the prior settings then succeeds. The reconfigure must roll the machine back
+	// to the prior configuration, health-check it, and surface the original error.
+	f.failN["configure"] = 1
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when CONFIGURE fails, got status %+v", st)
+	}
+	if st != nil {
+		t.Fatalf("failed reconfigure must return nil status, got %+v", st)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("error must report prior config restored, got %v", err)
+	}
+	// The manifest records the rolled-back reconfigure, version/checksum unchanged;
+	// this is written only on the restore-succeeded path.
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "rolled_back"`) || !strings.Contains(mj, `"current_version": "1.0.0"`) {
+		t.Fatalf("rolled-back manifest not finalized: %s", mj)
+	}
+}
+
+func TestReconfigureRollbackFailedSurfaces(t *testing.T) { // RBK-05: restore also fails => ERR_ROLLBACK_FAILED
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// HEALTH fails permanently: the new config fails HEALTH, and the restored prior
+	// config also fails HEALTH, so restoration cannot be confirmed. The engine must
+	// persist a failed manifest (§10.6) and surface ERR_ROLLBACK_FAILED.
+	f.fail["health"] = true
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when restore fails, got status %+v", st)
+	}
+	if !strings.Contains(err.Error(), "ERR_ROLLBACK_FAILED") || !strings.Contains(err.Error(), "MACHINE IN UNKNOWN STATE") {
+		t.Fatalf("error must be ERR_ROLLBACK_FAILED with unknown-state detail, got %v", err)
+	}
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "failed"`) || !strings.Contains(mj, `"type": "deploy"`) {
+		t.Fatalf("failed manifest (§10.6 deploy/failed marker) not written: %s", mj)
+	}
+}
+
+func TestReconfigureRestoreUsesPriorHealthCheck(t *testing.T) { // RBK-06: restore validated against prior check
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum) // new health check → http://localhost:8080/health
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	prior := winSvcSpec(t, url, sum)
+	prior.HealthCheck.HTTP.URL = "http://localhost:9090/health" // prior check differs
+	f.log = nil
+	// Health passes ONLY for the PRIOR check's endpoint (:9090); the new check's
+	// endpoint (:8080) fails. Restoration therefore succeeds only if it is validated
+	// against prior.HealthCheck — if the engine reused the new check, the restore
+	// health would fail and this would surface ERR_ROLLBACK_FAILED instead.
+	f.healthScriptGate = func(script string) bool { return strings.Contains(script, "8080") }
+	st, err := eng.Reconfigure(context.Background(), d, prior)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when new-config HEALTH fails, got status %+v", st)
+	}
+	if strings.Contains(err.Error(), "ERR_ROLLBACK_FAILED") {
+		t.Fatalf("restore validated against the WRONG (new) health check: %v", err)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("restore against prior health check must succeed, got %v", err)
+	}
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "rolled_back"`) {
+		t.Fatalf("rolled-back manifest not finalized: %s", mj)
+	}
+}
+
+func TestReconfigureRunsChangedPostInstall(t *testing.T) { // changed hook must run at pre-activation point
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Deploy WITHOUT a post_install hook, then reconfigure to ADD one (same
+	// artifact). The newly-added hook MUST run, between CONFIGURE and START.
+	prior := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	next := winSvcSpecPostInstall(t, url, sum) // adds LDPOSTINSTALL, artifact unchanged
+	st, err := eng.Reconfigure(context.Background(), next, prior)
+	if err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("reconfigure returned nil status")
+	}
+	order := strings.Join(f.log, ">")
+	if !strings.Contains(order, "POSTINSTALL") {
+		t.Fatalf("a CHANGED post_install hook must run, got %v", f.log)
+	}
+	for _, pair := range [][2]string{{"CONFIGURE", "POSTINSTALL"}, {"POSTINSTALL", "START"}} {
+		if strings.Index(order, pair[0]) > strings.Index(order, pair[1]) {
+			t.Fatalf("post_install order violated (%s before %s): %v", pair[0], pair[1], f.log)
+		}
+	}
+}
+
+func TestReconfigureSkipsUnchangedPostInstall(t *testing.T) { // unchanged hook must NOT re-run
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Deploy WITH a post_install hook, then reconfigure with the SAME hook. The hook
+	// already ran when the artifact was staged; a same-artifact reconfigure that does
+	// not change it must NOT re-execute it.
+	d := winSvcSpecPostInstall(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	if _, err := eng.Reconfigure(context.Background(), d, d); err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if strings.Contains(strings.Join(f.log, ">"), "POSTINSTALL") {
+		t.Fatalf("an UNCHANGED post_install hook must NOT re-run, got %v", f.log)
+	}
+}
+
+func TestReconfigureRollbackSkipsPriorPostInstall(t *testing.T) { // rollback must NOT re-run the prior hook
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Prior config HAS a post_install hook; the reconfigure keeps the SAME hook (so
+	// the forward path does not run it) but fails at CONFIGURE, forcing a rollback.
+	// The restore of the prior configuration must NOT re-execute the prior hook.
+	d := winSvcSpecPostInstall(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	f.failN["configure"] = 1 // fail the forward CONFIGURE once → rollback
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when CONFIGURE fails, got status %+v", st)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("error must report prior config restored, got %v", err)
+	}
+	if strings.Contains(strings.Join(f.log, ">"), "POSTINSTALL") {
+		t.Fatalf("rollback must NOT re-run the prior post_install hook, got %v", f.log)
+	}
+}
+
+func TestUpdateRoutesSameArtifactThroughReconfigure(t *testing.T) { // item 2: approved path applies config
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Same artifact (version + checksum unchanged): Update MUST route through the
+	// transactional Reconfigure path so CONFIGURE actually runs, rather than hitting
+	// Deploy's idempotency short-circuit which would skip it.
+	st, err := eng.Update(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("update returned nil status")
+	}
+	order := strings.Join(f.log, ">")
+	if !strings.Contains(order, "CONFIGURE") {
+		t.Fatalf("same-artifact Update must reconfigure (run CONFIGURE), got %v", f.log)
+	}
+	if strings.Contains(order, "FETCH") {
+		t.Fatalf("same-artifact Update must not re-stage the artifact, got %v", f.log)
+	}
+}
+
+func TestUpdateRoutesNewArtifactThroughDeploy(t *testing.T) { // item 2: version bump still deploys
+	p1 := []byte("v1")
+	url1, sum1, done1 := testArtifactServer(t, p1)
+	defer done1()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	prior := winSvcSpec(t, url1, sum1)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	p2 := []byte("v2 bytes")
+	url2, sum2, done2 := testArtifactServer(t, p2)
+	defer done2()
+	next := winSvcSpec(t, url2, sum2)
+	next.Artifact.Version = "2.0.0"
+	f.log = nil
+	if _, err := eng.Update(context.Background(), next, prior); err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), "FETCH") {
+		t.Fatalf("changed-artifact Update must deploy (re-stage the artifact), got %v", f.log)
+	}
+}
+
+func TestUpdateFallsBackToDeployWhenManifestAbsent(t *testing.T) { // item 4: (nil,nil) must not surface
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	// Nothing deployed yet → the manifest is absent, so Reconfigure returns (nil,nil).
+	// Engine.Update must fall back to Deploy and return a NON-nil status (the provider
+	// dereferences it) rather than propagating the nil.
+	st, err := eng.Update(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("Update must fall back to Deploy (non-nil status) when nothing is deployed")
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), "FETCH") {
+		t.Fatalf("fallback Deploy must stage the artifact, got %v", f.log)
 	}
 }
 
@@ -830,9 +1158,9 @@ type recLinux struct {
 }
 
 func (r *recLinux) Connect(ctx context.Context) error { return nil }
-func (r *recLinux) Close() error                       { return nil }
-func (r *recLinux) OS() spec.OSKind                    { return spec.OSLinux }
-func (r *recLinux) Host() string                       { return r.host }
+func (r *recLinux) Close() error                      { return nil }
+func (r *recLinux) OS() spec.OSKind                   { return spec.OSLinux }
+func (r *recLinux) Host() string                      { return r.host }
 func (r *recLinux) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	r.scripts = append(r.scripts, c.Script)
 	return transport.Result{ExitCode: 0}, nil // empty stdout => empty prune listing
@@ -845,7 +1173,7 @@ var _ transport.Transport = (*recLinux)(nil)
 // TestLinuxOrchestrationQuotesHostileRoot drives the REAL staging/prune
 // orchestration (wipeStaging + pruneReleases, not just the script generators)
 // with an install_root that embeds a single quote and a shell metacharacter
-// payload, and asserts every emitted script POSIX-escapes it via shq (`'\''`)
+// payload, and asserts every emitted script POSIX-escapes it via shq (`'\”`)
 // so the payload can never break out of its quotes (evaluator feedback item 4).
 func TestLinuxOrchestrationQuotesHostileRoot(t *testing.T) {
 	url, sum, done := testArtifactServer(t, []byte("x"))
@@ -948,7 +1276,7 @@ func TestIncompleteReleaseCleanupFailureSurfaced(t *testing.T) {
 	defer done()
 	f := newFakeHost("lab-01")
 	f.fail["postinstall"] = true // pre-switch failure on a freshly-created release
-	f.fail["rmRelease"] = true    // ...and the release cleanup removal fails
+	f.fail["rmRelease"] = true   // ...and the release cleanup removal fails
 	eng := engineWith(f)
 
 	_, err := eng.Deploy(context.Background(), winSvcSpecPostInstall(t, url, sum))
@@ -1079,4 +1407,3 @@ func TestRunStagingFailureRemovesRelease(t *testing.T) {
 		t.Fatalf("pre-execution staging failure must remove the partial release; log=%v", f.log)
 	}
 }
-
