@@ -172,7 +172,7 @@ func (r *DeploymentResource) Create(ctx context.Context, req resource.CreateRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	r.apply(ctx, &plan, &resp.Diagnostics, func(m *deploymentModel) {
+	r.apply(ctx, &plan, nil, &resp.Diagnostics, func(m *deploymentModel) {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 	})
 }
@@ -183,20 +183,31 @@ func (r *DeploymentResource) Update(ctx context.Context, req resource.UpdateRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	r.apply(ctx, &plan, &resp.Diagnostics, func(m *deploymentModel) {
+	// Resolve the PRIOR spec from state so a same-artifact configuration change is
+	// routed through the transactional Reconfigure path instead of Deploy, whose
+	// idempotency short-circuit would otherwise skip it. A prior state that no
+	// longer parses is non-fatal: fall back to Deploy (prior == nil).
+	var prior *spec.Deployment
+	var state deploymentModel
+	if diag := req.State.Get(ctx, &state); !diag.HasError() {
+		if pd, _, err := r.resolveSpec(ctx, &state); err == nil {
+			prior = pd
+		}
+	}
+	r.apply(ctx, &plan, prior, &resp.Diagnostics, func(m *deploymentModel) {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 	})
 }
 
 func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
-	diags diagAppender, setState func(*deploymentModel)) {
+	prior *spec.Deployment, diags diagAppender, setState func(*deploymentModel)) {
 	d, hash, err := r.resolveSpec(ctx, plan)
 	if err != nil {
 		diags.AddError("Invalid spec", err.Error())
 		return
 	}
 	eng := engine.New()
-	st, err := eng.Deploy(ctx, d)
+	st, err := eng.Update(ctx, d, prior)
 	for _, w := range eng.Warnings {
 		diags.AddWarning("labdeploy", w)
 	}

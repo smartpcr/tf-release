@@ -103,6 +103,45 @@ func isChecksumErr(err error) bool {
 	return false
 }
 
+// Update is the entry point for a resource Update (DESIGN §10.2). When the desired
+// spec leaves the artifact (version + checksum) unchanged from prior — a
+// configuration-only change — Deploy's idempotency short-circuit (§10.1 step 2)
+// would skip CONFIGURE and silently drop the new mutable settings while Terraform
+// records them. For a single-target windows_service that case is routed through the
+// transactional, rollback-safe Reconfigure path so the change is actually applied.
+// Every other case (a new/changed artifact, or a pattern/topology Reconfigure does
+// not cover) falls through to Deploy, which is itself idempotent.
+func (e *Engine) Update(ctx context.Context, s, prior *spec.Deployment) (*Status, error) {
+	if reconfigurable(s, prior) {
+		return e.Reconfigure(ctx, s, prior)
+	}
+	return e.Deploy(ctx, s)
+}
+
+// reconfigurable reports whether a same-artifact configuration change should be
+// applied via Reconfigure rather than Deploy. Reconfigure is single-host and, in
+// this stage, defined for the windows_service pattern; anything else defers to
+// Deploy. artifactUnchanged gates it so version upgrades always deploy.
+func reconfigurable(s, prior *spec.Deployment) bool {
+	if prior == nil || s == nil {
+		return false
+	}
+	if s.Pattern.Type != spec.PatternWindowsService {
+		return false
+	}
+	if len(s.Target.Hosts) != 1 {
+		return false
+	}
+	return artifactUnchanged(s, prior)
+}
+
+// artifactUnchanged reports whether two specs point at the same artifact — the
+// signal that a change is configuration-only.
+func artifactUnchanged(s, prior *spec.Deployment) bool {
+	return s.Artifact.Version == prior.Artifact.Version &&
+		s.Artifact.Checksum == prior.Artifact.Checksum
+}
+
 // Deploy is the entry point for Create and Update (DESIGN §10.1/§10.2).
 func (e *Engine) Deploy(ctx context.Context, s *spec.Deployment) (*Status, error) {
 	if s.Pattern.Type == spec.PatternClusterGeneric {
@@ -1330,20 +1369,22 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 	// the prior environment/arguments would be written but never activated. The
 	// health check is passed in so the restored configuration is validated against
 	// the PRIOR health check, not the new one.
-	activate := func(rc pattern.ReleaseCtx, hc *spec.HealthCheck) error {
+	//
+	// preStart, when non-nil, runs at the pre-activation point (after CONFIGURE,
+	// before START). Only the forward path supplies it, and only to run a CHANGED
+	// post_install hook — the restore path passes nil so the PRIOR hook is never
+	// re-executed while rolling back.
+	activate := func(rc pattern.ReleaseCtx, hc *spec.HealthCheck, preStart func() error) error {
 		if err := sl.timed(ctx, "STOP", func() error { return pat.Stop(ctx, t, rc) }); err != nil {
 			return coded("ERR_SERVICE_STOP", host, "STOP", err)
 		}
 		if err := sl.timed(ctx, "CONFIGURE", func() error { return pat.Configure(ctx, t, rc) }); err != nil {
 			return coded("ERR_SERVICE_INSTALL", host, "CONFIGURE", err)
 		}
-		// Run the post_install hook against the (already staged) release so a
-		// configuration-only update that changes post_install actually executes it,
-		// rather than Terraform recording a value the machine never applied. rc.Spec
-		// is the deployment being (re)applied — the new one on the forward path, the
-		// prior one on the restore path.
-		if err := e.runPostInstall(ctx, t, rc.Spec, rp.Release, rc, host); err != nil {
-			return err
+		if preStart != nil {
+			if err := preStart(); err != nil {
+				return err
+			}
 		}
 		if err := sl.timed(ctx, "START", func() error { return pat.Start(ctx, t, rc) }); err != nil {
 			return err
@@ -1361,7 +1402,20 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		okStatus   string
 	)
 	forward := func() error {
-		if err := activate(newRC, &s.HealthCheck); err != nil {
+		// Run post_install ONLY when the hook actually CHANGED for this same-artifact
+		// reconfigure, at the pre-activation point (after CONFIGURE, before START) so
+		// it runs before the new configuration is activated — matching its
+		// after-extract/before-switchover semantics on deploy. An UNCHANGED hook is
+		// not re-executed (its effect already landed when the artifact was staged),
+		// and because only the forward path supplies preStart the PRIOR hook is never
+		// re-run while rolling back.
+		var preStart func() error
+		if s.Pattern.PostInstall != prior.Pattern.PostInstall {
+			preStart = func() error {
+				return e.runPostInstall(ctx, t, s, rp.Release, newRC, host)
+			}
+		}
+		if err := activate(newRC, &s.HealthCheck, preStart); err != nil {
 			return err
 		}
 		nm := writeManifest("success")
@@ -1383,7 +1437,7 @@ func (e *Engine) Reconfigure(ctx context.Context, s, prior *spec.Deployment) (*S
 		priorRC := releaseCtxVersion(prior, rp, m.CurrentVersion)
 		priorRC.EmitStep = sl.emit
 		rbStart := time.Now()
-		rerr := activate(priorRC, &prior.HealthCheck)
+		rerr := activate(priorRC, &prior.HealthCheck, nil)
 		if rerr == nil {
 			// Prior configuration restored and healthy — re-finalize the manifest to
 			// record the rolled-back reconfigure (version/checksum unchanged).

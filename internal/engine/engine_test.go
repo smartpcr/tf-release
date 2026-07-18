@@ -653,20 +653,21 @@ func TestReconfigureRestoreUsesPriorHealthCheck(t *testing.T) { // RBK-06: resto
 	}
 }
 
-func TestReconfigureRunsPostInstall(t *testing.T) { // config-only update must execute post_install
+func TestReconfigureRunsChangedPostInstall(t *testing.T) { // changed hook must run at pre-activation point
 	payload := []byte("v1 bytes")
 	url, sum, done := testArtifactServer(t, payload)
 	defer done()
 	f := newFakeHost("lab-01")
 	eng := engineWith(f)
-	d := winSvcSpecPostInstall(t, url, sum)
-	if _, err := eng.Deploy(context.Background(), d); err != nil {
+	// Deploy WITHOUT a post_install hook, then reconfigure to ADD one (same
+	// artifact). The newly-added hook MUST run, between CONFIGURE and START.
+	prior := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
 		t.Fatalf("first deploy: %v", err)
 	}
 	f.log = nil
-	// A post_install-only change routes through Reconfigure; the hook MUST run so
-	// the value Terraform records is actually applied (not silently skipped).
-	st, err := eng.Reconfigure(context.Background(), d, d)
+	next := winSvcSpecPostInstall(t, url, sum) // adds LDPOSTINSTALL, artifact unchanged
+	st, err := eng.Reconfigure(context.Background(), next, prior)
 	if err != nil {
 		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
 	}
@@ -675,12 +676,115 @@ func TestReconfigureRunsPostInstall(t *testing.T) { // config-only update must e
 	}
 	order := strings.Join(f.log, ">")
 	if !strings.Contains(order, "POSTINSTALL") {
-		t.Fatalf("reconfigure must run the post_install hook, got %v", f.log)
+		t.Fatalf("a CHANGED post_install hook must run, got %v", f.log)
 	}
 	for _, pair := range [][2]string{{"CONFIGURE", "POSTINSTALL"}, {"POSTINSTALL", "START"}} {
 		if strings.Index(order, pair[0]) > strings.Index(order, pair[1]) {
 			t.Fatalf("post_install order violated (%s before %s): %v", pair[0], pair[1], f.log)
 		}
+	}
+}
+
+func TestReconfigureSkipsUnchangedPostInstall(t *testing.T) { // unchanged hook must NOT re-run
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Deploy WITH a post_install hook, then reconfigure with the SAME hook. The hook
+	// already ran when the artifact was staged; a same-artifact reconfigure that does
+	// not change it must NOT re-execute it.
+	d := winSvcSpecPostInstall(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	if _, err := eng.Reconfigure(context.Background(), d, d); err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if strings.Contains(strings.Join(f.log, ">"), "POSTINSTALL") {
+		t.Fatalf("an UNCHANGED post_install hook must NOT re-run, got %v", f.log)
+	}
+}
+
+func TestReconfigureRollbackSkipsPriorPostInstall(t *testing.T) { // rollback must NOT re-run the prior hook
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Prior config HAS a post_install hook; the reconfigure keeps the SAME hook (so
+	// the forward path does not run it) but fails at CONFIGURE, forcing a rollback.
+	// The restore of the prior configuration must NOT re-execute the prior hook.
+	d := winSvcSpecPostInstall(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	f.failN["configure"] = 1 // fail the forward CONFIGURE once → rollback
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when CONFIGURE fails, got status %+v", st)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("error must report prior config restored, got %v", err)
+	}
+	if strings.Contains(strings.Join(f.log, ">"), "POSTINSTALL") {
+		t.Fatalf("rollback must NOT re-run the prior post_install hook, got %v", f.log)
+	}
+}
+
+func TestUpdateRoutesSameArtifactThroughReconfigure(t *testing.T) { // item 2: approved path applies config
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Same artifact (version + checksum unchanged): Update MUST route through the
+	// transactional Reconfigure path so CONFIGURE actually runs, rather than hitting
+	// Deploy's idempotency short-circuit which would skip it.
+	st, err := eng.Update(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("update returned nil status")
+	}
+	order := strings.Join(f.log, ">")
+	if !strings.Contains(order, "CONFIGURE") {
+		t.Fatalf("same-artifact Update must reconfigure (run CONFIGURE), got %v", f.log)
+	}
+	if strings.Contains(order, "FETCH") {
+		t.Fatalf("same-artifact Update must not re-stage the artifact, got %v", f.log)
+	}
+}
+
+func TestUpdateRoutesNewArtifactThroughDeploy(t *testing.T) { // item 2: version bump still deploys
+	p1 := []byte("v1")
+	url1, sum1, done1 := testArtifactServer(t, p1)
+	defer done1()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	prior := winSvcSpec(t, url1, sum1)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	p2 := []byte("v2 bytes")
+	url2, sum2, done2 := testArtifactServer(t, p2)
+	defer done2()
+	next := winSvcSpec(t, url2, sum2)
+	next.Artifact.Version = "2.0.0"
+	f.log = nil
+	if _, err := eng.Update(context.Background(), next, prior); err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), "FETCH") {
+		t.Fatalf("changed-artifact Update must deploy (re-stage the artifact), got %v", f.log)
 	}
 }
 
