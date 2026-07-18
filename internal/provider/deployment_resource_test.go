@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
 
@@ -413,6 +415,106 @@ func TestModifyPlanRecoveryCreateProceeds(t *testing.T) {
 	}
 	if planned.ResolvedSpec.IsNull() || planned.ResolvedSpec.ValueString() == "" {
 		t.Fatal("recovery create plan must carry a resolved_spec for Create to persist a verified snapshot")
+	}
+}
+
+// fakeDeployEngine injects at the resource's engine boundary (DESIGN §17) so a
+// full lifecycle path can be driven without a live transport. It records the spec
+// it was asked to deploy (so a test can prove the RESOLVED, default-merged identity
+// — not the pre-merge spec — is what gets deployed) and returns a canned success.
+type fakeDeployEngine struct {
+	gotSpec *spec.Deployment
+	status  *engine.Status
+}
+
+func (f *fakeDeployEngine) Update(_ context.Context, s, _ *spec.Deployment) (*engine.Status, error) {
+	f.gotSpec = s
+	return f.status, nil
+}
+func (f *fakeDeployEngine) ReadStatus(_ context.Context, _ *spec.Deployment) (*engine.Status, error) {
+	return f.status, nil
+}
+func (f *fakeDeployEngine) Destroy(_ context.Context, _ *spec.Deployment, _ string) error { return nil }
+func (f *fakeDeployEngine) Warns() []string                                               { return nil }
+
+// runCreate drives DeploymentResource.Create end-to-end with a real plan built from
+// the resource schema and returns the response so tests can assert the persisted state.
+func runCreate(t *testing.T, r *DeploymentResource, plan *deploymentModel) *resource.CreateResponse {
+	t.Helper()
+	ctx := context.Background()
+	sr := resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, &sr)
+	p := tfsdk.Plan{Schema: sr.Schema}
+	if d := p.Set(ctx, plan); d.HasError() {
+		t.Fatalf("build plan: %v", d)
+	}
+	resp := &resource.CreateResponse{State: tfsdk.State{Schema: sr.Schema}}
+	r.Create(ctx, resource.CreateRequest{Plan: p}, resp)
+	return resp
+}
+
+// TestCreateRecoveryPersistsResolvedSpec is the end-to-end continuation of the
+// documented `terraform state rm` + `terraform apply` recovery for unverifiable
+// default-dependent state (iter-34 review item 1). Where TestModifyPlanRecoveryCreateProceeds
+// only proves create-path PLANNING is unblocked and carries a resolved_spec, this test
+// drives DeploymentResource.Create itself through the recovery and proves:
+//  1. the engine deploys the RESOLVED, default-merged identity (host lab-99) — the intended
+//     deployed identity — not the pre-merge spec that omits the host, and
+//  2. the resulting state persists a DECODABLE resolved_spec snapshot for that same identity,
+//     i.e. Create actually reaches verified state (not merely assumed).
+func TestCreateRecoveryPersistsResolvedSpec(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	// Raw spec_file omits target.hosts; the provider default_target supplies lab-99 — the
+	// same default-contributes-host setup that BLOCKS on the update path.
+	if err := os.WriteFile(specPath, []byte(wsSpecYAMLNoHost("1.0.0")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	fake := &fakeDeployEngine{status: &engine.Status{
+		DeployedVersion: "1.0.0", ServiceStatus: "running", Hosts: []string{"lab-99"},
+	}}
+	r := &DeploymentResource{
+		pd:        &providerData{DefaultTarget: &spec.Target{Hosts: []string{"lab-99"}}},
+		newEngine: func() deployEngine { return fake },
+	}
+	// Post `terraform state rm`, the apply flows through Create with no prior state.
+	plan := &deploymentModel{SpecFile: types.StringValue(specPath), Spec: types.StringNull(),
+		ResolvedSpec: types.StringNull(), SpecHash: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	resp := runCreate(t, r, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("recovery Create must succeed, got %v", resp.Diagnostics.Errors())
+	}
+	// 1. The engine was asked to deploy the resolved default-merged identity, not the
+	//    pre-merge spec (which has no host).
+	if fake.gotSpec == nil {
+		t.Fatal("Create must invoke the engine deploy")
+	}
+	if len(fake.gotSpec.Target.Hosts) != 1 || fake.gotSpec.Target.Hosts[0] != "lab-99" {
+		t.Fatalf("Create must deploy the resolved identity lab-99, got hosts %v", fake.gotSpec.Target.Hosts)
+	}
+	// 2. The persisted state carries a DECODABLE resolved_spec snapshot for that identity —
+	//    proving Create reaches VERIFIED state rather than merely assuming adoption.
+	var persisted deploymentModel
+	if d := resp.State.Get(context.Background(), &persisted); d.HasError() {
+		t.Fatalf("read persisted state: %v", d)
+	}
+	rs := persisted.ResolvedSpec.ValueString()
+	if rs == "" {
+		t.Fatal("recovery Create must persist a resolved_spec snapshot")
+	}
+	var decoded spec.Deployment
+	if err := json.Unmarshal([]byte(rs), &decoded); err != nil {
+		t.Fatalf("persisted resolved_spec must be decodable, got error: %v (raw=%q)", err, rs)
+	}
+	if len(decoded.Target.Hosts) != 1 || decoded.Target.Hosts[0] != "lab-99" {
+		t.Fatalf("persisted resolved_spec must capture the deployed identity lab-99, got %v", decoded.Target.Hosts)
+	}
+	// A verified snapshot is exactly what stateSpec treats as trustworthy, so a subsequent
+	// Read/Delete would no longer hit the unverifiable-legacy migration guard.
+	if _, _, verified, err := r.stateSpec(context.Background(), &persisted); err != nil || !verified {
+		t.Fatalf("post-recovery state must be verified, got verified=%v err=%v", verified, err)
 	}
 }
 

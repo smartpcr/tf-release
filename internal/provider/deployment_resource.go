@@ -32,7 +32,35 @@ var (
 
 func NewDeploymentResource() resource.Resource { return &DeploymentResource{} }
 
-type DeploymentResource struct{ pd *providerData }
+type DeploymentResource struct {
+	pd *providerData
+	// newEngine is an OPTIONAL test seam (DESIGN §17): when nil the resource uses
+	// the real engine.New(); unit tests inject a fake so a lifecycle path (e.g. the
+	// state-rm + apply recovery Create) can be exercised end-to-end without a live
+	// transport. Production always leaves it nil.
+	newEngine func() deployEngine
+}
+
+// deployEngine is the narrow engine surface the resource depends on. It exists so
+// tests can inject a fake at the engine boundary (DESIGN §17) rather than
+// reimplementing the transport-script protocol. realEngine adapts *engine.Engine.
+type deployEngine interface {
+	Update(ctx context.Context, s, prior *spec.Deployment) (*engine.Status, error)
+	ReadStatus(ctx context.Context, s *spec.Deployment) (*engine.Status, error)
+	Destroy(ctx context.Context, s *spec.Deployment, mode string) error
+	Warns() []string
+}
+
+type realEngine struct{ *engine.Engine }
+
+func (r realEngine) Warns() []string { return r.Engine.Warnings }
+
+func (r *DeploymentResource) engine() deployEngine {
+	if r.newEngine != nil {
+		return r.newEngine()
+	}
+	return realEngine{engine.New()}
+}
 
 // ConfigValidators enforces the VAL-06 exactly-one-of(spec, spec_file) rule at
 // the Terraform config layer (DESIGN §14).
@@ -513,9 +541,9 @@ func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
 		diags.AddError("Invalid spec", err.Error())
 		return
 	}
-	eng := engine.New()
+	eng := r.engine()
 	st, err := eng.Update(ctx, d, prior)
-	for _, w := range eng.Warnings {
+	for _, w := range eng.Warns() {
 		diags.AddWarning("labdeploy", w)
 	}
 	if err != nil {
@@ -540,9 +568,9 @@ func (r *DeploymentResource) Read(ctx context.Context, req resource.ReadRequest,
 		resp.Diagnostics.AddError("Invalid spec in state", err.Error())
 		return
 	}
-	eng := engine.New()
+	eng := r.engine()
 	st, err := eng.ReadStatus(ctx, d)
-	for _, w := range eng.Warnings {
+	for _, w := range eng.Warns() {
 		resp.Diagnostics.AddWarning("labdeploy", w)
 	}
 	if err != nil {
@@ -596,12 +624,12 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 				"destroying now could orphan the deployed service. "+recoveryUnverifiableLegacy)
 		return
 	}
-	eng := engine.New()
+	eng := r.engine()
 	if err := eng.Destroy(ctx, d, state.DestroyMode.ValueString()); err != nil {
 		resp.Diagnostics.AddError("Destroy failed", err.Error())
 		return
 	}
-	for _, w := range eng.Warnings {
+	for _, w := range eng.Warns() {
 		resp.Diagnostics.AddWarning("labdeploy", w)
 	}
 }
