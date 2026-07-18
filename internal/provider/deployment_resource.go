@@ -398,9 +398,23 @@ func (r *DeploymentResource) Delete(ctx context.Context, req resource.DeleteRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	d, _, _, err := r.stateSpec(ctx, &state)
+	d, _, verified, err := r.stateSpec(ctx, &state)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid spec in state", err.Error())
+		return
+	}
+	if !verified {
+		// Legacy spec_file state with no persisted resolved_spec snapshot: the identity
+		// we would destroy comes from a fresh spec_file reread, NOT the deployed snapshot.
+		// An immutable-field edit on disk (host, service_name, install_root) would make
+		// Destroy target the WRONG service and orphan the one actually deployed. Refuse to
+		// destroy an unverifiable identity; demand an explicit migration first.
+		resp.Diagnostics.AddError("labdeploy state migration required",
+			"this resource predates resolved_spec and is configured via spec_file, so the "+
+				"identity to destroy cannot be verified from state — it would be re-derived from "+
+				"the current spec_file, which may have been edited to point at a different target. "+
+				"Destroying now could orphan the deployed service. Re-apply (terraform apply) to "+
+				"persist a resolved_spec snapshot, then destroy.")
 		return
 	}
 	eng := engine.New()

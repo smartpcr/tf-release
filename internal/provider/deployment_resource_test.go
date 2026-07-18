@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
@@ -241,5 +243,43 @@ func TestConfiguredSpecPath(t *testing.T) {
 	inlineCfg := &deploymentModel{Spec: types.StringValue("y"), SpecFile: types.StringNull()}
 	if got := configuredSpecPath(inlineCfg); !got.Equal(path.Root("spec")) {
 		t.Fatalf("inline config must attribute replacement to spec, got %s", got)
+	}
+}
+
+// deleteReqForModel builds a real resource.DeleteRequest whose State carries the given
+// model, using the resource's own schema, so Delete can be exercised end-to-end.
+func deleteReqForModel(t *testing.T, r *DeploymentResource, m *deploymentModel) (resource.DeleteRequest, *resource.DeleteResponse) {
+	t.Helper()
+	sr := resource.SchemaResponse{}
+	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)
+	st := tfsdk.State{Schema: sr.Schema}
+	if diags := st.Set(context.Background(), m); diags.HasError() {
+		t.Fatalf("build state: %v", diags)
+	}
+	return resource.DeleteRequest{State: st}, &resource.DeleteResponse{State: st}
+}
+
+// TestDeleteRejectsUnverifiedLegacyState covers item 2 (iter-25 review): Delete must
+// refuse to destroy when the identity is unverifiable (legacy spec_file with no
+// resolved_spec snapshot), since an immutable file edit could orphan the deployed
+// service. It must surface a migration diagnostic instead of calling Destroy.
+func TestDeleteRejectsUnverifiedLegacyState(t *testing.T) {
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.yaml")
+	if err := os.WriteFile(path, []byte(wsSpecYAMLHost("1.0.0", "lab-01")), 0o600); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	r := &DeploymentResource{}
+	// Legacy state: spec_file set, NO resolved_spec snapshot ⇒ unverifiable identity.
+	m := &deploymentModel{SpecFile: types.StringValue(path), ResolvedSpec: types.StringNull(),
+		Hosts: types.ListNull(types.StringType), Variables: types.MapNull(types.StringType)}
+	req, resp := deleteReqForModel(t, r, m)
+	r.Delete(context.Background(), req, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Delete on unverifiable legacy state must surface a migration error, not destroy")
+	}
+	if !strings.Contains(resp.Diagnostics.Errors()[0].Summary(), "migration required") {
+		t.Fatalf("expected migration diagnostic, got %q", resp.Diagnostics.Errors()[0].Summary())
 	}
 }
