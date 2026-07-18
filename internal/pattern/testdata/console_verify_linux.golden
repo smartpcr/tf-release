@@ -1,0 +1,1 @@
+cd '/opt/labdeploy/sample-svc/current' && ./sample-svc --version

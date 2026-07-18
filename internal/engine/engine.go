@@ -769,8 +769,11 @@ func (e *Engine) stageOnHost(ctx context.Context, sl stepLogger, t transport.Tra
 	}
 	sl.emit(ctx, "RENDER", renderStart)
 	// post_install hook runs in release dir after extract, before switchover;
-	// non-zero exit ⇒ ERR_SERVICE_INSTALL (DESIGN §6.4).
-	if hook := s.Pattern.PostInstall; hook != "" {
+	// non-zero exit ⇒ ERR_SERVICE_INSTALL (DESIGN §6.4). console_app is the sole
+	// exception: DESIGN §9.3 sequences its post_install AFTER switch in <cur>, so
+	// the ConsoleApp pattern owns that hook (in Configure) — running it here too
+	// would execute post_install twice.
+	if hook := s.Pattern.PostInstall; hook != "" && s.Pattern.Type != spec.PatternConsoleApp {
 		var r transport.Result
 		var xerr error
 		if t.OS() == spec.OSWindows {
