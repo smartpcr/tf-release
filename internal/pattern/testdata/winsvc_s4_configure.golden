@@ -1,0 +1,20 @@
+$ErrorActionPreference='Continue'
+$svc='PaymentsSvc'
+$bin='\"C:\deploy\payments-svc\current\bin\Payments.exe\" --config appsettings.json'
+$obj='CONTOSO\svc-pay'
+& sc.exe query $svc *> $null
+$exists = ($LASTEXITCODE -ne 1060)
+if(-not $exists){
+  if($env:LD_SVC_PW){ & sc.exe create $svc binPath= $bin start= auto DisplayName= 'Contoso Payments' obj= $obj password= $env:LD_SVC_PW }
+  elseif($obj){       & sc.exe create $svc binPath= $bin start= auto DisplayName= 'Contoso Payments' obj= $obj }
+  else{               & sc.exe create $svc binPath= $bin start= auto DisplayName= 'Contoso Payments' }
+  if($LASTEXITCODE -ne 0){ exit 46 }
+} else {
+  & sc.exe config $svc binPath= $bin start= auto
+  if($LASTEXITCODE -ne 0){ exit 46 }
+}
+& sc.exe description $svc 'Handles payments'
+if($LASTEXITCODE -ne 0){ exit 46 }
+& sc.exe failure "PaymentsSvc" reset= 86400 actions= restart/5000/restart/5000/restart/5000
+if($LASTEXITCODE -ne 0){ exit 46 }
+exit 0

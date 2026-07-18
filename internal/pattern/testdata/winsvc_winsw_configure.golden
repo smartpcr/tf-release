@@ -1,0 +1,28 @@
+$ErrorActionPreference='Continue'
+Set-Content -Path 'C:\deploy\payments-svc\current\WorkerSvc.winsw.xml' -Value '<service>
+  <id>WorkerSvc</id>
+  <name>Contoso Worker</name>
+  <description>Background worker</description>
+  <executable>C:\deploy\payments-svc\current\bin\Worker.exe</executable>
+  <logpath>C:\deploy\payments-svc\shared\logs</logpath>
+  <stopwait>60sec</stopwait>
+  <env name="LD_APP" value="payments-svc"/>
+  <env name="LD_RELEASE_DIR" value="C:\deploy\payments-svc\current"/>
+  <env name="LD_SHARED_DIR" value="C:\deploy\payments-svc\shared"/>
+  <env name="LD_VERSION" value="1.2.0"/>
+  <env name="WORKER_MODE" value="lab"/>
+</service>
+' -Encoding UTF8
+& sc.exe query 'WorkerSvc' *> $null
+if($LASTEXITCODE -eq 1060){
+  & 'C:\deploy\payments-svc\current\tools\WinSW.exe' install 'C:\deploy\payments-svc\current\WorkerSvc.winsw.xml'
+  if($LASTEXITCODE -ne 0){ exit 46 }
+} else {
+  & 'C:\deploy\payments-svc\current\tools\WinSW.exe' refresh 'C:\deploy\payments-svc\current\WorkerSvc.winsw.xml'
+  if($LASTEXITCODE -ne 0){
+    & 'C:\deploy\payments-svc\current\tools\WinSW.exe' uninstall 'C:\deploy\payments-svc\current\WorkerSvc.winsw.xml' | Out-Null
+    & 'C:\deploy\payments-svc\current\tools\WinSW.exe' install 'C:\deploy\payments-svc\current\WorkerSvc.winsw.xml'
+    if($LASTEXITCODE -ne 0){ exit 46 }
+  }
+}
+exit 0

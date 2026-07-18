@@ -156,6 +156,14 @@ func finalizeDeployment(d *spec.Deployment, pd *providerData) (string, diag.Diag
 	if pd != nil && pd.DefaultTarget != nil {
 		spec.MergeTargetDefaults(&d.Target, pd.DefaultTarget)
 	}
+	// Canonical transport fallback for the typed pattern resources: applied ONLY
+	// when neither the resource attribute NOR the provider default_target
+	// supplied one. A static schema-level default would mask
+	// default_target.transport (it would never be empty at merge time), so the
+	// fallback lives here, AFTER the merge (evaluator item 7).
+	if d.Target.Transport == "" {
+		d.Target.Transport = spec.TransportWinRM
+	}
 	if err := spec.ValidateDeployment(d); err != nil {
 		diags.AddError("Invalid windows_service configuration", err.Error())
 		return "", diags

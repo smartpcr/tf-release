@@ -87,8 +87,11 @@ func (w *WindowsService) configureWithBinPath(ctx context.Context, t transport.T
 	}
 	recovery := ""
 	if p.Recovery.RestartOnFailure == nil || *p.Recovery.RestartOnFailure {
+		// S4 recovery actions: exit≠0 is a failed S4 configuration and MUST
+		// surface as ERR_SERVICE_INSTALL rather than being swallowed.
 		recovery = fmt.Sprintf(
-			`& sc.exe failure "%s" reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null`, svc)
+			"& sc.exe failure \"%s\" reset= 86400 actions= restart/5000/restart/5000/restart/5000\nif($LASTEXITCODE -ne 0){ exit %d }",
+			svc, ExitSvcInstall)
 	}
 	// S0 + S4: create when 1060 (service does not exist), else config.
 	script := fmt.Sprintf(`$ErrorActionPreference='Continue'
@@ -106,7 +109,8 @@ if(-not $exists){
   & sc.exe config $svc binPath= $bin start= %s
   if($LASTEXITCODE -ne 0){ exit %d }
 }
-& sc.exe description $svc %s | Out-Null
+& sc.exe description $svc %s
+if($LASTEXITCODE -ne 0){ exit %d }
 %s
 exit 0`,
 		psq(svc), psq(binPath), pwLine,
@@ -115,7 +119,7 @@ exit 0`,
 		startTypeArg(st), psq(display),
 		ExitSvcInstall,
 		startTypeArg(st), ExitSvcInstall,
-		psq(p.Description), recovery)
+		psq(p.Description), ExitSvcInstall, recovery)
 	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, env, 120)
 	if err != nil {
 		return err
@@ -311,7 +315,7 @@ func WinswXML(id, name, desc, executable string, args []string, logPath string, 
 		fmt.Fprintf(&b, "  <argument>%s</argument>\n", xmlEsc(a))
 	}
 	fmt.Fprintf(&b, "  <logpath>%s</logpath>\n", xmlEsc(logPath))
-	fmt.Fprintf(&b, "  <stoptimeout>%dsec</stoptimeout>\n", stopWaitSec)
+	fmt.Fprintf(&b, "  <stopwait>%dsec</stopwait>\n", stopWaitSec)
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		keys = append(keys, k)

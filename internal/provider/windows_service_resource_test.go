@@ -209,6 +209,41 @@ func TestSingleTargetGuard(t *testing.T) {
 	}
 }
 
+// TestWSTransportDefaultTargetOverride locks evaluator item 7: when the resource
+// omits `transport`, the provider default_target.transport MUST win — it is not
+// masked by a static winrm default.
+func TestWSTransportDefaultTargetOverride(t *testing.T) {
+	t.Setenv("LAB_KEY", "----PEM----")
+	m := validWSModel(t)
+	m.Transport = types.StringNull()   // resource leaves transport unset
+	m.PasswordEnv = types.StringNull() // ssh uses key auth
+	pd := &providerData{DefaultTarget: &spec.Target{
+		Transport:   spec.TransportSSH,
+		Credentials: spec.Credentials{Username: "labadmin", PrivateKeyEnv: "LAB_KEY"},
+	}}
+	d, diags := m.buildDeployment(context.Background(), pd)
+	if diags.HasError() {
+		t.Fatalf("build: %v", diags)
+	}
+	if d.Target.Transport != spec.TransportSSH {
+		t.Fatalf("transport = %q, want ssh (default_target must win over the winrm fallback)", d.Target.Transport)
+	}
+}
+
+// TestWSTransportFallbackWinRM: with neither resource nor default_target
+// transport set, the canonical winrm fallback applies (after merge).
+func TestWSTransportFallbackWinRM(t *testing.T) {
+	m := validWSModel(t)
+	m.Transport = types.StringNull()
+	d, diags := m.buildDeployment(context.Background(), nil)
+	if diags.HasError() {
+		t.Fatalf("build: %v", diags)
+	}
+	if d.Target.Transport != spec.TransportWinRM {
+		t.Fatalf("transport = %q, want winrm fallback", d.Target.Transport)
+	}
+}
+
 // TestWSImportUnsupported: import returns an error (v1 unsupported).
 func TestWSImportUnsupported(t *testing.T) {
 	r := &WindowsServiceResource{}

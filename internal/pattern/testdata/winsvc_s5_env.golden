@@ -1,0 +1,4 @@
+$k='HKLM:\SYSTEM\CurrentControlSet\Services\PaymentsSvc'
+if(-not (Test-Path $k)){ exit 46 }
+Set-ItemProperty -Path $k -Name Environment -Type MultiString -Value @('ASPNETCORE_ENVIRONMENT=Production','LD_APP=payments-svc','LD_RELEASE_DIR=C:\deploy\payments-svc\current','LD_SHARED_DIR=C:\deploy\payments-svc\shared','LD_VERSION=1.2.0')
+exit 0

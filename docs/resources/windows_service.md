@@ -103,7 +103,10 @@ resource "labdeploy_windows_service" "worker" {
 - `name` (String, **Required**, **ForceNew**) — Logical deployment name
   (`metadata.name`).
 - `host` (String, **Required**, **ForceNew**) — The single target host.
-- `transport` (String, Optional) — `winrm` (default) | `ssh` | `local`.
+- `transport` (String, Optional) — `winrm` | `ssh` | `local`. **Precedence:** this
+  attribute > provider `default_target.transport` > `winrm` fallback. Leaving it
+  unset lets `default_target.transport` supply `ssh`/`local`; the `winrm` fallback
+  only applies when neither is set.
 - `port` (Number, Optional) — `0` ⇒ transport default (winrm-https `5986`,
   winrm-http `5985`, ssh `22`).
 - `username` (String, Optional) — Connection username.
