@@ -234,6 +234,23 @@ func (s *readDriftState) givenVerifiedDialFailure() error {
 	return nil
 }
 
+// --- scenario 3b: a mid-Read manifest-read transport failure is equally loud ----
+
+// givenVerifiedManifestReadFailure scripts the OTHER DESIGN §10.4 "Read network error"
+// path: the dial SUCCEEDS but the manifest read itself fails on the wire — readSmallFile
+// returns a transport error, NOT the exit-3 "absent" sentinel — via the fake's fail["read"]
+// toggle. engine.ReadStatus wraps that as coded("ERR_CONNECT", host, "PREFLIGHT", …), so —
+// exactly like the dial failure — Read MUST fail loudly with the stable [ERR_CONNECT] code
+// and leave prior state intact, never RemoveResource (a read that failed on the wire is not
+// an absent deployment). Covering it keeps fail["read"] live capability, not dead code.
+func (s *readDriftState) givenVerifiedManifestReadFailure() error {
+	s.specYAML = rdWinSvcSpecYAML()
+	s.fake = newRDFakeHost("lab-01")
+	s.fake.fail["read"] = true // Connect succeeds; the manifest READ is what fails on the wire
+	s.newResourceOverFake()
+	return nil
+}
+
 func (s *readDriftState) whenReadRefreshRuns() error { return s.runRead() }
 
 // --- Then steps (Read scenarios) ----------------------------------------------
@@ -323,6 +340,34 @@ func (s *readDriftState) thenReadErrorNotWarning() error {
 	if s.readResp.Diagnostics.WarningsCount() != 0 {
 		return fmt.Errorf("unreachable target must not be downgraded to a WARN, got %d warnings",
 			s.readResp.Diagnostics.WarningsCount())
+	}
+	// A bare HasError()/zero-warning check would pass for ANY error — including a
+	// mis-classified generic failure — so it can't prove the failure was actually routed
+	// through the REAL wrapTransportErr taxonomy into an ERR_CONNECT diagnostic. DESIGN
+	// §12 makes that taxonomy a stable contract pipelines grep for: Summary is exactly
+	// "[<CODE>] <short>" and the Detail pins "host=<h> step=<STEP>". Assert BOTH:
+	//   1. the Summary carries the bracketed [ERR_CONNECT] code (a regression that drops
+	//      the code fails here), and
+	//   2. the Detail still carries host=/step= — which ONLY the real engine.CodedError
+	//      path emits, so a regression that surfaces a generic error (no coded taxonomy)
+	//      is caught even though the provider's Read fallback would otherwise re-stamp the
+	//      code onto the Summary.
+	var connectDetail string
+	found := false
+	for _, e := range s.readResp.Diagnostics.Errors() {
+		if strings.Contains(e.Summary(), "[ERR_CONNECT]") {
+			found = true
+			connectDetail = e.Detail()
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("Read ERROR must carry the stable [ERR_CONNECT] taxonomy code in its Summary (DESIGN §12); got errors %v",
+			s.readResp.Diagnostics.Errors())
+	}
+	if !strings.Contains(connectDetail, "host=") || !strings.Contains(connectDetail, "step=") {
+		return fmt.Errorf("[ERR_CONNECT] Detail must pin host= and step= per DESIGN §12 (proving the real transport taxonomy, not a generic error), got %q",
+			connectDetail)
 	}
 	return nil
 }
@@ -445,5 +490,33 @@ func TestE2E_terraform_provider_surface_read_drift_reconciliation_and_destroy_mo
 	}
 	if suite.Run() != 0 {
 		t.Fatal("non-zero status returned, failed to run read-drift-reconciliation-and-destroy-modes feature tests")
+	}
+}
+
+// TestE2E_..._manifest_read_network_error_is_loud covers the SECOND DESIGN §10.4
+// loud-error path — a manifest-read transport failure AFTER a successful dial — which the
+// .feature Read scenarios (a Connect-time dial failure) do not exercise. It is driven
+// directly rather than through a godog scenario because it reuses the readDriftState
+// harness and asserts the identical loud-[ERR_CONNECT] / prior-state-intact contract, so
+// the fake transport's fail["read"] toggle is proven live capability, not dead code.
+func TestE2E_terraform_provider_surface_read_drift_manifest_read_network_error_is_loud(t *testing.T) {
+	// Specs reference password_env: LABDEPLOY_PASSWORD; set it so parse/validate succeed.
+	if err := os.Setenv("LABDEPLOY_PASSWORD", "pw"); err != nil {
+		t.Fatalf("set LABDEPLOY_PASSWORD: %v", err)
+	}
+	s := &readDriftState{}
+	if err := s.givenVerifiedManifestReadFailure(); err != nil {
+		t.Fatalf("arrange manifest-read failure: %v", err)
+	}
+	if err := s.whenReadRefreshRuns(); err != nil {
+		t.Fatalf("drive Read refresh: %v", err)
+	}
+	// Same contract as the dial-failure scenario: a loud [ERR_CONNECT] error (not a WARN)
+	// whose Detail pins host=/step=, and prior state left byte-identical (not removed).
+	if err := s.thenReadErrorNotWarning(); err != nil {
+		t.Fatalf("manifest-read failure must be a loud ERR_CONNECT error: %v", err)
+	}
+	if err := s.thenPriorStateUnchanged(); err != nil {
+		t.Fatalf("manifest-read failure must leave prior state intact: %v", err)
 	}
 }
