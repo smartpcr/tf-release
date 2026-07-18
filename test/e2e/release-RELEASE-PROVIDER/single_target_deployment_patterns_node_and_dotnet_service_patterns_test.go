@@ -98,6 +98,7 @@ type ndsWorld struct {
 	transport *scriptTransportNDS
 
 	installDeps bool
+	lockfile    string
 
 	err error
 }
@@ -178,9 +179,10 @@ func (w *ndsWorld) givenNodeInstallDeps() error {
 }
 
 func (w *ndsWorld) givenNoLockfile(name string) error {
-	// The absent lockfile is modeled by the fake transport replaying the remote
-	// guard's exit=46 result; nothing to do here beyond documenting intent.
-	_ = name
+	// Capture the lockfile the guard must name so the When/Then can assert the
+	// REAL generated install script references it (the absent file itself is
+	// modeled by the fake transport replaying the remote guard's exit=46 result).
+	w.lockfile = name
 	return nil
 }
 
@@ -190,14 +192,16 @@ func (w *ndsWorld) whenNodeInstallDeps() error {
 	w.rc.Spec.Pattern.InstallDeps = w.installDeps
 	// Drive the REAL node lifecycle the engine runs (DESIGN §9.4): Preflight
 	// gates node/npm on PATH (first Exec => exit 0), then the STAGE `npm ci`
-	// install runs. The remote `Test-Path 'package-lock.json'` guard emits the
-	// lockfile-naming error on stderr and exits 46 (ERR_SERVICE_INSTALL); the
-	// fake transport replays those two scripted results in order. failFrom folds
-	// that stderr into the returned *StepError, so the error itself names the
-	// lockfile — no need to inspect the generated script.
+	// install runs. The remote `Test-Path` guard exits 46 (ERR_SERVICE_INSTALL)
+	// when the lockfile is absent; the fake transport replays those two scripted
+	// results in order so the exit-46 => ERR_SERVICE_INSTALL mapping is exercised
+	// end to end. The scripted stderr is only a realistic remote stub — the
+	// acceptance clause "names the lockfile" is proven against the GENERATED
+	// install script (scripts[1]) in thenFailureNamesLockfile, NOT against this
+	// injected string, so a regression that dropped the guard/sentinel is caught.
 	w.transport = &scriptTransportNDS{osKind: spec.OSWindows, queue: []transport.Result{
 		{ExitCode: 0}, // Preflight: node/npm present on PATH
-		{ExitCode: pattern.ExitSvcInstall, Stderr: "package-lock.json missing (required for npm ci)"},
+		{ExitCode: pattern.ExitSvcInstall, Stderr: w.lockfile + " missing (required for npm ci)"},
 	}}
 	if err := n.Preflight(context.Background(), w.transport, w.rc); err != nil {
 		w.err = err
@@ -222,23 +226,41 @@ func (w *ndsWorld) thenFailsWithCode(code string) error {
 }
 
 // thenFailureNamesLockfile proves the acceptance clause "yields ERR_SERVICE_INSTALL
-// NAMING the lockfile" by asserting on the RETURNED error's message (which
-// failFrom builds from the remote script's stderr) — not on the generated
-// script. It also confirms both lifecycle steps (Preflight + npm ci install)
-// actually executed against the transport.
+// NAMING the lockfile" against PRODUCTION output: the REAL generated install
+// script (scripts[1], emitted by NodeWebApp.InstallDeps) must carry the
+// lockfile-naming guard and the exit-46 (ExitSvcInstall) sentinel. Asserting the
+// returned error's message would be circular — failFrom builds that message from
+// the stderr this test itself injected, so it would stay green even if the real
+// script dropped the guard or the sentinel. Inspecting the emitted script mirrors
+// the sibling unit test TestNodeInstallDepsMissingLockfile and actually catches
+// such a regression. It also confirms both lifecycle steps (Preflight + npm ci
+// install) executed against the transport.
 func (w *ndsWorld) thenFailureNamesLockfile(name string) error {
 	if w.err == nil {
 		return errors.New("expected a failure that names the lockfile, got nil error")
-	}
-	if !strings.Contains(w.err.Error(), name) {
-		return fmt.Errorf("returned error must name the lockfile %q, got: %v", name, w.err)
 	}
 	// The Preflight gate and the STAGE npm ci install must both have run (2 Execs).
 	if len(w.transport.scripts) != 2 {
 		return fmt.Errorf("expected Preflight + npm ci install to run (2 scripts), got %d", len(w.transport.scripts))
 	}
-	if !strings.Contains(w.transport.scripts[1], "npm ci --omit=dev") {
-		return fmt.Errorf("install step must run `npm ci --omit=dev`:\n%s", w.transport.scripts[1])
+	install := w.transport.scripts[1]
+	// Prove the GENERATED guard names the required lockfile — production output,
+	// not the stderr the fake transport supplied.
+	if !strings.Contains(install, name) {
+		return fmt.Errorf("generated install script must name the required lockfile %q:\n%s", name, install)
+	}
+	// Prove the missing-lockfile guard exits with the ERR_SERVICE_INSTALL sentinel
+	// (46, DESIGN §12) — the exit code the fake transport replays and thenFailsWithCode
+	// maps back to ERR_SERVICE_INSTALL.
+	if !strings.Contains(install, "exit 46") {
+		return fmt.Errorf("missing-lockfile guard must exit with the ERR_SERVICE_INSTALL sentinel (exit 46):\n%s", install)
+	}
+	// Prove the install runs `npm ci --omit=dev` in the RELEASE dir (before switch).
+	if !strings.Contains(install, "npm ci --omit=dev") {
+		return fmt.Errorf("install step must run `npm ci --omit=dev`:\n%s", install)
+	}
+	if !strings.Contains(install, w.rc.P.Release) {
+		return fmt.Errorf("npm ci must run in the release dir %q (before switch):\n%s", w.rc.P.Release, install)
 	}
 	return nil
 }
