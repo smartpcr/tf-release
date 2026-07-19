@@ -130,6 +130,18 @@ func passCases() []passCase {
 			logs.Counters{}, spec.PassCriteria{}, false, false, true},
 		{"trx all skipped vacuous pass", 0, "trx",
 			logs.Counters{Total: 5, Skipped: 5}, spec.PassCriteria{}, true, true, true},
+		// junit is a first-class results.format alongside trx (DESIGN §5.3, §7);
+		// computePassRate/evaluatePass gate the rate check on trx||junit, so the
+		// junit result-parsing path is exercised here too: a failing-rate case
+		// (covers the evaluatePass `|| format == "junit"` branch) and passing-rate
+		// cases (cover the computePassRate junit branch and the (total-skipped)
+		// denominator), mirroring the trx rows above with format swapped.
+		{"junit rate enforced", 0, "junit",
+			logs.Counters{Total: 4, Passed: 3, Failed: 1}, spec.PassCriteria{MinPassRate: ptrF64(0.8)}, false, true, false},
+		{"junit boundary rate passes", 0, "junit",
+			logs.Counters{Total: 4, Passed: 3, Failed: 1}, spec.PassCriteria{MinPassRate: ptrF64(0.75)}, true, true, true},
+		{"junit skipped excluded from denom", 0, "junit",
+			logs.Counters{Total: 4, Passed: 3, Skipped: 1}, spec.PassCriteria{MinPassRate: ptrF64(1.0)}, true, true, true},
 		{"none exit ok", 0, "none",
 			engine.NoResultCounters(), spec.PassCriteria{}, true, true, true},
 		{"none bad exit", 2, "none",
