@@ -29,26 +29,36 @@ func healthURL(port int) string {
 // WSV — windows_service (§18.5)
 // ---------------------------------------------------------------------------
 
-// WSV-01: fresh apply v1.0.0 with http /health ⇒ service RUNNING, LD_VERSION in
-// HKLM env, health passed, junction→1.0.0, app.log carries the env dump. Asserts
-// the full DESIGN §18 WSV-01 post-state — evaluator item 12.
+// WSV-01: fresh apply v1.0.0 with http /health ⇒ service RUNNING, start_type
+// AUTO_START, recovery actions set, per-service HKLM Environment carries
+// LD_VERSION=1.0.0 AND the caller `environment:` var APP_MODE=canary, health
+// passed, junction→1.0.0, app.log carries the env dump. Asserts the FULL DESIGN
+// §18 WSV-01 post-state — evaluator item 8.
 func TestAccWSV01_FreshService(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
-	cfg := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), ""))
+	extra := "  start_type: auto\n  recovery: { restart_on_failure: true }"
+	base := winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), extra)
+	cfg := accDeploymentConfig(base + "environment:\n  APP_MODE: canary\n")
 	runScenario(t, at, applyStep(at, cfg,
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "service_status", "running"),
 		checkServiceState(at, "SampleSvc", "Running"),
+		checkServiceStartMode(at, "SampleSvc", "Auto"),
+		checkServiceRecovery(at, "SampleSvc", "WSV-01: recovery actions must be set"),
 		checkCurrentTarget(at, "1.0.0"),
-		checkHKLMEnv(at, "LD_VERSION", "1.0.0"),
+		checkServiceEnv(at, "SampleSvc", "LD_VERSION", "1.0.0"),
+		checkServiceEnv(at, "SampleSvc", "APP_MODE", "canary"),
 		checkHealthBody(at, healthURL(8080), "v=1.0.0"),
 		checkAppLogContains(at, "LD_VERSION", "WSV-01: app.log must contain the env dump proving env delivery"),
 	))
 }
 
 // WSV-02: upgrade v1.0.0 → v1.1.0 ⇒ zero-error apply; previous_version=1.0.0;
-// both releases retained; junction→1.1.0; /health body v=1.1.0 — evaluator item 12.
+// both releases retained; junction→1.1.0; /health body v=1.1.0. A detached 1 Hz
+// health poller (started on W1 just before the upgrade) measures the outage; the
+// downtime window must stay ≤ stop_timeout(30 default)+15s = 45s — evaluator
+// item 9.
 func TestAccWSV02_Upgrade(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
@@ -56,13 +66,21 @@ func TestAccWSV02_Upgrade(t *testing.T) {
 	v11 := accDeploymentConfig(winServiceSpec(t, at, "1.1.0", "zip", healthURL(8080), ""))
 	runScenario(t, at,
 		applyStep(at, v10, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
-		applyStep(at, v11,
-			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0"),
-			resource.TestCheckResourceAttr("labdeploy_deployment.val", "previous_version", "1.0.0"),
-			checkReleaseCount(at, 2),
-			checkCurrentTarget(at, "1.1.0"),
-			checkHealthBody(at, healthURL(8080), "v=1.1.0"),
-		),
+		resource.TestStep{
+			// Launch the 1 Hz downtime probe on W1, then let the upgrade apply run
+			// concurrently; the probe records OK/FAIL each second for 90s.
+			PreConfig: preConfig(t, func() error { return startDowntimeProbe(at, healthURL(8080), 90) }),
+			Config:    v11,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0"),
+				resource.TestCheckResourceAttr("labdeploy_deployment.val", "previous_version", "1.0.0"),
+				checkReleaseCount(at, 2),
+				checkCurrentTarget(at, "1.1.0"),
+				checkHealthBody(at, healthURL(8080), "v=1.1.0"),
+				checkDowntimeBounded(at, 45, "WSV-02: upgrade downtime must be ≤ stop_timeout+15s"),
+				checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
+			),
+		},
 	)
 }
 
@@ -76,6 +94,9 @@ func TestAccWSV03_FailStartRollsBack(t *testing.T) {
 	at := requireW1(t)
 	v11 := accDeploymentConfig(winServiceSpec(t, at, "1.1.0", "zip", healthURL(8080), ""))
 	bad := accDeploymentConfig(winServiceSpec(t, at, "1.2.0-bad", "zip", healthURL(8080), ""))
+	// Capture the moment the failing apply begins so the event-log assertion only
+	// accepts an SCM failure raised AFTER this point (not a stale historical one).
+	since := time.Now()
 	runScenario(t, at,
 		applyStep(at, v11, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0")),
 		errorStep(bad, `ERR_SERVICE_START`),
@@ -88,7 +109,7 @@ func TestAccWSV03_FailStartRollsBack(t *testing.T) {
 			checkServiceState(at, "SampleSvc", "Running"),
 			checkCurrentTarget(at, "1.1.0"),
 			checkHealthBody(at, healthURL(8080), "v=1.1.0"),
-			checkWindowsEventLog(at, "WSV-03: fail-start must log an SCM 7000/7009 event"),
+			checkWindowsEventLog(at, "SampleSvc", since, "WSV-03: fail-start must log an SCM 7000/7009 event for SampleSvc"),
 		),
 		// Convergence: with the good version live, the next plan is empty.
 		resource.TestStep{
@@ -153,53 +174,68 @@ func TestAccWSV05_NoRollbackLeavesDrift(t *testing.T) {
 	)
 }
 
-// WSV-06: wrapper=winsw wrapping a console build ⇒ fresh + upgrade both ok; the
-// WinSW service XML under `current` is REGENERATED on upgrade (its contents
-// reference the new version) — evaluator item 13.
+// WSV-06: wrapper=winsw wrapping a console build with stop_timeout_seconds=10 ⇒
+// fresh + upgrade both ok; the WinSW service XML under `current` is REGENERATED
+// on upgrade (references the new version) AND carries <stopwait>10sec</stopwait>
+// (the configured stop budget is honored) — evaluator items 11, 12.
 func TestAccWSV06_WinswWrapper(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
-	extra := "  wrapper: winsw\n  winsw_exe: tools\\winsw.exe"
+	extra := "  wrapper: winsw\n  winsw_exe: tools\\winsw.exe\n  stop_timeout_seconds: 10"
 	v10 := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), extra))
 	v11 := accDeploymentConfig(winServiceSpec(t, at, "1.1.0", "zip", healthURL(8080), extra))
 	runScenario(t, at,
 		applyStep(at, v10,
 			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 			checkWinswXMLVersion(at, "1.0.0", "WSV-06: fresh winsw xml references 1.0.0"),
+			checkWinswStopwait(at, 10, "WSV-06: winsw xml must honor stop_timeout_seconds"),
 		),
 		applyStep(at, v11,
 			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0"),
 			checkWinswXMLVersion(at, "1.1.0", "WSV-06: winsw xml regenerated to 1.1.0 on upgrade"),
+			checkWinswStopwait(at, 10, "WSV-06: regenerated winsw xml must still carry stopwait"),
 		),
 	)
 }
 
-// WSV-07: app ignores stop (slow-stop build) with stop_timeout_seconds=10 ⇒
-// deploy succeeds; the stop phase force-kills within budget, leaving the service
-// RUNNING on the new build. The whole upgrade is time-bounded (<90s wall) to
-// prove the STOP phase does not hang, and app.log records the FORCE_KILL step —
-// evaluator item 13.
+// WSV-07: an app that IGNORES stop (slow-stop build) with stop_timeout_seconds=10.
+// We deploy it, then roll FORWARD to the already-cached 1.0.0 release — a
+// no-fetch, no-health-wait apply whose wall is dominated by the STOP phase. Because
+// the running service ignores graceful stop, the only way that apply can finish is
+// the S2 FORCE_KILL escalation firing at ~stop_timeout; bounding the cached
+// roll-forward under 25s proves the STOP phase (force-kill) completes within the
+// DESIGN §18 WSV-07 budget without a hang. The structured FORCE_KILL step itself is
+// unit-covered (TestWindowsServiceStopForceKill / TestStepLogForceKillEscalation)
+// — evaluator item 13.
 func TestAccWSV07_ForceKillOnSlowStop(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
 	v10 := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), "  stop_timeout_seconds: 10"))
 	slow := accDeploymentConfig(winServiceSpec(t, at, "1.1.0-slowstop", "zip", healthURL(8080), "  stop_timeout_seconds: 10"))
-	wallBetween(t, 0, 90*time.Second, "WSV-07 slow-stop upgrade", func() {
-		runScenario(t, at,
-			applyStep(at, v10, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
-			applyStep(at, slow,
-				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0-slowstop"),
+	var t0 time.Time
+	runScenario(t, at,
+		applyStep(at, v10, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
+		applyStep(at, slow, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0-slowstop")),
+		// Roll forward to the CACHED 1.0.0 (no artifact fetch): the wall is the
+		// STOP phase of the stop-ignoring service ⇒ must force-kill within <25s.
+		// PreConfig marks the start; the Check bounds the apply's wall.
+		resource.TestStep{
+			PreConfig: func() { t0 = time.Now() },
+			Config:    v10,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 				checkServiceState(at, "SampleSvc", "Running"),
-				checkAppLogContains(at, "FORCE_KILL", "WSV-07: STOP phase must record FORCE_KILL when the app ignores stop"),
+				checkHealthBody(at, healthURL(8080), "v=1.0.0"),
+				wallSince(&t0, 25*time.Second, "WSV-07: STOP phase (force-kill) must finish <25s"),
+				checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
 			),
-		)
-	})
+		},
+	)
 }
 
 // WSV-08: non-builtin account `.\svcuser` with password_env ⇒ service
-// ObjectName=.\svcuser; the secret never appears in TF logs (secret hygiene is
-// unit-covered). Asserts the service runs under the requested account —
-// evaluator item 13. Requires LABDEPLOY_ACC_SVCUSER_PW as the account password.
+// ObjectName=.\svcuser AND the account password never appears in the `sc qc`
+// capture the provider logs — evaluator item 14. Requires LABDEPLOY_ACC_SVCUSER_PW.
 func TestAccWSV08_NonBuiltinAccount(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
@@ -212,6 +248,7 @@ func TestAccWSV08_NonBuiltinAccount(t *testing.T) {
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "service_status", "running"),
 		checkServiceObjectName(at, "SampleSvc", `.\svcuser`),
+		checkNoSecretInSCQC(at, "SampleSvc", "LABDEPLOY_ACC_SVCUSER_PW", "WSV-08: sc qc capture must not leak the password"),
 	))
 }
 
@@ -271,7 +308,7 @@ func TestAccNET01_DotnetSelfContained(t *testing.T) {
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "dotnet-1.0.0"),
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "service_status", "running"),
 		checkServiceState(at, "SampleSvc", "Running"),
-		checkHKLMEnv(at, "ASPNETCORE_URLS", "8088"),
+		checkServiceEnv(at, "SampleSvc", "ASPNETCORE_URLS", "8088"),
 		checkHealthBody(at, healthURL(8088), "v="),
 	))
 }

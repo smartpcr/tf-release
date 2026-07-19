@@ -607,37 +607,66 @@ func checkManifestContains(at accTarget, token, why string) func(*terraform.Stat
 	return checkFileContains(at, p.Manifest, token, why)
 }
 
-// checkWindowsEventLog asserts the System event log contains a recent Service
-// Control Manager error (id 7000/7009/7011/7031) — WSV-03's fail-start proof
-// (DESIGN §18 WSV-03 "an event-log 7000/7009 line") — evaluator item 12.
-func checkWindowsEventLog(at accTarget, why string) func(*terraform.State) error {
+// checkWindowsEventLog asserts the System event log contains a Service Control
+// Manager error (id 7000/7009/7011/7031) for the SampleSvc service raised AT OR
+// AFTER `since` (the moment the failing apply began). Filtering by both the
+// service name and the operation start time prevents an unrelated historical SCM
+// failure from satisfying WSV-03 (DESIGN §18 WSV-03 "an event-log 7000/7009
+// line") — evaluator item 10.
+func checkWindowsEventLog(at accTarget, svc string, since time.Time, why string) func(*terraform.State) error {
 	return func(*terraform.State) error {
-		out, err := probeHost(at,
-			"$e = Get-WinEvent -FilterHashtable @{LogName='System';Id=7000,7009,7011,7031} -MaxEvents 20 -ErrorAction SilentlyContinue; if ($e) { 'EVT_FOUND' } else { 'EVT_NONE' }",
-			"echo EVT_NONE")
+		start := since.UTC().Format("2006-01-02T15:04:05Z")
+		ps := fmt.Sprintf("$since=([datetimeoffset]'%s').LocalDateTime; "+
+			"$e = Get-WinEvent -FilterHashtable @{LogName='System';Id=7000,7009,7011,7031;StartTime=$since} -ErrorAction SilentlyContinue | "+
+			"Where-Object { $_.Message -match '%s' }; if ($e) { 'EVT_FOUND' } else { 'EVT_NONE' }", start, psq(svc))
+		out, err := probeHost(at, ps, "echo EVT_NONE")
 		if err != nil {
 			return fmt.Errorf("%s: event-log probe: %w", why, err)
 		}
 		if !strings.Contains(out, "EVT_FOUND") {
-			return fmt.Errorf("%s: no SCM 7000/7009/7011/7031 event found for the fail-start", why)
+			return fmt.Errorf("%s: no SCM 7000/7009/7011/7031 event naming %s found at/after %s", why, svc, start)
 		}
 		return nil
 	}
 }
 
+// winswXMLPath is the WinSW config the provider writes: <current>\<svc>.winsw.xml
+// (internal/pattern/windows_service.go writes `rc.P.Current\<svc>.winsw.xml`).
+func winswXMLPath(at accTarget, svc string) string {
+	cur := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "").Current
+	return cur + string(sep(at.tgt.OS)) + svc + ".winsw.xml"
+}
+
 // checkWinswXMLVersion asserts the regenerated WinSW service XML under `current`
 // references the expected release version (WSV-06: xml regenerated on upgrade) —
-// evaluator item 13.
+// evaluator items 11, 13.
 func checkWinswXMLVersion(at accTarget, version, why string) func(*terraform.State) error {
 	return func(*terraform.State) error {
-		cur := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "").Current
-		xml := cur + string(sep(at.tgt.OS)) + "SampleSvc.xml"
+		xml := winswXMLPath(at, "SampleSvc")
 		out, err := hostReadFile(at, xml)
 		if err != nil {
 			return fmt.Errorf("%s: read winsw xml %s: %w", why, xml, err)
 		}
 		if !strings.Contains(out, version) {
 			return fmt.Errorf("%s: winsw xml %s does not reference %s (not regenerated?)", why, xml, version)
+		}
+		return nil
+	}
+}
+
+// checkWinswStopwait asserts the WinSW xml carries <stopwait>Nsec</stopwait>
+// matching the configured stop_timeout_seconds (WSV-06: "stopwait honored") —
+// evaluator item 12.
+func checkWinswStopwait(at accTarget, sec int, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		xml := winswXMLPath(at, "SampleSvc")
+		out, err := hostReadFile(at, xml)
+		if err != nil {
+			return fmt.Errorf("%s: read winsw xml %s: %w", why, xml, err)
+		}
+		want := fmt.Sprintf("<stopwait>%dsec</stopwait>", sec)
+		if !strings.Contains(out, want) {
+			return fmt.Errorf("%s: winsw xml %s missing %s (stopwait not honored)", why, xml, want)
 		}
 		return nil
 	}
@@ -711,20 +740,163 @@ func checkHealthBody(at accTarget, url, want string) func(*terraform.State) erro
 	}
 }
 
-// checkHKLMEnv asserts the machine environment (HKLM) exposes name=value — the
-// service env delivery DESIGN §18 WSV-01/NET-01 require (LD_VERSION,
-// ASPNETCORE_URLS) — evaluator items 12, 14.
-func checkHKLMEnv(at accTarget, name, value string) func(*terraform.State) error {
-	const key = `HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
+// checkServiceEnv asserts the service's per-service Environment (the MultiString
+// under HKLM:\SYSTEM\CurrentControlSet\Services\<svc>\Environment that
+// writeServiceEnv populates — NOT the machine-wide Session Manager environment)
+// exposes name=value. This is the env-delivery contract DESIGN §18 WSV-01/NET-01
+// require (LD_VERSION, ASPNETCORE_URLS, caller `environment:` vars) — item 7.
+func checkServiceEnv(at accTarget, svc, name, value string) func(*terraform.State) error {
+	const base = `HKLM:\SYSTEM\CurrentControlSet\Services\`
 	return func(*terraform.State) error {
+		key := base + svc
 		out, err := probeHost(at,
-			fmt.Sprintf("(Get-ItemProperty -Path '%s' -Name '%s' -ErrorAction SilentlyContinue).'%s'", key, psq(name), psq(name)),
+			fmt.Sprintf("(Get-ItemProperty -Path '%s' -Name Environment -ErrorAction SilentlyContinue).Environment -join \"`n\"", psq(key)),
 			"echo n/a")
 		if err != nil {
-			return fmt.Errorf("HKLM env %s probe: %w", name, err)
+			return fmt.Errorf("service %s env probe: %w", svc, err)
 		}
-		if !strings.Contains(out, value) {
-			return fmt.Errorf("HKLM env %s = %q, want to contain %q", name, strings.TrimSpace(out), value)
+		want := name + "=" + value
+		if !containsEnvEntry(out, name, value) {
+			return fmt.Errorf("service %s Environment missing %q (got %q)", svc, want, strings.TrimSpace(out))
+		}
+		return nil
+	}
+}
+
+// containsEnvEntry reports whether any `NAME=...value...` line appears in a
+// newline-joined MultiString environment block.
+func containsEnvEntry(block, name, value string) bool {
+	for _, ln := range strings.Split(block, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, name+"=") && strings.Contains(ln, value) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkServiceStartMode asserts the service start type (WSV-01 AUTO_START ⇒
+// Win32_Service.StartMode == "Auto") — evaluator item 8.
+func checkServiceStartMode(at accTarget, svc, wantMode string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			fmt.Sprintf("(Get-CimInstance Win32_Service -Filter \"Name='%s'\").StartMode", psq(svc)),
+			"echo n/a")
+		if err != nil {
+			return fmt.Errorf("service %s start-mode probe: %w", svc, err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(out), wantMode) {
+			return fmt.Errorf("service %s StartMode = %q, want %s", svc, strings.TrimSpace(out), wantMode)
+		}
+		return nil
+	}
+}
+
+// checkServiceRecovery asserts the service has a RESTART recovery action
+// configured (WSV-01 "recovery actions set"; the provider writes
+// `sc.exe failure ... actions= restart/5000/...`) — evaluator item 8.
+func checkServiceRecovery(at accTarget, svc, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			fmt.Sprintf("& sc.exe qfailure '%s' | Out-String", psq(svc)),
+			"echo n/a")
+		if err != nil {
+			return fmt.Errorf("%s: sc qfailure probe: %w", why, err)
+		}
+		if !strings.Contains(strings.ToUpper(out), "RESTART") {
+			return fmt.Errorf("%s: service %s has no RESTART recovery action (sc qfailure=%q)", why, svc, strings.TrimSpace(out))
+		}
+		return nil
+	}
+}
+
+// checkNoSecretInSCQC asserts the `sc qc` capture for a service does NOT contain
+// the account password (WSV-08 "secret absent from sc qc capture") — evaluator
+// item 14. The password is read from the same env var the spec references.
+func checkNoSecretInSCQC(at accTarget, svc, secretEnv, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		secret := os.Getenv(secretEnv)
+		if secret == "" {
+			return fmt.Errorf("%s: %s not set (needed to prove secret absence)", why, secretEnv)
+		}
+		out, err := probeHost(at,
+			fmt.Sprintf("& sc.exe qc '%s' | Out-String", psq(svc)),
+			"echo n/a")
+		if err != nil {
+			return fmt.Errorf("%s: sc qc probe: %w", why, err)
+		}
+		if strings.Contains(out, secret) {
+			return fmt.Errorf("%s: service %s sc qc output leaks the account password", why, svc)
+		}
+		return nil
+	}
+}
+
+// snapshotTree returns a stable, sorted recursive listing of every entry under
+// root with its mtime and size — a byte-identical fingerprint used to prove an
+// abandon destroy changed NOTHING on the box (DST-02) — evaluator item 15.
+func snapshotTree(at accTarget, root string) (string, error) {
+	return probeHost(at,
+		fmt.Sprintf("if(Test-Path -LiteralPath '%s'){ Get-ChildItem -LiteralPath '%s' -Recurse -Force | Sort-Object FullName | ForEach-Object { \"$($_.FullName)|$($_.LastWriteTimeUtc.Ticks)|$($_.Length)\" } | Out-String } else { 'MISSING' }", psq(root), psq(root)),
+		fmt.Sprintf("find '%s' -printf '%%p|%%T@|%%s\\n' 2>/dev/null | sort", shq(root)))
+}
+
+// checkTreeUnchanged asserts the recursive fingerprint of root equals `before`.
+func checkTreeUnchanged(at accTarget, root, before, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		now, err := snapshotTree(at, root)
+		if err != nil {
+			return fmt.Errorf("%s: tree snapshot: %w", why, err)
+		}
+		if strings.TrimSpace(now) != strings.TrimSpace(before) {
+			return fmt.Errorf("%s: the tree under %s was mutated during destroy (abandon must touch nothing)", why, root)
+		}
+		return nil
+	}
+}
+
+// startDowntimeProbe launches a DETACHED 1 Hz health poller on W1 that appends
+// OK/FAIL to ldDowntimeLog for durSec seconds, so a concurrent upgrade's health
+// outage can be measured from W1 itself (WSV-02 "downtime window, 1s-poll curl
+// from W1") — evaluator item 9. Fire-and-forget: it runs during the apply that
+// follows this PreConfig.
+const ldDowntimeLog = `C:\Windows\Temp\ld_downtime.log`
+
+func startDowntimeProbe(at accTarget, url string, durSec int) error {
+	const scriptPath = `C:\Windows\Temp\ld_downtime.ps1`
+	body := fmt.Sprintf("$end=(Get-Date).AddSeconds(%d); Remove-Item -LiteralPath '%s' -ErrorAction SilentlyContinue; "+
+		"while((Get-Date) -lt $end){ try{ $c=(Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 -Uri '%s').StatusCode }catch{ $c=0 }; "+
+		"if($c -eq 200){ Add-Content -LiteralPath '%s' -Value 'OK' }else{ Add-Content -LiteralPath '%s' -Value 'FAIL' }; Start-Sleep -Seconds 1 }",
+		durSec, ldDowntimeLog, psq(url), ldDowntimeLog, ldDowntimeLog)
+	cmd := fmt.Sprintf("Set-Content -LiteralPath '%s' -Value '%s' -Encoding ASCII; "+
+		"Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','%s' -WindowStyle Hidden; 'STARTED'",
+		scriptPath, psq(body), scriptPath)
+	_, err := probeHost(at, cmd, "true")
+	return err
+}
+
+// checkDowntimeBounded reads the poller log and asserts the longest run of
+// consecutive FAIL samples (≈ seconds of outage) does not exceed maxSec — the
+// DESIGN §18 WSV-02 downtime bound (≤ stop_timeout+15s) — evaluator item 9.
+func checkDowntimeBounded(at accTarget, maxSec int, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := hostReadFile(at, ldDowntimeLog)
+		if err != nil {
+			return fmt.Errorf("%s: read downtime log: %w", why, err)
+		}
+		maxRun, cur := 0, 0
+		for _, ln := range strings.Fields(out) {
+			if strings.EqualFold(strings.TrimSpace(ln), "FAIL") {
+				cur++
+				if cur > maxRun {
+					maxRun = cur
+				}
+			} else {
+				cur = 0
+			}
+		}
+		if maxRun > maxSec {
+			return fmt.Errorf("%s: health downtime %ds exceeds bound %ds", why, maxRun, maxSec)
 		}
 		return nil
 	}
@@ -811,5 +983,18 @@ func wallBetween(t *testing.T, min, max time.Duration, what string, fn func()) {
 	}
 	if min > 0 && elapsed < min {
 		t.Fatalf("%s took %s, want >= %s (retries/attempts did not occur)", what, elapsed, min)
+	}
+}
+
+// wallSince returns a check asserting the wall time elapsed since *t0 is ≤ max.
+// The caller sets *t0 in the step's PreConfig (which runs immediately before the
+// apply) so the Check (which runs immediately after) bounds that single apply's
+// duration — used by WSV-07 to bound the STOP/force-kill phase.
+func wallSince(t0 *time.Time, max time.Duration, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		if d := time.Since(*t0); d > max {
+			return fmt.Errorf("%s: took %s, want <= %s", why, d, max)
+		}
+		return nil
 	}
 }

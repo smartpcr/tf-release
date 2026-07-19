@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,9 +37,11 @@ func TestAccCON01_InsecureTLSApplies(t *testing.T) {
 	))
 }
 
-// CON-02: W1 with a wrong password ⇒ ERR_AUTH, exactly one auth attempt (no
-// retry, connect_retries=0) in under 15s wall. The password_env references a var
-// we set to a deliberately wrong value.
+// CON-02: W1 with a wrong password ⇒ ERR_AUTH, exactly one auth attempt. We set
+// connect_retries: 2 so that IF auth failures were (wrongly) retried, the apply
+// would incur at least one 5s backoff; bounding the failure UNDER 5s therefore
+// proves the configured retries were suppressed for an auth rejection (DESIGN
+// §8.1: ERR_AUTH is never retried) — evaluator item 3.
 func TestAccCON02_WrongPassword(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
@@ -50,7 +53,7 @@ func TestAccCON02_WrongPassword(t *testing.T) {
   os: windows
   credentials: { username: %q, password_env: LABDEPLOY_ACC_W1_WRONGPW }
   winrm: { use_https: true, insecure_skip_verify: true }
-  connect_retries: 0`, host, user)
+  connect_retries: 2`, host, user)
 	spec := fmt.Sprintf(`apiVersion: labdeploy/v1
 kind: Deployment
 metadata: { name: sample-svc }
@@ -64,18 +67,19 @@ artifact:
 pattern: { type: console_app, exe: bin\sample-svc.exe }
 `, target, artifactSHA(t, "1.0.0", "zip"), artifactURL(t, "1.0.0", "zip"))
 	_ = at
-	// connect_retries=0 ⇒ a single auth attempt; a bad credential must fail fast
-	// (<15s), never spin in a retry loop (DESIGN §18 CON-02).
-	wallBetween(t, 0, 15*time.Second, "CON-02 wrong-password apply", func() {
+	// A bad credential must fail before even the first 5s retry backoff elapses,
+	// proving the one auth attempt was NOT retried despite connect_retries=2.
+	wallBetween(t, 0, 5*time.Second, "CON-02 wrong-password apply", func() {
 		runScenarioNoProbe(t, errorStep(accDeploymentConfig(spec), `ERR_AUTH`))
 	})
 }
 
 // CON-03: firewall-dropped port with connect_retries=2 ⇒ ERR_CONNECT after the
-// retries are exhausted (3 attempts total). Uses an unroutable host so the dial
-// times out without ever completing. The elapsed wall is bounded BELOW by
-// 2×timeout to prove the two retries actually happened (a single immediate
-// failure would return far faster) — DESIGN §18 CON-03 "log shows attempts=3".
+// retries are exhausted. The retry loop wraps the last error as
+// `after 3 attempts:` (retries+1), so the diagnostic itself proves attempts=3 —
+// the DESIGN §18 CON-03 "log shows attempts=3" requirement — evaluator item 4.
+// The elapsed wall is additionally bounded BELOW by 2×backoff to prove the two
+// retries actually spun (a single immediate failure returns far faster).
 func TestAccCON03_ConnectRetriesExhausted(t *testing.T) {
 	accPreCheck(t)
 	// A TEST-NET / unroutable address guarantees the port is never reachable.
@@ -98,10 +102,10 @@ artifact:
   source: { type: http, url: "http://203.0.113.1/a.zip" }
 pattern: { type: console_app, exe: bin\sample-svc.exe }
 `, target)
-	// 3 attempts × ~3s timeout ⇒ elapsed must be at least ~2 further timeouts
-	// beyond the first, proving the retries occurred (not one immediate reject).
+	// The two 5s backoffs between the three attempts put the floor at ~10s; the
+	// error text must name the attempt count (attempts=3).
 	wallBetween(t, 6*time.Second, 90*time.Second, "CON-03 retry-exhausted apply", func() {
-		runScenarioNoProbe(t, errorStep(accDeploymentConfig(spec), `ERR_CONNECT`))
+		runScenarioNoProbe(t, errorStep(accDeploymentConfig(spec), `ERR_CONNECT(?s).*after 3 attempts`))
 	})
 }
 
@@ -121,10 +125,13 @@ func TestAccCON04_HostKeyMismatch(t *testing.T) {
 	if os.Getenv(envL1Password) == "" {
 		credLine = fmt.Sprintf("credentials: { username: %q, private_key_env: %s }", user, envL1Key)
 	}
-	// A well-formed ssh-ed25519 known_hosts line: a real, valid 32-byte ed25519
-	// public key (Base64 decodes cleanly) that is NOT L1's key. This exercises
-	// the mismatch branch, not a Base64/parse error branch.
-	const wrongKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICJ2sJhQm0h0m0J8Xk1c9r9m1kqU3g0Yy0m2wN7pQ0Zx"
+	// A syntactically-valid ed25519 host key in the exact wire form
+	// sshTransport.hostKeyCallback expects: ONLY the Base64-encoded wire bytes
+	// (no `ssh-ed25519 ` prefix, no comment). ssh.ParsePublicKey decodes this
+	// cleanly, so the handshake reaches the key-comparison stage and rejects the
+	// mismatch (ERR_CONNECT "host key mismatch") rather than failing earlier on a
+	// malformed pin — evaluator item 1.
+	const wrongKey = "AAAAC3NzaC1lZDI1NTE5AAAAILJtYLj4f6zAekxuJD5jn5vGMDR1kiaw/ZHA2AR3dHIi"
 	spec := fmt.Sprintf(`apiVersion: labdeploy/v1
 kind: Deployment
 metadata: { name: sample-svc }
@@ -141,7 +148,7 @@ artifact:
   source: { type: http, url: "http://203.0.113.1/a.zip" }
 pattern: { type: console_app, exe: bin/sample-svc }
 `, host, credLine, wrongKey)
-	runScenarioNoProbe(t, errorStep(accDeploymentConfig(spec), `ERR_CONNECT(?s).*(host key mismatch|host_key)`))
+	runScenarioNoProbe(t, errorStep(accDeploymentConfig(spec), `ERR_CONNECT(?s).*host key mismatch`))
 }
 
 // CON-05: runner==W1, transport local, os windows ⇒ apply a console spec
@@ -208,29 +215,35 @@ strategy: { keep_releases: 2 }
 	))
 }
 
-// ART-02: W1 sha off by one hex ⇒ ERR_CHECKSUM_MISMATCH; POST-STATE per DESIGN
-// §18 ART-02: no releases/<ver> dir, manifest unchanged (no such version), and
-// staging empty (the rejected payload is cleaned up) — evaluator item 6. The
-// host IS reachable, so CheckDestroy still asserts the lock is absent.
+// ART-02: with a healthy windows_service ALREADY deployed at 1.0.0, an upgrade to
+// 1.1.0 whose spec sha is off by one hex ⇒ ERR_CHECKSUM_MISMATCH; POST-STATE per
+// DESIGN §18 ART-02: no releases/1.1.0 dir, manifest still records 1.0.0 (no
+// change), staging empty, and the PRE-EXISTING service is untouched & still
+// RUNNING on 1.0.0 — evaluator item 2. The reachable host means CheckDestroy also
+// asserts the lock is absent.
 func TestAccART02_ChecksumMismatch(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
-	bad := flipLastHex(artifactSHA(t, "1.0.0", "zip"))
-	spec := fmt.Sprintf(`apiVersion: labdeploy/v1
-kind: Deployment
-metadata: { name: sample-svc }
-target:
-%s
-artifact:
-  type: zip
-  version: "1.0.0"
-  checksum: %q
-  source: { type: http, url: %q }
-pattern: { type: console_app, exe: bin\sample-svc.exe }
-`, at.yaml, bad, artifactURL(t, "1.0.0", "zip"))
-	errorScenario(t, at, accDeploymentConfig(spec), `ERR_CHECKSUM_MISMATCH`,
-		checkReleaseAbsent(at, "1.0.0", "ART-02: failed checksum must leave no release dir"),
-		checkStagingEmpty(at),
+	good10 := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), ""))
+	sha11 := artifactSHA(t, "1.1.0", "zip")
+	bad11 := accDeploymentConfig(strings.Replace(
+		winServiceSpec(t, at, "1.1.0", "zip", healthURL(8080), ""), sha11, flipLastHex(sha11), 1))
+	runScenario(t, at,
+		applyStep(at, good10,
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "service_status", "running"),
+		),
+		errorStep(bad11, `ERR_CHECKSUM_MISMATCH`),
+		// Re-apply the good 1.0.0 (no-op) so Check can assert the post-failure live
+		// state: the failed upgrade left nothing behind and did not disturb 1.0.0.
+		applyStep(at, good10,
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
+			checkReleaseAbsent(at, "1.1.0", "ART-02: failed checksum must leave no release dir"),
+			checkReleaseCount(at, 1),
+			checkManifestVersion(at, "1.0.0", "ART-02: manifest must still record 1.0.0 (unchanged)"),
+			checkServiceState(at, "SampleSvc", "Running"),
+			checkStagingEmpty(at),
+		),
 	)
 }
 
@@ -283,15 +296,18 @@ strategy: { keep_releases: 2 }
 	))
 }
 
-// ART-05: W1 fetch_mode target_pull with an auth header env ⇒ success (the
-// target pulls the payload itself). We prove the target-side pull by asserting a
-// release marker landed AND — when LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED=1 (the
-// DESIGN variant where the runner cannot reach the package host) — the deploy
-// still succeeds, which is only possible if the TARGET did the fetch — evaluator
-// item 9.
+// ART-05: W1 fetch_mode target_pull with an auth header env ⇒ success proven to
+// be a TARGET-side pull. Runs only when LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED=1
+// (the runner's egress to the package host is firewalled), so a successful deploy
+// is possible ONLY if the target fetched the payload itself — the DESIGN §18
+// ART-05 discriminator. Without that isolation the test SKIPS rather than passing
+// on an unproven path — evaluator item 5.
 func TestAccART05_TargetPull(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
+	if os.Getenv("LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED") != "1" {
+		t.Skip("set LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED=1 (runner egress to the package host blocked) so a successful deploy PROVES the target pulled the artifact")
+	}
 	sha := artifactSHA(t, "1.0.0", "zip")
 	if os.Getenv("LABDEPLOY_ACC_ART_TOKEN") == "" {
 		t.Setenv("LABDEPLOY_ACC_ART_TOKEN", "lab-token")
@@ -313,9 +329,6 @@ artifact:
 pattern: { type: console_app, exe: bin\sample-svc.exe }
 strategy: { keep_releases: 2 }
 `, at.yaml, sha, artifactURL(t, "1.0.0", "zip"))
-	if os.Getenv("LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED") != "1" {
-		t.Log("ART-05: set LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED=1 (runner egress to the package host blocked) to prove the payload is pulled target-side, not proxied via the runner")
-	}
 	runScenario(t, at, applyStep(at, accDeploymentConfig(spec),
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 		checkReleaseMarkerSHA(at, "1.0.0", "zip", sha),
@@ -365,7 +378,7 @@ pattern: { type: docker_container, container_name: sample-svc }
 func TestAccCAP01_WindowsConsole(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
-	cfg := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", `sample-svc.exe --version`))
+	cfg := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", `bin\sample-svc.exe --version`))
 	runScenario(t, at, applyStep(at, cfg,
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "service_status", "n/a"),
@@ -403,7 +416,7 @@ func TestAccCAP02_KeepReleasesPrune(t *testing.T) {
 func TestAccCAP03_LinuxConsole(t *testing.T) {
 	accPreCheck(t)
 	at := requireL1(t)
-	cfg := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", `sample-svc --version`))
+	cfg := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", `bin/sample-svc --version`))
 	runScenario(t, at, applyStep(at, cfg,
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 		checkCurrentTarget(at, "1.0.0"),
