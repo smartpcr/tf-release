@@ -55,9 +55,11 @@ Each zip contains the versioned binary (`terraform-provider-labdeploy_v<version>
 on linux, `terraform-provider-labdeploy_v<version>.exe` on windows) alongside
 `README.md`. A separate `terraform-provider-labdeploy_v<version>_SHA256SUMS`
 checksum file is published as its own release artifact (not bundled inside the
-zips). Reproduce the archive matrix locally with
-`goreleaser release --snapshot --clean --skip=publish` (the plain
-`goreleaser build` subcommand compiles binaries but does not produce the zips).
+zips). Reproduce the full archive matrix locally with either
+`goreleaser release --snapshot --clean --skip=publish` (zips + checksums in
+`dist/`) or `goreleaser build --snapshot --clean` — a per-target build hook
+(`tools/zipbin`) writes the same `terraform-provider-labdeploy_v<version>_<os>_<arch>.zip`
+next to each binary so the plain `build` subcommand emits the zips too.
 
 To install on a CI runner, download and unzip the matching artifact into the
 filesystem-mirror layout Terraform expects (DESIGN §16.1):
