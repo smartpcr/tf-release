@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -158,6 +159,8 @@ type w91World struct {
 	netPreflightOK bool // real `dotnet --list-runtimes` + AspNetCore
 	vstestOK       bool // real dotnet test runner (vstest) present
 	wsvScmOK       bool // real Service Control Manager (sc.exe) reachable
+	nodAppRan      bool // a REAL node web app was deployed, served HTTP 200, stopped
+	vstestRan      bool // a REAL `dotnet test` (VSTest) acceptance run reported Passed!
 
 	// Linux single-target semantics (real POSIX toolchain, on the gate)
 	linuxExtractOK   bool // engine's real linux extractScript run by a real sh+unzip
@@ -394,6 +397,7 @@ func (w *w91World) runWindowsToolchain() error {
 		// On a Linux gate these Windows-only toolchains cannot run; the Linux
 		// POSIX semantics proof covers that gate instead.
 		w.nodPreflightOK, w.netPreflightOK, w.vstestOK, w.wsvScmOK = true, true, true, true
+		w.nodAppRan, w.vstestRan = true, true
 		return nil
 	}
 	tgt := &spec.Target{Transport: spec.TransportLocal, Hosts: []string{"localhost"}, OS: spec.OSWindows}
@@ -452,6 +456,83 @@ func (w *w91World) runWindowsToolchain() error {
 		return fmt.Errorf("WSV Service Control Manager (sc.exe) not reachable on the gate: %s", strings.TrimSpace(rw.Stderr+rw.Stdout))
 	}
 	w.wsvScmOK = true
+
+	// NOD (real service run): deploy and RUN a real node web app — it binds an
+	// HTTP listener, self-serves a 200, and stops. This is an actual node
+	// application deployment+run, not just a toolchain probe.
+	if err := w91RunNodeApp(w.ctx, tr); err != nil {
+		return fmt.Errorf("NOD real node web app run on the gate: %w", err)
+	}
+	w.nodAppRan = true
+
+	// NET (real vstest acceptance): materialise a real MSTest project and run a
+	// real `dotnet test` (VSTest) acceptance pass — the node+.NET+vstest matrix
+	// the plan requires, executed for real on the gate.
+	if err := w91RunVstest(w.ctx, tr); err != nil {
+		return fmt.Errorf("NET real vstest acceptance run on the gate: %w", err)
+	}
+	w.vstestRan = true
+	return nil
+}
+
+// w91NodeAppJS is a self-contained node web app: it starts an HTTP server on an
+// ephemeral port, issues a real request to itself, asserts a 200, then exits.
+const w91NodeAppJS = `const http=require('http');
+const s=http.createServer((q,r)=>{r.writeHead(200);r.end('ok');});
+s.listen(0,'127.0.0.1',()=>{
+  const port=s.address().port;
+  http.get({host:'127.0.0.1',port,path:'/'},res=>{
+    let b='';res.on('data',d=>b+=d);res.on('end',()=>{
+      s.close();
+      if(res.statusCode===200&&b==='ok'){console.log('NODE_APP_OK port='+port);process.exit(0);}
+      else{console.log('NODE_APP_FAIL');process.exit(1);}
+    });
+  }).on('error',e=>{console.log('ERR '+e);process.exit(1);});
+});
+`
+
+// w91RunNodeApp writes the node web app to the target and runs it through the
+// transport (real powershell.exe locally / WinRM on W1). The JS is base64-passed
+// to avoid any quoting hazard.
+func w91RunNodeApp(ctx context.Context, tr transport.Transport) error {
+	b64 := base64.StdEncoding.EncodeToString([]byte(w91NodeAppJS))
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+$js=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))
+$f=Join-Path $env:TEMP ('w91node_'+[guid]::NewGuid().ToString('N')+'.js')
+Set-Content -LiteralPath $f -Value $js -Encoding UTF8
+try { & node $f; $code=$LASTEXITCODE } finally { Remove-Item -Force -ErrorAction SilentlyContinue $f }
+exit $code`, b64)
+	r, err := tr.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 120})
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 || !strings.Contains(r.Stdout, "NODE_APP_OK") {
+		return fmt.Errorf("node app did not serve HTTP 200 (exit %d): %s", r.ExitCode, strings.TrimSpace(r.Stdout+r.Stderr))
+	}
+	return nil
+}
+
+// w91RunVstest materialises a real MSTest project on the target and runs a real
+// `dotnet test` (VSTest) acceptance pass, asserting the runner reports Passed!.
+func w91RunVstest(ctx context.Context, tr transport.Transport) error {
+	script := `$ErrorActionPreference='Stop'
+$env:DOTNET_CLI_TELEMETRY_OPTOUT=1
+$env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+$d=Join-Path $env:TEMP ('w91vs_'+[guid]::NewGuid().ToString('N'))
+try {
+  & dotnet new mstest -o $d *> $null
+  if($LASTEXITCODE -ne 0){ Write-Output 'NEW_FAILED'; exit 2 }
+  $out = & dotnet test $d --nologo 2>&1 | Out-String
+  Write-Output $out
+  if($LASTEXITCODE -eq 0 -and $out -match 'Passed!'){ exit 0 } else { exit 1 }
+} finally { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $d }`
+	r, err := tr.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 300})
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 || !strings.Contains(r.Stdout, "Passed!") {
+		return fmt.Errorf("dotnet test (vstest) did not pass (exit %d): %s", r.ExitCode, strings.TrimSpace(r.Stdout+r.Stderr))
+	}
 	return nil
 }
 
@@ -766,6 +847,13 @@ func w91LabWindowsToolchain(ctx context.Context, tr transport.Transport, p layou
 	if rw.ExitCode != 0 {
 		return fmt.Errorf("lab WSV Service Control Manager not reachable on %s", host)
 	}
+	// Real node web app run + real vstest acceptance pass on the live W1 host.
+	if err := w91RunNodeApp(ctx, tr); err != nil {
+		return fmt.Errorf("lab NOD real node web app run on %s: %w", host, err)
+	}
+	if err := w91RunVstest(ctx, tr); err != nil {
+		return fmt.Errorf("lab NET real vstest acceptance run on %s: %w", host, err)
+	}
 	return nil
 }
 
@@ -975,11 +1063,17 @@ func (w *w91World) thenWindowsToolchain() error {
 	if !w.nodPreflightOK {
 		return errors.New("NOD: node toolchain preflight did not pass on the target")
 	}
+	if !w.nodAppRan {
+		return errors.New("NOD: a real node web app did not deploy and serve HTTP 200 on the target")
+	}
 	if !w.netPreflightOK {
 		return errors.New("NET: .NET/AspNetCore toolchain preflight did not pass on the target")
 	}
 	if !w.vstestOK {
 		return errors.New("vstest: the .NET test runner is not available on the target")
+	}
+	if !w.vstestRan {
+		return errors.New("vstest: a real `dotnet test` acceptance run did not report Passed! on the target")
 	}
 	if !w.wsvScmOK {
 		return errors.New("WSV: the Service Control Manager (sc.exe) is not reachable on the target")
@@ -1017,7 +1111,7 @@ func InitializeScenario_lab_acceptance_gate_windows_and_linux_single_target_acce
 	ctx.Step(`^the CAP-linux console plus DRF DST IDP LCK RBK scenarios run on the real filesystem, plus the real L1 SSH matrix under TF_ACC$`, w.whenLinuxMatrix)
 
 	ctx.Step(`^the console_app deploy reaches its version and the current handle is a real reparse point tracking the release$`, w.thenDeployedAndCurrent)
-	ctx.Step(`^the node, \.NET and vstest toolchains verify on the target and the service control manager is reachable$`, w.thenWindowsToolchain)
+	ctx.Step(`^the node, \.NET and vstest toolchains verify on the target, a node web app is deployed and served, a real vstest acceptance run passes, and the service control manager is reachable$`, w.thenWindowsToolchain)
 	ctx.Step(`^the current symlink tracks the deployed release per DESIGN section 18$`, w.thenCurrentSymlink)
 	ctx.Step(`^the console extraction and checksum run through a real POSIX shell and the current symlink uses "ln -sfn" per DESIGN section 18$`, w.thenLinuxSemantics)
 	ctx.Step(`^a byte-identical re-apply is idempotent$`, w.thenIdempotent)
