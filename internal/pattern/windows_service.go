@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
@@ -160,7 +162,67 @@ exit 0`,
 }
 
 func (w *WindowsService) Configure(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
-	return w.configure(ctx, t, rc, "")
+	if err := w.configure(ctx, t, rc, ""); err != nil {
+		return err
+	}
+	w.traceServiceConfig(ctx, t, rc)
+	return nil
+}
+
+// traceServiceConfig captures `sc.exe qc <svc>` and records it in the provider's
+// TF log at TRACE (DESIGN §18.5 WSV-08: "secret absent from `sc qc` capture in TF
+// logs at TRACE"). sc.exe qc reports the service's BINARY_PATH_NAME and
+// SERVICE_START_NAME (ObjectName) but NEVER the account password, so emitting the
+// capture makes the redaction of the service-account secret an OBSERVABLE fact in
+// the Terraform TRACE log rather than an implicit one. Best-effort: a probe
+// failure is logged but never fails the deploy (the service is already configured).
+func (w *WindowsService) traceServiceConfig(ctx context.Context, t transport.Transport, rc ReleaseCtx) {
+	svc := w.svcName(rc)
+	// Propagate sc.exe's own exit code so a probe that FAILED to query the service
+	// (e.g. it does not exist) is observable, not silently reported as an empty
+	// success. sc.exe qc prints the `SERVICE_NAME:` block on success.
+	script := fmt.Sprintf(`$ErrorActionPreference='Continue'
+& sc.exe qc %s | Out-String
+exit $LASTEXITCODE`, psq(svc))
+	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, nil, 60)
+	exitCode := 0
+	stdout := ""
+	if err == nil {
+		exitCode, stdout = r.ExitCode, r.Stdout
+	}
+	capture, ok := scQCCapture(err, exitCode, stdout)
+	if !ok {
+		fields := map[string]interface{}{"service": svc, "host": t.Host(), "exit_code": exitCode}
+		if err != nil {
+			fields["error"] = err.Error()
+		} else {
+			fields["reason"] = "sc.exe qc returned no service configuration"
+		}
+		tflog.Trace(ctx, "sc qc capture failed", fields)
+		return
+	}
+	tflog.Trace(ctx, "sc qc capture", map[string]interface{}{
+		"service": svc,
+		"host":    t.Host(),
+		"sc_qc":   capture,
+	})
+}
+
+// scQCCapture decides whether an `sc.exe qc` probe produced a usable, REAL service
+// configuration capture. It returns the trimmed capture and ok=true ONLY when the
+// probe ran (runErr==nil), sc.exe exited 0, AND the output carries the SERVICE_NAME
+// block; otherwise ok=false so the caller logs a failure rather than a vacuous
+// "successful" capture that a redaction assertion could pass against (DESIGN §18.5
+// WSV-08). Kept as a pure function so every branch is unit-testable.
+func scQCCapture(runErr error, exitCode int, stdout string) (string, bool) {
+	if runErr != nil {
+		return "", false
+	}
+	capture := strings.TrimSpace(stdout)
+	if exitCode != 0 || !strings.Contains(capture, "SERVICE_NAME") {
+		return "", false
+	}
+	return capture, true
 }
 
 // writeServiceEnv = S5: HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Environment.

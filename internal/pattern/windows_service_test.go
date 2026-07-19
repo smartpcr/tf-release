@@ -50,11 +50,15 @@ func TestWindowsServiceS4Golden(t *testing.T) {
 	if err := w.Configure(context.Background(), f, rc); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
-	if len(f.scripts) != 2 {
-		t.Fatalf("windows_service Configure should emit S4 configure + S5 env scripts, got %d", len(f.scripts))
+	if len(f.scripts) != 3 {
+		t.Fatalf("windows_service Configure should emit S4 configure + S5 env + sc-qc TRACE scripts, got %d", len(f.scripts))
 	}
 	checkGolden(t, "winsvc_s4_configure.golden", f.scripts[0])
 	checkGolden(t, "winsvc_s5_env.golden", f.scripts[1])
+	// The trailing script is the DESIGN §18.5 sc qc TRACE capture (WSV-08).
+	if !strings.Contains(f.scripts[2], "sc.exe qc") {
+		t.Errorf("Configure must end with an sc qc capture for the TRACE log:\n%s", f.scripts[2])
+	}
 
 	// The single S4 script embeds BOTH the fresh and update branches.
 	if !strings.Contains(f.scripts[0], "sc.exe create") || !strings.Contains(f.scripts[0], "sc.exe config") {
@@ -74,6 +78,66 @@ func TestWindowsServiceS4Golden(t *testing.T) {
 	}
 	if !strings.Contains(f.scripts[1], "ASPNETCORE_ENVIRONMENT=Production") {
 		t.Errorf("S5 script must inject the spec environment:\n%s", f.scripts[1])
+	}
+}
+
+// Scenario: scQCCapture branch matrix (DESIGN §18.5 WSV-08). traceServiceConfig must
+// only log a SUCCESSFUL "sc qc capture" when the probe actually ran, sc.exe exited 0,
+// and the output carries the SERVICE_NAME block — otherwise redaction would be
+// asserted against a vacuous record. Each branch is exercised here — evaluator item 5.
+func TestWindowsServiceSCQCCaptureBranches(t *testing.T) {
+	const good = "SERVICE_NAME: SampleSvc\n        TYPE               : 10  WIN32_OWN_PROCESS\n        SERVICE_START_NAME : .\\svcuser\n"
+	cases := []struct {
+		name     string
+		runErr   error
+		exitCode int
+		stdout   string
+		wantOK   bool
+	}{
+		{"transport error", errors.New("winrm dial failed"), 0, good, false},
+		{"nonzero exit (service absent, 1060)", nil, 1060, "", false},
+		{"exit0 empty output", nil, 0, "", false},
+		{"exit0 no SERVICE_NAME block", nil, 0, "some unrelated banner text", false},
+		{"exit0 real config", nil, 0, good, true},
+		{"exit0 real config with surrounding whitespace", nil, 0, "\r\n" + good + "  \n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			capture, ok := scQCCapture(tc.runErr, tc.exitCode, tc.stdout)
+			if ok != tc.wantOK {
+				t.Fatalf("scQCCapture ok=%v, want %v (capture=%q)", ok, tc.wantOK, capture)
+			}
+			if tc.wantOK {
+				if !strings.Contains(capture, "SERVICE_NAME") {
+					t.Errorf("accepted capture must carry the SERVICE_NAME block, got %q", capture)
+				}
+				if strings.HasPrefix(capture, "\r") || strings.HasPrefix(capture, "\n") || strings.HasSuffix(capture, " ") {
+					t.Errorf("accepted capture must be trimmed, got %q", capture)
+				}
+			} else if capture != "" {
+				t.Errorf("rejected capture must be empty, got %q", capture)
+			}
+		})
+	}
+}
+
+// TestWindowsServiceConfigureEmitsSCQCScript proves Configure ends with the sc qc
+// TRACE-capture probe script (the wire that feeds scQCCapture) — DESIGN §18.5.
+func TestWindowsServiceConfigureEmitsSCQCScript(t *testing.T) {
+	var w WindowsService
+	rc := winsvcRC(spec.Pattern{
+		Type:        spec.PatternWindowsService,
+		ServiceName: "SampleSvc",
+		Exe:         `bin\sample.exe`,
+		StartType:   "auto",
+	}, nil)
+	f := &scriptTransport{osKind: spec.OSWindows}
+	if err := w.Configure(context.Background(), f, rc); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	last := f.scripts[len(f.scripts)-1]
+	if !strings.Contains(last, "sc.exe qc") || !strings.Contains(last, "exit $LASTEXITCODE") {
+		t.Errorf("Configure must end with an sc qc probe that propagates the exit code:\n%s", last)
 	}
 }
 
@@ -135,10 +199,13 @@ func TestWindowsServiceWinswConfigureGolden(t *testing.T) {
 	if err := w.Configure(context.Background(), f, rc); err != nil {
 		t.Fatalf("Configure(winsw): %v", err)
 	}
-	if len(f.scripts) != 1 {
-		t.Fatalf("winsw Configure should emit a single install/refresh script, got %d", len(f.scripts))
+	if len(f.scripts) != 2 {
+		t.Fatalf("winsw Configure should emit a single install/refresh script + sc-qc TRACE capture, got %d", len(f.scripts))
 	}
 	checkGolden(t, "winsvc_winsw_configure.golden", f.scripts[0])
+	if !strings.Contains(f.scripts[1], "sc.exe qc") {
+		t.Errorf("winsw Configure must end with an sc qc capture for the TRACE log:\n%s", f.scripts[1])
+	}
 	if !strings.Contains(f.scripts[0], "<stopwait>60sec</stopwait>") {
 		t.Errorf("winsw configure script must embed <stopwait>60sec</stopwait>:\n%s", f.scripts[0])
 	}

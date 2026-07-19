@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
@@ -610,9 +611,22 @@ func (r *DeploymentResource) apply(ctx context.Context, plan *deploymentModel,
 	}
 	eng := r.engine()
 	st, err := eng.Update(ctx, d, prior)
-	for _, w := range eng.Warns() {
+	warns := eng.Warns()
+	insecureWarns := 0
+	for _, w := range warns {
+		if strings.Contains(w, "insecure_skip_verify") {
+			insecureWarns++
+		}
 		diags.AddWarning(warnSummary(w), w)
 	}
+	// Structured, countable record of the warnings this apply surfaced so an
+	// acceptance test can assert the DESIGN §11 "exactly one insecure-TLS WARN"
+	// invariant end-to-end from the REAL apply (terraform-plugin-testing exposes no
+	// Check hook for warning diagnostics) — CON-01.
+	tflog.Info(ctx, "surfaced engine warnings", map[string]interface{}{
+		"count":              len(warns),
+		"insecure_transport": insecureWarns,
+	})
 	if err != nil {
 		diags.AddError(diagSummary(ctx, "ERR_CONNECT", "deploy failed", err), err.Error())
 		return
