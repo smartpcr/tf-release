@@ -163,9 +163,9 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	}
 	defer t.Close()
 
-	// Test workspace: <install_root>/<name>-tests/runs/<version>.
+	// Test workspace (DESIGN §7.4:377): <install_root>/_tests/<name>/releases/<version>.
 	root := tr.EffectiveWorkRoot(tr.Target.OS)
-	p := layout.NewPaths(tr.Target.OS, root, tr.Metadata.Name+"-tests", tr.Artifact.Version)
+	p := layout.NewPaths(tr.Target.OS, layout.Join(tr.Target.OS, root, "_tests"), tr.Metadata.Name, tr.Artifact.Version)
 	dep := &spec.Deployment{ // reuse staging plumbing with a synthetic deployment
 		APIVersion: tr.APIVersion, Kind: "Deployment", Metadata: tr.Metadata,
 		Target: tr.Target, Artifact: tr.Artifact, Environment: tr.Runner.Env,
@@ -449,7 +449,7 @@ func isTimeoutErr(err error) bool {
 }
 
 // DeleteTestDir best-effort removes the remote test workspace
-// (`<install_root>/<name>-tests`) created by RunTest. It is called from the
+// (`<install_root>/_tests/<name>`) created by RunTest. It is called from the
 // resource Delete and MUST NOT fail a Terraform destroy: a missing dir is a
 // no-op (removePath is idempotent) and any transport/connect error is returned
 // for the caller to surface as a WARNING only (DESIGN §5.3 "Delete removes the
@@ -465,7 +465,7 @@ func (e *Engine) DeleteTestDir(ctx context.Context, tr *spec.TestRun) error {
 	}
 	defer t.Close()
 	root := tr.EffectiveWorkRoot(tr.Target.OS)
-	p := layout.NewPaths(tr.Target.OS, root, tr.Metadata.Name+"-tests", tr.Artifact.Version)
+	p := layout.NewPaths(tr.Target.OS, layout.Join(tr.Target.OS, root, "_tests"), tr.Metadata.Name, tr.Artifact.Version)
 	if err := e.removePath(ctx, t, p.Root); err != nil {
 		return coded("ERR_CONNECT", host, "DELETE", err)
 	}

@@ -368,7 +368,7 @@ func TestRunTestTimeoutKillsTree(t *testing.T) {
 // TestRunnerScriptWindowsKillsTree locks the Windows watchdog issuing a
 // full-tree taskkill (/T) force-kill (/F) on timeout.
 func TestRunnerScriptWindowsKillsTree(t *testing.T) {
-	s := runnerScriptWindows(`C:\deploy\smoke-tests\releases\1.2.3`, "vstest.console.exe tests.dll", 120)
+	s := runnerScriptWindows(`C:\deploy\_tests\smoke\releases\1.2.3`, "vstest.console.exe tests.dll", 120)
 	for _, want := range []string{"taskkill /PID", "/T /F", timeoutMarker} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("windows watchdog missing %q:\n%s", want, s)
@@ -408,7 +408,7 @@ func (e errString) Error() string { return string(e) }
 
 // TestDeleteTestDirRemovesWorkspace proves best-effort Delete (DESIGN §5.3):
 // DeleteTestDir issues a RECURSIVE removal of the remote test workspace
-// (<install_root>/<name>-tests) and returns nil on success.
+// (<install_root>/_tests/<name>) and returns nil on success.
 func TestDeleteTestDirRemovesWorkspace(t *testing.T) {
 	ft := &fakeRunnerTransport{osKind: spec.OSLinux, host: "lab-01"}
 	e := New()
@@ -419,7 +419,7 @@ func TestDeleteTestDirRemovesWorkspace(t *testing.T) {
 	}
 	var removed bool
 	for _, s := range ft.execScripts {
-		if strings.Contains(s, "rm -rf") && strings.Contains(s, "/opt/deploy/smoke-tests") {
+		if strings.Contains(s, "rm -rf") && strings.Contains(s, "/opt/deploy/_tests/smoke") {
 			removed = true
 		}
 	}

@@ -1512,7 +1512,7 @@ func TestRunPostStagingFailureKeepsRelease(t *testing.T) {
 		t.Fatalf("test release should have been extracted; log=%v", f.log)
 	}
 	// ... but the fully-extracted release must survive the post-staging failure.
-	release := `C:\deploy\sample-svc-e2e-tests\releases\1.0.0`
+	release := `C:\deploy\_tests\sample-svc-e2e\releases\1.0.0`
 	if strings.Contains(joined, "RM "+release) {
 		t.Fatalf("post-staging failure must NOT delete the extracted release; log=%v", f.log)
 	}
@@ -1535,7 +1535,7 @@ func TestRunStagingFailureRemovesRelease(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected extract failure")
 	}
-	release := `C:\deploy\sample-svc-e2e-tests\releases\1.0.0`
+	release := `C:\deploy\_tests\sample-svc-e2e\releases\1.0.0`
 	if !strings.Contains(strings.Join(f.log, ">"), "RM "+release) {
 		t.Fatalf("pre-execution staging failure must remove the partial release; log=%v", f.log)
 	}
