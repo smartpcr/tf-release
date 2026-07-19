@@ -1,0 +1,5 @@
+Import-Module FailoverClusters
+try { Start-ClusterGroup -Name 'PaymentsRole' -Wait 120 -ErrorAction Stop | Out-Null }
+catch { Write-Error $_.Exception.Message; exit 47 }
+if((Get-ClusterGroup -Name 'PaymentsRole').State -ne 'Online'){ exit 47 }
+exit 0

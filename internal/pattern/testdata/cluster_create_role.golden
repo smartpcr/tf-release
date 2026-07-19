@@ -1,0 +1,4 @@
+Import-Module FailoverClusters
+try { Add-ClusterGenericServiceRole -ServiceName 'PaymentsSvc' -Name 'PaymentsRole' -StaticAddress '10.0.0.42' -ErrorAction Stop | Out-Null }
+catch { Write-Error $_.Exception.Message; exit 46 }
+exit 0

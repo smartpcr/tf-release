@@ -147,26 +147,24 @@ func (e *Engine) deployCluster(ctx context.Context, s *spec.Deployment) (*Status
 		}
 	}
 
-	if err := e.lockAll(ctx, cc, "deploy"); err != nil {
-		return nil, err
-	}
-	defer e.unlockAll(ctx, cc)
-
+	// Role-binding conflict (CLU-06) MUST be detected BEFORE any lock is acquired
+	// so a conflicting spec modifies NOTHING — no lock files are created/removed
+	// and the operator sees ERR_SERVICE_INSTALL rather than a spurious ERR_LOCKED.
 	role := s.Pattern.RoleName
 	var exists bool
-	var boundSvc, owner string
+	var owner string
 	if err := slCoord0.timed(ctx, "VALIDATE", func() error {
 		var berr error
-		exists, boundSvc, owner, _, berr = cc.cg.RoleBinding(ctx, cc.coord(), role)
+		exists, owner, berr = cc.cg.PreflightRole(ctx, cc.coord(), role, s.Pattern.ServiceName)
 		return berr
 	}); err != nil {
 		return nil, err
 	}
-	if exists && !strings.EqualFold(boundSvc, s.Pattern.ServiceName) {
-		return nil, coded("ERR_PREFLIGHT", cc.hosts[0], "PREFLIGHT",
-			fmt.Errorf("role %q already bound to service %q, spec wants %q — refusing (CLU-06)",
-				role, boundSvc, s.Pattern.ServiceName))
+
+	if err := e.lockAll(ctx, cc, "deploy"); err != nil {
+		return nil, err
 	}
+	defer e.unlockAll(ctx, cc)
 
 	// Idempotency short-circuit across all nodes (IDP-02).
 	if exists {
@@ -186,13 +184,27 @@ func (e *Engine) deployCluster(ctx context.Context, s *spec.Deployment) (*Status
 	return e.clusterRollingUpdate(ctx, cc, strings.ToLower(owner))
 }
 
+// clusterAllCurrent reports whether EVERY node's manifest already matches the
+// spec version+checksum AND records a cleanly-finalized last operation. A node
+// whose last_operation.result=="failed" is NOT treated as current even when its
+// version/checksum match, so the idempotency short-circuit (IDP-02) does not fire
+// on a failed-but-current manifest. The cluster failure finalizes (U7
+// preferred-owner ordering, create C2..C4, cleanup, stop) record current=new and
+// checksum=new; without this guard clusterAllCurrent would return true, the
+// short-circuit would return a NO-OP success, the failed step would never be
+// re-attempted, and Read/ReconcileManifest would append "!failed" on every apply
+// forever — the opposite of DESIGN §10.4's "forces a converging apply". Excluding
+// the failed result re-enters clusterRollingUpdate/clusterCreate so the failed
+// operation re-runs to convergence, matching the non-cluster paths (which keep
+// current=prev on failure so re-apply likewise does not short-circuit).
 func (e *Engine) clusterAllCurrent(ctx context.Context, cc *clusterCtx) (bool, *Manifest) {
 	var first *Manifest
 	for _, h := range cc.hosts {
 		m, err := ReadManifest(ctx, cc.tr[h], cc.paths(h, cc.s.Artifact.Version))
 		if err != nil || m == nil ||
 			m.CurrentVersion != cc.s.Artifact.Version ||
-			m.ArtifactChecksum != cc.s.Artifact.Checksum {
+			m.ArtifactChecksum != cc.s.Artifact.Checksum ||
+			m.LastOperation.Result == "failed" {
 			return false, nil
 		}
 		if first == nil {
@@ -461,7 +473,12 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 		if err := newStepLogger(s, cc.hosts[0]).timed(ctx, "CONFIGURE", func() error {
 			return cc.cg.SetPreferredOwners(ctx, cc.coord(), s.Pattern.RoleName, ordered)
 		}); err != nil {
-			e.warnf("set preferred owners failed: %v", err)
+			// The new release is deployed and healthy on the preferred owner, but
+			// PERSISTING the preferred-owner ordering failed. Do NOT finalize a clean
+			// success (which would falsely report the preferred_owner change applied);
+			// record a failed manifest (current=new so state reflects the running
+			// release) and surface the error, consistent with the create C3 path.
+			return nil, foldFinalize(err, e.clusterFinalizeVersion(ctx, cc, s.Artifact.Version, prevVersion, started, "failed"))
 		}
 	}
 	// U8: finalize. A finalize (manifest-write) failure means the successful
