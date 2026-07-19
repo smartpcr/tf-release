@@ -275,19 +275,65 @@ func (d *DockerContainer) q(t transport.Transport, s string) string {
 	return shq(s)
 }
 
-// RunNew = D4+D5 with a given image ref (new ref, or old image id on rollback).
+// classifyScript wraps a docker lifecycle invocation `inner` (e.g.
+// `docker rm -f 'x'` or `docker stop 'x'`) in the SHARED sentinel-exit
+// convention used across the docker D-steps: exit 0 on success, exit 20 when the
+// container is ABSENT ("No such object/container" — a satisfied post-condition,
+// nothing to do), and exit 21 on ANY OTHER (genuine) failure (daemon
+// unreachable, permission denied, CLI error). This lets the engine distinguish a
+// missing container from a real failure instead of the previous blanket
+// `|| true` / `2>$null` suppression that let daemon and permission failures pass
+// as success (evaluator iter10 items 2/3/4). The inner command's own stderr is
+// preserved on the genuine-failure path for diagnostics.
+func (d *DockerContainer) classifyScript(t transport.Transport, inner string) string {
+	if t.OS() == spec.OSWindows {
+		return fmt.Sprintf(`$out = (%s 2>&1 | Out-String).Trim()
+if($LASTEXITCODE -eq 0){ exit 0 }
+if($out -match 'No such'){ exit 20 }
+[Console]::Error.Write($out); exit 21`, inner)
+	}
+	return fmt.Sprintf(`out=$(%s 2>&1); rc=$?
+if [ $rc -eq 0 ]; then exit 0; fi
+case "$out" in *"No such"*) exit 20;; esac
+printf '%%s' "$out" >&2; exit 21`, inner)
+}
+
+// classifyLifecycle interprets a classifyScript result: exit 0 ⇒ done, exit 20 ⇒
+// container absent (returns absent=true, no error — an already-gone container
+// satisfies stop/remove), anything else ⇒ a coded StepError under `code` so the
+// genuine failure surfaces to the engine rather than being silently swallowed.
+func classifyLifecycle(host, step, code string, r transport.Result) (absent bool, err error) {
+	switch r.ExitCode {
+	case 0:
+		return false, nil
+	case 20:
+		return true, nil
+	default:
+		return false, stepErr(code, host, step,
+			fmt.Errorf("docker %s failed (exit %d): %s", strings.ToLower(step), r.ExitCode, truncOut(r)))
+	}
+}
 func (d *DockerContainer) RunNew(ctx context.Context, t transport.Transport, rc ReleaseCtx, ref string) error {
 	name := rc.Spec.Pattern.ContainerName
 	var script string
+	// D4 removes any prior container of the same name before D5 re-runs it. DESIGN
+	// §9.6 permits ignoring ONLY a not-found ("No such") result — a genuine removal
+	// failure (daemon down, container stuck) must be reported directly, NOT obscured
+	// as a later D5 start failure (evaluator iter10 item 4). We therefore classify
+	// the D4 `rm -f` first: not-found is skipped, but any other nonzero exits with
+	// ExitServiceStop so the engine surfaces ERR_SERVICE_STOP (distinct from the
+	// ERR_SERVICE_START that a genuine D5 `docker run` failure yields).
 	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf(`docker rm -f %s 2>$null | Out-Null
+		script = fmt.Sprintf(`$rmout = (docker rm -f %s 2>&1 | Out-String).Trim()
+if($LASTEXITCODE -ne 0 -and $rmout -notmatch 'No such'){ [Console]::Error.Write($rmout); exit %d }
 docker run %s %s
 if($LASTEXITCODE -ne 0){ exit %d }
-exit 0`, d.q(t, name), d.runArgs(t, rc), d.q(t, ref), ExitServiceStart)
+exit 0`, d.q(t, name), ExitServiceStop, d.runArgs(t, rc), d.q(t, ref), ExitServiceStart)
 	} else {
-		script = fmt.Sprintf(`docker rm -f %s >/dev/null 2>&1 || true
+		script = fmt.Sprintf(`rmout=$(docker rm -f %s 2>&1); rc=$?
+if [ $rc -ne 0 ]; then case "$rmout" in *"No such"*) : ;; *) printf '%%s' "$rmout" >&2; exit %d;; esac; fi
 docker run %s %s || exit %d
-exit 0`, d.q(t, name), d.runArgs(t, rc), d.q(t, ref), ExitServiceStart)
+exit 0`, d.q(t, name), ExitServiceStop, d.runArgs(t, rc), d.q(t, ref), ExitServiceStart)
 	}
 	r, err := d.run(ctx, t, "START", script, nil, 300)
 	if err != nil {
@@ -307,14 +353,16 @@ func (d *DockerContainer) Configure(ctx context.Context, t transport.Transport, 
 
 func (d *DockerContainer) Stop(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
 	qn := d.q(t, rc.Spec.Pattern.ContainerName)
-	var script string
-	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf("docker stop %s 2>$null | Out-Null\nexit 0", qn)
-	} else {
-		script = fmt.Sprintf("docker stop %s >/dev/null 2>&1 || true", qn)
+	// A `docker stop` on an ABSENT container ("No such container") is a satisfied
+	// post-condition and must be ignored, but daemon/permission/stop failures must
+	// surface to the engine per the pattern lifecycle contract — the old blanket
+	// `|| true` / `2>$null` swallowed all of them (evaluator iter10 item 3).
+	r, err := d.run(ctx, t, "STOP", d.classifyScript(t, "docker stop "+qn), nil, 120)
+	if err != nil {
+		return err
 	}
-	_, err := d.run(ctx, t, "STOP", script, nil, 120)
-	return err
+	_, cerr := classifyLifecycle(t.Host(), "STOP", "ERR_SERVICE_STOP", r)
+	return cerr
 }
 
 func (d *DockerContainer) Start(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
@@ -324,32 +372,45 @@ func (d *DockerContainer) Start(ctx context.Context, t transport.Transport, rc R
 func (d *DockerContainer) Status(ctx context.Context, t transport.Transport, rc ReleaseCtx) (string, error) {
 	qn := d.q(t, rc.Spec.Pattern.ContainerName)
 	var script string
+	// DESIGN §10.4: ReadStatus must fail LOUDLY on daemon/permission errors rather
+	// than report absence. Only a not-found ("No such") inspect result maps to
+	// not_installed; any other nonzero exits 21 so the engine returns a coded
+	// ERR_CONNECT refresh failure instead of a false "not_installed" (iter10 item 1).
 	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf(`$s = docker inspect -f '{{.State.Running}}' %s 2>$null
-if($LASTEXITCODE -ne 0){ Write-Output 'not_installed'; exit 0 }
-if($s -match 'true'){ Write-Output 'running' } else { Write-Output 'stopped' }
-exit 0`, qn)
+		script = fmt.Sprintf(`$out = (docker inspect -f '{{.State.Running}}' %s 2>&1 | Out-String).Trim()
+if($LASTEXITCODE -eq 0){ if($out -match 'true'){ Write-Output 'running' } else { Write-Output 'stopped' }; exit 0 }
+if($out -match 'No such'){ Write-Output 'not_installed'; exit 0 }
+[Console]::Error.Write($out); exit 21`, qn)
 	} else {
-		script = fmt.Sprintf(`s=$(docker inspect -f '{{.State.Running}}' %s 2>/dev/null) || { echo not_installed; exit 0; }
-[ "$s" = "true" ] && echo running || echo stopped`, qn)
+		script = fmt.Sprintf(`out=$(docker inspect -f '{{.State.Running}}' %s 2>&1); rc=$?
+if [ $rc -eq 0 ]; then [ "$out" = "true" ] && echo running || echo stopped; exit 0; fi
+case "$out" in *"No such"*) echo not_installed; exit 0;; esac
+printf '%%s' "$out" >&2; exit 21`, qn)
 	}
 	r, err := d.run(ctx, t, "STATUS", script, nil, 60)
 	if err != nil {
 		return "", err
+	}
+	if r.ExitCode != 0 {
+		return "", stepErr("ERR_CONNECT", t.Host(), "STATUS",
+			fmt.Errorf("docker inspect failed (exit %d): %s", r.ExitCode, truncOut(r)))
 	}
 	return strings.TrimSpace(r.Stdout), nil
 }
 
 func (d *DockerContainer) Uninstall(ctx context.Context, t transport.Transport, rc ReleaseCtx, purge bool) error {
 	qn := d.q(t, rc.Spec.Pattern.ContainerName)
-	var script string
-	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf("docker rm -f %s 2>$null | Out-Null\nexit 0", qn)
-	} else {
-		script = fmt.Sprintf("docker rm -f %s >/dev/null 2>&1 || true", qn)
+	// Uninstall backs Engine.Destroy, which removes the manifest/tree once this
+	// returns nil. A blanket-suppressed `docker rm -f` let Destroy report success
+	// while the container was still running (evaluator iter10 item 2); classify so
+	// only a not-found container is treated as already-gone and genuine removal
+	// failures propagate as ERR_SERVICE_STOP.
+	r, err := d.run(ctx, t, "CONFIGURE", d.classifyScript(t, "docker rm -f "+qn), nil, 120)
+	if err != nil {
+		return err
 	}
-	_, err := d.run(ctx, t, "CONFIGURE", script, nil, 120)
-	return err
+	_, cerr := classifyLifecycle(t.Host(), "CONFIGURE", "ERR_SERVICE_STOP", r)
+	return cerr
 }
 
 // ConfigFingerprint hashes the MUTABLE docker_container settings — image ref

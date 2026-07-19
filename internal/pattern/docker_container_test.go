@@ -469,3 +469,79 @@ func TestDockerConfigFingerprint(t *testing.T) {
 	}
 }
 
+// Scenario: docker lifecycle failures surface (evaluator iter10 items 1..4). The
+// D-step lifecycle probes (Status/Stop/Uninstall and the D4 rm -f inside RunNew)
+// must distinguish an ABSENT container (exit 20 / "No such") — a satisfied
+// post-condition — from a GENUINE daemon/permission/CLI failure (exit 21/43),
+// which must be reported as a coded StepError instead of being swallowed by the
+// old blanket `|| true` / `2>$null` suppression (DESIGN §10.4, §9.6, lifecycle
+// contract). Verified in-process with the scripted fake transport.
+func TestDockerLifecycleFailuresSurface(t *testing.T) {
+	rc := dockerRC(spec.OSLinux, dockerPattern(), spec.Source{
+		Type: "docker_registry", Image: "registry.example.com/app", Tag: "2.0.0",
+	}, nil)
+	var d DockerContainer
+	ctx := context.Background()
+	daemonDown := transport.Result{ExitCode: 21, Stderr: "Cannot connect to the Docker daemon"}
+
+	assertCode := func(t *testing.T, err error, want string) {
+		t.Helper()
+		var se *StepError
+		if !errors.As(err, &se) || se.Code != want {
+			t.Fatalf("want coded %s StepError, got %v", want, err)
+		}
+	}
+
+	// --- Status (item 1) -------------------------------------------------------
+	// exit 0 ⇒ running/stopped, "No such" ⇒ not_installed, exit 21 ⇒ ERR_CONNECT.
+	stRun := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{{ExitCode: 0, Stdout: "running\n"}}}
+	if got, err := d.Status(ctx, stRun, rc); err != nil || got != "running" {
+		t.Errorf("Status running: got %q err=%v", got, err)
+	}
+	stAbsent := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{{ExitCode: 0, Stdout: "not_installed\n"}}}
+	if got, err := d.Status(ctx, stAbsent, rc); err != nil || got != "not_installed" {
+		t.Errorf("Status absent must be not_installed w/o error: got %q err=%v", got, err)
+	}
+	stBroken := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{daemonDown}}
+	if got, err := d.Status(ctx, stBroken, rc); got != "" {
+		t.Errorf("failed Status must not report a status, got %q", got)
+	} else {
+		assertCode(t, err, "ERR_CONNECT")
+	}
+	if !strings.Contains(stBroken.scripts[0], "No such") {
+		t.Errorf("Status script must classify not-found separately:\n%s", stBroken.scripts[0])
+	}
+
+	// --- Stop (item 3) ---------------------------------------------------------
+	stopAbsent := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{{ExitCode: 20}}}
+	if err := d.Stop(ctx, stopAbsent, rc); err != nil {
+		t.Errorf("Stop on absent container (exit 20) must be a no-op, got %v", err)
+	}
+	stopBroken := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{daemonDown}}
+	assertCode(t, d.Stop(ctx, stopBroken, rc), "ERR_SERVICE_STOP")
+
+	// --- Uninstall (item 2) ----------------------------------------------------
+	unAbsent := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{{ExitCode: 20}}}
+	if err := d.Uninstall(ctx, unAbsent, rc, false); err != nil {
+		t.Errorf("Uninstall on absent container must succeed, got %v", err)
+	}
+	unBroken := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{daemonDown}}
+	assertCode(t, d.Uninstall(ctx, unBroken, rc, false), "ERR_SERVICE_STOP")
+
+	// --- RunNew D4 rm -f (item 4) ---------------------------------------------
+	// A genuine D4 removal failure (exit 43 / ExitServiceStop) must surface
+	// ERR_SERVICE_STOP directly — NOT be obscured as the D5 ERR_SERVICE_START.
+	runBroken := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{
+		{ExitCode: ExitServiceStop, Stderr: "permission denied while removing container"},
+	}}
+	assertCode(t, d.RunNew(ctx, runBroken, rc, "img:2.0.0"), "ERR_SERVICE_STOP")
+	if !strings.Contains(runBroken.scripts[0], `*"No such"*`) {
+		t.Errorf("RunNew D4 must ignore only not-found removals:\n%s", runBroken.scripts[0])
+	}
+	// A genuine D5 run failure still maps to ERR_SERVICE_START (distinct signal).
+	runD5 := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{
+		{ExitCode: ExitServiceStart, Stderr: "docker: run failed"},
+	}}
+	assertCode(t, d.RunNew(ctx, runD5, rc, "img:2.0.0"), "ERR_SERVICE_START")
+}
+
