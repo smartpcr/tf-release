@@ -1,0 +1,1 @@
+vstest.console.exe tests\Unit.dll tests\Integration.dll /Parallel /Logger:trx /ResultsDirectory:.\TestResults

@@ -28,31 +28,114 @@ type TestOutcome struct {
 	Summary         string
 }
 
-// runnerCommand renders the concrete command per runner.type (DESIGN §7.2).
+// runnerCommand renders the concrete command per runner.type (DESIGN §7.2). The
+// normative argument source is `runner.args` for EVERY runner type; the typed
+// convenience fields (assemblies/project/script) are folded in additively so a
+// spec may supply either. `<args>` is always emitted BEFORE the framework's
+// results-dir logger flags exactly as the DESIGN §7 table specifies.
 func runnerCommand(t *spec.TestRun) string {
 	r := t.Runner
 	switch r.Type {
 	case "exec":
-		if len(r.Args) > 0 {
-			return r.Command + " " + strings.Join(r.Args, " ")
+		args := runnerArgList(r)
+		if len(args) > 0 {
+			return r.Command + " " + strings.Join(args, " ")
 		}
 		return r.Command
 	case "vstest":
-		asm := strings.Join(r.Assemblies, " ")
-		extra := strings.Join(r.ExtraArgs, " ")
-		return strings.TrimSpace(fmt.Sprintf(`vstest.console.exe %s /Logger:trx /ResultsDirectory:.\TestResults %s`, asm, extra))
-	case "dotnet_test":
-		proj := r.Project
-		extra := strings.Join(r.ExtraArgs, " ")
-		return strings.TrimSpace(fmt.Sprintf(`dotnet test %s --logger trx --results-directory .\TestResults %s`, proj, extra))
-	case "npm":
-		script := r.Script
-		if script == "" {
-			script = "test"
+		// vstest.console.exe <assemblies + args> /Logger:trx /ResultsDirectory:<dir>
+		args := append(append([]string{}, r.Assemblies...), runnerArgList(r)...)
+		cmd := "vstest.console.exe"
+		if len(args) > 0 {
+			cmd += " " + strings.Join(args, " ")
 		}
-		return "npm run " + script
+		return cmd + ` /Logger:trx /ResultsDirectory:.\TestResults`
+	case "dotnet_test":
+		// dotnet test <project + args> --logger trx --results-directory <dir> --no-build
+		var args []string
+		if r.Project != "" {
+			args = append(args, r.Project)
+		}
+		args = append(args, runnerArgList(r)...)
+		cmd := "dotnet test"
+		if len(args) > 0 {
+			cmd += " " + strings.Join(args, " ")
+		}
+		return cmd + ` --logger trx --results-directory .\TestResults --no-build`
+	case "npm":
+		// DESIGN §7.2: `npm <args or "test">`. runner.args (or extra_args) win;
+		// else a named script becomes `npm run <script>`; else default `npm test`.
+		if args := runnerArgList(r); len(args) > 0 {
+			return "npm " + strings.Join(args, " ")
+		}
+		if r.Script != "" {
+			return "npm run " + r.Script
+		}
+		return "npm test"
 	}
 	return r.Command
+}
+
+// runnerArgList is the normative `<args>` for a runner: `runner.args` first
+// (DESIGN §7 table), then any `extra_args` appended, so both the standard and
+// the convenience field flow into the expanded command.
+func runnerArgList(r spec.Runner) []string {
+	args := make([]string, 0, len(r.Args)+len(r.ExtraArgs))
+	args = append(args, r.Args...)
+	args = append(args, r.ExtraArgs...)
+	return args
+}
+
+// noResultCounters is the sentinel counter set emitted when results.format is
+// none|empty: nothing is parsed, so every counter is -1 (DESIGN §5.3 outputs
+// table "-1 when results.format: none"; E2E-07).
+func noResultCounters() logs.Counters {
+	return logs.Counters{Total: -1, Passed: -1, Failed: -1, Skipped: -1}
+}
+
+// computePassRate is the SINGLE source of truth for the pass_rate VALUE, shared
+// by evaluatePass and writeSummaryJSON so the persisted rate agrees with the
+// verdict (DESIGN §7.3 `pass_rate = passed/(total-skipped)`). It returns:
+//   - -1 when results.format is none|empty (nothing measured),
+//   - passed/(total-skipped) when at least one non-skipped test ran,
+//   - 0 when a format was parsed but zero tests ran (rate is NOT enforced in
+//     this case — see evaluatePass — but 0 is the reported value),
+//   - 1 when tests ran but every one was skipped (no failures ⇒ vacuous pass).
+func computePassRate(format string, c logs.Counters) float64 {
+	if format != "trx" && format != "junit" {
+		return -1
+	}
+	denom := c.Total - c.Skipped
+	if denom > 0 {
+		return float64(c.Passed) / float64(denom)
+	}
+	if c.Total == 0 {
+		return 0
+	}
+	return 1
+}
+
+// evaluatePass applies pass_criteria (DESIGN §7.3) in-process: the runner exit
+// code must be in the allowed set AND — only when a result format was parsed and
+// at least one test was reported (`total > 0`, DESIGN §7 line 372) — the pass
+// rate (see computePassRate) must be >= min_pass_rate. When results.format is
+// none OR no tests were reported, the rate gate is skipped entirely
+// (rateOK=true) and the verdict rides purely on exit_codes. Pure function so it
+// is unit-testable without a transport.
+func evaluatePass(exitCode int, format string, c logs.Counters, pc *spec.PassCriteria) (passed, exitOK, rateOK bool) {
+	for _, code := range pc.EffectiveExitCodes() {
+		if exitCode == code {
+			exitOK = true
+			break
+		}
+	}
+	rateOK = true
+	// min_pass_rate is enforced ONLY when a format was parsed and total > 0
+	// (DESIGN §7 line 372); a zero-test run is exit-code-only.
+	if (format == "trx" || format == "junit") && c.Total > 0 {
+		rateOK = computePassRate(format, c) >= pc.EffectiveMinPassRate()
+	}
+	return exitOK && rateOK, exitOK, rateOK
 }
 
 // RunTest = fetch+extract test package on target, execute runner, collect
@@ -219,39 +302,29 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 
 	out := &TestOutcome{ExitCode: r.ExitCode, ResultsDir: dest, DurationSeconds: duration}
 
-	// PARSE results if a format is configured.
+	// PARSE results if a format is configured; otherwise emit -1 sentinels so
+	// consumers can distinguish "not measured" from a genuine zero (E2E-07).
+	c := noResultCounters()
 	if f := tr.Results.Format; f == "trx" || f == "junit" {
-		c, matched, perr := logs.SumResults(f, localResults, tr.Results.Paths)
+		parsed, matched, perr := logs.SumResults(f, localResults, tr.Results.Paths)
 		if perr != nil {
 			// Missing/corrupt results with format set ⇒ ERR_TEST_FAILED (E2E-06).
 			return out, coded("ERR_TEST_FAILED", host, "TEST",
 				fmt.Errorf("result parsing (%s, matched=%d): %v", f, len(matched), perr))
 		}
-		out.Total, out.PassedTests, out.FailedTests, out.SkippedTests = c.Total, c.Passed, c.Failed, c.Skipped
+		c = parsed
 	}
+	out.Total, out.PassedTests, out.FailedTests, out.SkippedTests = c.Total, c.Passed, c.Failed, c.Skipped
 
 	// PASS CRITERIA (DESIGN §7.3): exit code ∈ allowed AND pass-rate ≥ min.
-	exitOK := false
-	for _, c := range tr.PassCriteria.EffectiveExitCodes() {
-		if r.ExitCode == c {
-			exitOK = true
-			break
-		}
-	}
-	rateOK := true
-	if tr.Results.Format == "trx" || tr.Results.Format == "junit" {
-		denom := out.Total - out.SkippedTests
-		rate := 1.0
-		if denom > 0 {
-			rate = float64(out.PassedTests) / float64(denom)
-		} else if out.Total == 0 {
-			rate = 0 // zero tests discovered ⇒ never passes rate gate (E2E-07)
-		}
-		rateOK = rate >= tr.PassCriteria.EffectiveMinPassRate()
-	}
-	out.Passed = exitOK && rateOK
+	passed, exitOK, rateOK := evaluatePass(r.ExitCode, tr.Results.Format, c, &tr.PassCriteria)
+	out.Passed = passed
 	out.Summary = summarize(out, exitOK, rateOK)
-	writeSummaryJSON(dest, tr, out, startedAt)
+	// The summary.json is a REQUIRED artifact (DESIGN §7.4); a marshal/write
+	// failure must fail the op rather than silently yield an outcome without it.
+	if werr := writeSummaryJSON(dest, tr, out, startedAt); werr != nil {
+		return out, coded("ERR_TEST_FAILED", host, "TEST", werr)
+	}
 	return out, nil
 }
 
@@ -270,20 +343,44 @@ func summarize(o *TestOutcome, exitOK, rateOK bool) string {
 		o.Passed, o.ExitCode, exitOK, o.Total, o.PassedTests, o.FailedTests, o.SkippedTests, rateOK, o.DurationSeconds)
 }
 
-// writeSummaryJSON emits the machine-readable summary.json (DESIGN §7.4).
-func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started time.Time) {
+// writeSummaryJSON emits the machine-readable summary.json (DESIGN §7.4). Field
+// names mirror the design's example document. `pass_rate` is shared with the
+// pass verdict via computePassRate (-1 when no format was parsed, matching the
+// -1 counters). It RETURNS an error on marshal/write failure so the caller can
+// treat a missing required artifact as an op failure instead of silently
+// succeeding.
+func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started time.Time) error {
+	passRate := computePassRate(tr.Results.Format, logs.Counters{
+		Total: o.Total, Passed: o.PassedTests, Failed: o.FailedTests, Skipped: o.SkippedTests,
+	})
 	doc := map[string]interface{}{
-		"schema": 1, "name": tr.Metadata.Name, "version": tr.Artifact.Version,
-		"host":   strings.ToLower(tr.Target.Hosts[0]),
-		"passed": o.Passed, "exit_code": o.ExitCode,
-		"total": o.Total, "passed_tests": o.PassedTests,
-		"failed_tests": o.FailedTests, "skipped_tests": o.SkippedTests,
+		"name":             tr.Metadata.Name,
+		"version":          tr.Artifact.Version,
+		"host":             strings.ToLower(tr.Target.Hosts[0]),
+		"passed":           o.Passed,
+		"exit_code":        o.ExitCode,
+		"total":            o.Total,
+		"passed_tests":     o.PassedTests,
+		"failed":           o.FailedTests,
+		"skipped":          o.SkippedTests,
+		"pass_rate":        passRate,
 		"duration_seconds": o.DurationSeconds,
-		"started_utc":      started.UTC().Format(time.RFC3339),
-		"finished_utc":     time.Now().UTC().Format(time.RFC3339),
+		"criteria": map[string]interface{}{
+			"exit_codes":    tr.PassCriteria.EffectiveExitCodes(),
+			"min_pass_rate": tr.PassCriteria.EffectiveMinPassRate(),
+		},
+		"error_code":   "",
+		"started_utc":  started.UTC().Format(time.RFC3339),
+		"finished_utc": time.Now().UTC().Format(time.RFC3339),
 	}
-	b, _ := json.MarshalIndent(doc, "", "  ")
-	_ = os.WriteFile(filepath.Join(dest, "summary.json"), b, 0o644)
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal summary.json: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "summary.json"), b, 0o644); err != nil {
+		return fmt.Errorf("write summary.json: %w", err)
+	}
+	return nil
 }
 
 func tail(s string, n int) string {
