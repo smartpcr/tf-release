@@ -1,3 +1,7 @@
 Import-Module FailoverClusters
-Stop-ClusterGroup -Name 'PaymentsRole' -ErrorAction SilentlyContinue | Out-Null
+$g = Get-ClusterGroup -Name 'PaymentsRole' -ErrorAction SilentlyContinue
+if($null -eq $g){ exit 0 }
+try { Stop-ClusterGroup -Name 'PaymentsRole' -ErrorAction Stop | Out-Null }
+catch { Write-Error $_.Exception.Message; exit 47 }
+if((Get-ClusterGroup -Name 'PaymentsRole').State -ne 'Offline'){ Write-Error 'role still Online after Stop-ClusterGroup'; exit 47 }
 exit 0

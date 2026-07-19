@@ -196,15 +196,19 @@ exit 0`, psq(role), waitSec, ExitClusterMove, psq(role), ExitClusterMove)
 	return nil
 }
 
-// SetPreferredOwners applies the preferred_owner ordering (C3/U7).
+// SetPreferredOwners applies the preferred_owner ordering (C3/U7). The cmdlet
+// is forced terminating (-ErrorAction Stop) and wrapped so a non-terminating or
+// terminating failure surfaces as ERR_SERVICE_INSTALL instead of an unconditional
+// exit 0 masking a silent PowerShell error (evaluator iter2 item 2).
 func (c *ClusterGeneric) SetPreferredOwners(ctx context.Context, t transport.Transport, role string, ordered []string) error {
 	list := make([]string, len(ordered))
 	for i, n := range ordered {
 		list[i] = psq(n)
 	}
 	script := fmt.Sprintf(`Import-Module FailoverClusters
-Set-ClusterOwnerNode -Group %s -Owners %s
-exit 0`, psq(role), strings.Join(list, ","))
+try { Set-ClusterOwnerNode -Group %s -Owners %s -ErrorAction Stop | Out-Null }
+catch { Write-Error $_.Exception.Message; exit %d }
+exit 0`, psq(role), strings.Join(list, ","), ExitSvcInstall)
 	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, nil, 120)
 	if err != nil {
 		return err
@@ -216,12 +220,26 @@ exit 0`, psq(role), strings.Join(list, ","))
 }
 
 // StopGroup takes the role Offline (create-failure path, DESIGN §9.5 C5-fail).
+// An ABSENT role is a clean no-op (exit 0), but a role that is PRESENT and fails
+// to reach Offline must surface as ERR_CLUSTER_MOVE rather than being masked by
+// -ErrorAction SilentlyContinue + exit 0, so clusterCreateStop can escalate an
+// unknown/still-Online state (evaluator iter2 item 3).
 func (c *ClusterGeneric) StopGroup(ctx context.Context, t transport.Transport, role string) error {
 	script := fmt.Sprintf(`Import-Module FailoverClusters
-Stop-ClusterGroup -Name %s -ErrorAction SilentlyContinue | Out-Null
-exit 0`, psq(role))
-	_, err := runPS(ctx, t, t.Host(), "MOVE_GROUP", script, nil, 300)
-	return err
+$g = Get-ClusterGroup -Name %s -ErrorAction SilentlyContinue
+if($null -eq $g){ exit 0 }
+try { Stop-ClusterGroup -Name %s -ErrorAction Stop | Out-Null }
+catch { Write-Error $_.Exception.Message; exit %d }
+if((Get-ClusterGroup -Name %s).State -ne 'Offline'){ Write-Error 'role still Online after Stop-ClusterGroup'; exit %d }
+exit 0`, psq(role), psq(role), ExitClusterMove, psq(role), ExitClusterMove)
+	r, err := runPS(ctx, t, t.Host(), "MOVE_GROUP", script, nil, 300)
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return failFrom(t.Host(), "MOVE_GROUP", r)
+	}
+	return nil
 }
 
 // RemoveRole = destroy path (DESIGN §9.5 DESTROY).

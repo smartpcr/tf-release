@@ -1,0 +1,22 @@
+$ErrorActionPreference='Continue'
+$svc='SampleSvc'
+$bin='\"C:\deploy\payments-svc\current\bin\SampleSvc.exe\"'
+
+& sc.exe query $svc *> $null
+$exists = ($LASTEXITCODE -ne 1060)
+if(-not $exists){
+  if($env:LD_SVC_PW){ & sc.exe create $svc binPath= $bin start= demand DisplayName= 'Contoso Sample' obj= $obj password= $env:LD_SVC_PW }
+  elseif($obj){       & sc.exe create $svc binPath= $bin start= demand DisplayName= 'Contoso Sample' obj= $obj }
+  else{               & sc.exe create $svc binPath= $bin start= demand DisplayName= 'Contoso Sample' }
+  if($LASTEXITCODE -ne 0){ exit 46 }
+} else {
+  if($env:LD_SVC_PW){ & sc.exe config $svc binPath= $bin start= demand DisplayName= 'Contoso Sample' obj= $obj password= $env:LD_SVC_PW }
+  elseif($obj){       & sc.exe config $svc binPath= $bin start= demand DisplayName= 'Contoso Sample' obj= $obj }
+  else{               & sc.exe config $svc binPath= $bin start= demand DisplayName= 'Contoso Sample' obj= LocalSystem }
+  if($LASTEXITCODE -ne 0){ exit 46 }
+}
+& sc.exe description $svc '""'
+if($LASTEXITCODE -ne 0){ exit 46 }
+& sc.exe failure "SampleSvc" reset= 86400 actions= restart/5000/restart/5000/restart/5000
+if($LASTEXITCODE -ne 0){ exit 46 }
+exit 0

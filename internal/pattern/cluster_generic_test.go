@@ -89,7 +89,99 @@ func TestClusterGenericCreateRoleNoStaticAddress(t *testing.T) {
 	}
 }
 
-// Scenario: Role binding conflict (DESIGN §9.5 preflight, CLU-06).
+// Scenario (evaluator iter2 item 5): the per-node service registration the
+// cluster performs (ClusterGeneric.Configure) MUST register with start= demand
+// because the CLUSTER — not the SCM — controls start (DESIGN §9.5 C1). Capture
+// the S4 configure + S5 env scripts as goldens and assert start= demand on BOTH
+// the fresh create and the update config branch.
+func TestClusterGenericConfigureStartDemandGolden(t *testing.T) {
+	var c ClusterGeneric
+	rc := winsvcRC(spec.Pattern{
+		Type:        spec.PatternClusterGeneric,
+		ServiceName: "SampleSvc",
+		DisplayName: "Contoso Sample",
+		Exe:         `bin\SampleSvc.exe`,
+		RoleName:    "SampleRole",
+	}, map[string]string{"ASPNETCORE_ENVIRONMENT": "Production"})
+
+	f := &scriptTransport{osKind: spec.OSWindows}
+	if err := c.Configure(context.Background(), f, rc); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if len(f.scripts) != 2 {
+		t.Fatalf("cluster Configure should emit S4 configure + S5 env scripts, got %d", len(f.scripts))
+	}
+	checkGolden(t, "cluster_configure.golden", f.scripts[0])
+	checkGolden(t, "cluster_configure_env.golden", f.scripts[1])
+
+	// start= demand on BOTH the create and the config branch (cluster owns start).
+	if got := strings.Count(f.scripts[0], "start= demand"); got < 2 {
+		t.Errorf("cluster registration must use start= demand on create+config (found %d):\n%s", got, f.scripts[0])
+	}
+	if !strings.Contains(f.scripts[0], "sc.exe create") || !strings.Contains(f.scripts[0], "sc.exe config") {
+		t.Errorf("cluster S4 must carry both create + config branches:\n%s", f.scripts[0])
+	}
+	if strings.Contains(f.scripts[0], "start= auto") {
+		t.Errorf("cluster registration must NOT use start= auto — the cluster starts the role:\n%s", f.scripts[0])
+	}
+}
+
+// TestClusterGenericSetPreferredOwnersFailure guards evaluator iter2 item 2:
+// a non-zero exit from Set-ClusterOwnerNode must surface as ERR_SERVICE_INSTALL,
+// not be swallowed by an unconditional exit 0.
+func TestClusterGenericSetPreferredOwnersFailure(t *testing.T) {
+	var c ClusterGeneric
+	f := &scriptTransport{osKind: spec.OSWindows, queue: []transport.Result{
+		{ExitCode: ExitSvcInstall, Stderr: "owner not a cluster node"},
+	}}
+	err := c.SetPreferredOwners(context.Background(), f, "SampleRole", []string{"lab-01", "lab-02"})
+	if err == nil {
+		t.Fatal("SetPreferredOwners must fail when Set-ClusterOwnerNode errors")
+	}
+	var se *StepError
+	if !errors.As(err, &se) || se.Code != "ERR_SERVICE_INSTALL" {
+		t.Fatalf("expected ERR_SERVICE_INSTALL StepError, got %T: %v", err, err)
+	}
+	// The generated script must force a terminating error + exit-code marker.
+	if !strings.Contains(f.scripts[0], "-ErrorAction Stop") || !strings.Contains(f.scripts[0], "exit 46") {
+		t.Errorf("SetPreferredOwners must gate on -ErrorAction Stop + exit 46:\n%s", f.scripts[0])
+	}
+}
+
+// TestClusterGenericStopGroupSemantics guards evaluator iter2 item 3: StopGroup
+// is a clean no-op when the role is ABSENT, but a role that fails to reach
+// Offline must surface ERR_CLUSTER_MOVE rather than being masked by exit 0.
+func TestClusterGenericStopGroupSemantics(t *testing.T) {
+	var c ClusterGeneric
+
+	// Absent role ⇒ Get-ClusterGroup returns nothing ⇒ script exits 0; the fake
+	// returns exit 0 with empty output and StopGroup succeeds as a no-op.
+	absent := &scriptTransport{osKind: spec.OSWindows, queue: []transport.Result{{ExitCode: 0}}}
+	if err := c.StopGroup(context.Background(), absent, "SampleRole"); err != nil {
+		t.Fatalf("StopGroup on an absent role must be a no-op: %v", err)
+	}
+	// The script must guard on role presence and gate the stop + Offline check.
+	if !strings.Contains(absent.scripts[0], "if($null -eq $g){ exit 0 }") {
+		t.Errorf("StopGroup must no-op when the role is absent:\n%s", absent.scripts[0])
+	}
+	if !strings.Contains(absent.scripts[0], "-ErrorAction Stop") || !strings.Contains(absent.scripts[0], "exit 47") {
+		t.Errorf("StopGroup must gate a real stop failure to ERR_CLUSTER_MOVE (exit 47):\n%s", absent.scripts[0])
+	}
+
+	// A role still Online after the stop ⇒ ERR_CLUSTER_MOVE.
+	stuck := &scriptTransport{osKind: spec.OSWindows, queue: []transport.Result{
+		{ExitCode: ExitClusterMove, Stderr: "role still Online after Stop-ClusterGroup"},
+	}}
+	err := c.StopGroup(context.Background(), stuck, "SampleRole")
+	if err == nil {
+		t.Fatal("StopGroup must fail when the role cannot reach Offline")
+	}
+	var se *StepError
+	if !errors.As(err, &se) || se.Code != "ERR_CLUSTER_MOVE" {
+		t.Fatalf("expected ERR_CLUSTER_MOVE StepError, got %T: %v", err, err)
+	}
+}
+
 // Given the WSFC role already exists bound to `other-svc`, when PreflightRole
 // runs via a fake transport whose scripted probe reports that binding, then it
 // yields an ERR_SERVICE_INSTALL error NAMING BOTH the bound service and the

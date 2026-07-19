@@ -196,6 +196,54 @@ func TestStepLogClusterMultiHostUpdateRollback(t *testing.T) {
 	}
 }
 
+// TestClusterConflictNoMutationBeforeError covers evaluator iter2 item 4 /
+// DESIGN §9.5 CLU-06: when the WSFC role already exists bound to a DIFFERENT
+// service, the deploy must abort with ERR_SERVICE_INSTALL (naming BOTH services)
+// BEFORE any lock is acquired or any staging/switch/configure/mutating cluster
+// script runs — the conflict modifies nothing, on any node or in the cluster.
+func TestClusterConflictNoMutationBeforeError(t *testing.T) {
+	payload := []byte("cluster conflict zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	// Role present but bound to `other-svc`; spec wants `SampleSvc` ⇒ CLU-06.
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  true, svc: "other-svc", owner: "lab-01", state: "Online",
+	}
+	n1 := &clusterNode{fakeHost: newFakeHost("lab-01"), cl: cl}
+	n2 := &clusterNode{fakeHost: newFakeHost("lab-02"), cl: cl}
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	_, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("expected ERR_SERVICE_INSTALL when the role is bound to a different service")
+	}
+	if !strings.Contains(err.Error(), "ERR_SERVICE_INSTALL") {
+		t.Fatalf("role/service binding conflict must map to ERR_SERVICE_INSTALL, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "other-svc") || !strings.Contains(err.Error(), "SampleSvc") {
+		t.Fatalf("conflict error must name BOTH the bound service and the spec service, got: %v", err)
+	}
+
+	// Nothing modified: no lock/staging/switch/configure ran on ANY node.
+	for _, n := range []*clusterNode{n1, n2} {
+		for _, m := range n.fakeHost.log {
+			if m == "LOCK" || m == "EXTRACT" || m == "CONFIGURE" || strings.HasPrefix(m, "SWITCH->") {
+				t.Errorf("host %s performed a mutating step %q before conflict detection: %v", n.host, m, n.fakeHost.log)
+			}
+		}
+	}
+	// The cluster state is untouched: role still bound to other-svc and Online.
+	if !cl.role || cl.svc != "other-svc" || cl.state != "Online" {
+		t.Errorf("conflict must not mutate cluster state, got role=%v svc=%q state=%q", cl.role, cl.svc, cl.state)
+	}
+}
+
 // TestClusterCreatePartialCleanup covers evaluator iter5 item 4 / DESIGN §10.3
 // row 1: when a FRESH cluster create fails at C1 after an earlier node was
 // already switched+configured, the partially-deployed nodes must be cleaned

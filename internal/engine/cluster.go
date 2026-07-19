@@ -147,11 +147,9 @@ func (e *Engine) deployCluster(ctx context.Context, s *spec.Deployment) (*Status
 		}
 	}
 
-	if err := e.lockAll(ctx, cc, "deploy"); err != nil {
-		return nil, err
-	}
-	defer e.unlockAll(ctx, cc)
-
+	// Role-binding conflict (CLU-06) MUST be detected BEFORE any lock is acquired
+	// so a conflicting spec modifies NOTHING — no lock files are created/removed
+	// and the operator sees ERR_SERVICE_INSTALL rather than a spurious ERR_LOCKED.
 	role := s.Pattern.RoleName
 	var exists bool
 	var owner string
@@ -162,6 +160,11 @@ func (e *Engine) deployCluster(ctx context.Context, s *spec.Deployment) (*Status
 	}); err != nil {
 		return nil, err
 	}
+
+	if err := e.lockAll(ctx, cc, "deploy"); err != nil {
+		return nil, err
+	}
+	defer e.unlockAll(ctx, cc)
 
 	// Idempotency short-circuit across all nodes (IDP-02).
 	if exists {
