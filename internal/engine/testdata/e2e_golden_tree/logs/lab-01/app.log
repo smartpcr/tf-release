@@ -1,0 +1,4 @@
+2024-01-01T00:00:00Z INFO  app starting
+2024-01-01T00:00:01Z INFO  smoke suite begin
+2024-01-01T00:00:03Z ERROR report_export: expected 200 got 500
+2024-01-01T00:00:03Z INFO  smoke suite complete

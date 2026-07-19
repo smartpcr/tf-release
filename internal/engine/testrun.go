@@ -292,9 +292,10 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 		_, w := logs.CollectFiles(ctx, t, logGlobs, filepath.Join(dest, "logs"))
 		collectWarns = append(collectWarns, w...)
 	}
-	// 3. Windows event logs since test start.
+	// 3. Windows event logs since test start — E2E-05 requires the event JSON to
+	// land in the LOGS directory (results_dir/logs/events), not a sibling tree.
 	if len(tr.Collect.WindowsEventLogs) > 0 {
-		_, w := logs.CollectEventLogs(ctx, t, tr.Collect.WindowsEventLogs, startedAt, filepath.Join(dest, "events"))
+		_, w := logs.CollectEventLogs(ctx, t, tr.Collect.WindowsEventLogs, startedAt, filepath.Join(dest, "logs", "events"))
 		collectWarns = append(collectWarns, w...)
 	}
 	for _, w := range collectWarns {
@@ -411,13 +412,16 @@ exit $__rc`, shq(workDir), shq(cmdline), timeout, timeoutMarker, timeoutSentinel
 }
 
 // runnerTimedOut reports whether the runner exec hit its timeout, recognized
-// deterministically across transports: the watchdog's sentinel exit code, the
-// watchdog marker on either stream, OR a transport-level timeout error. This is
-// what makes ERR_TIMEOUT reliable regardless of which transport served the exec
-// (the prior substring-only check missed winrm/local context-deadline timeouts).
+// deterministically across transports: the watchdog's marker (printed on the
+// SAME event that sets the sentinel exit code) OR a transport-level timeout
+// error. This is what makes ERR_TIMEOUT reliable regardless of which transport
+// served the exec (the prior substring-only check missed winrm/local
+// context-deadline timeouts). The marker is required — a bare exit code equal to
+// timeoutSentinel is NOT treated as a timeout, so a command that legitimately
+// returns 124 is not misclassified (only the watchdog, which always prints the
+// marker alongside the sentinel, trips this path).
 func runnerTimedOut(r transport.Result, xerr error) bool {
-	if r.ExitCode == timeoutSentinel ||
-		strings.Contains(r.Stdout, timeoutMarker) ||
+	if strings.Contains(r.Stdout, timeoutMarker) ||
 		strings.Contains(r.Stderr, timeoutMarker) {
 		return true
 	}

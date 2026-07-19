@@ -27,7 +27,21 @@ var (
 
 func NewE2ETestResource() resource.Resource { return &E2ETestResource{} }
 
-type E2ETestResource struct{ pd *providerData }
+type E2ETestResource struct {
+	pd *providerData
+	// newEngine is swappable for provider-level fake-transport tests so
+	// E2ETestResource.Create/Delete can be exercised end-to-end without a live
+	// target (DESIGN §17 seam). nil ⇒ engine.New().
+	newEngine func() *engine.Engine
+}
+
+// engineNew returns the injected engine factory result, or a real engine.
+func (r *E2ETestResource) engineNew() *engine.Engine {
+	if r.newEngine != nil {
+		return r.newEngine()
+	}
+	return engine.New()
+}
 
 // ConfigValidators enforces the VAL-06 exactly-one-of(spec, spec_file) rule at
 // the Terraform config layer (DESIGN §14).
@@ -157,7 +171,7 @@ func (r *E2ETestResource) Create(ctx context.Context, req resource.CreateRequest
 		resp.Diagnostics.AddError(codedSummary(err, "ERR_SPEC_INVALID", "invalid TestRun spec"), err.Error())
 		return
 	}
-	eng := engine.New()
+	eng := r.engineNew()
 	out, err := eng.RunTest(ctx, tr)
 	for _, w := range eng.Warnings {
 		resp.Diagnostics.AddWarning("labdeploy", w)
@@ -240,7 +254,7 @@ func (r *E2ETestResource) Delete(ctx context.Context, req resource.DeleteRequest
 			fmt.Sprintf("could not resolve spec to locate the remote test dir; skipping best-effort cleanup: %v", err))
 		return
 	}
-	eng := engine.New()
+	eng := r.engineNew()
 	if derr := eng.DeleteTestDir(ctx, tr); derr != nil {
 		resp.Diagnostics.AddWarning(codedSummary(derr, "ERR_CONNECT", "remote test dir cleanup failed"),
 			fmt.Sprintf("best-effort removal of the remote test dir failed (destroy still succeeds): %v", derr))

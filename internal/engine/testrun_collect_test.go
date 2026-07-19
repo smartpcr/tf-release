@@ -27,7 +27,8 @@ type fakeRunnerTransport struct {
 	markerJSON  string // returned for the release-marker read ⇒ cached=true
 	runnerRes   transport.Result
 	runnerErr   error
-	archiveSrc  string   // local file whose bytes are served as the results archive
+	archiveSrc  string   // local file whose bytes are served as the RESULTS archive
+	logsSrc     string   // local file whose bytes are served as the extra-LOGS archive
 	runnerCmds  []string // recorded runner watchdog scripts
 	execScripts []string // every script executed (for assertions)
 }
@@ -40,8 +41,9 @@ func (f *fakeRunnerTransport) Host() string                      { return f.host
 func (f *fakeRunnerTransport) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	f.execScripts = append(f.execScripts, c.Script)
 	switch {
-	case strings.Contains(c.Script, releaseMarker) && strings.Contains(c.Script, "base64"):
-		// release-marker read ⇒ report the wanted version is already extracted.
+	case strings.Contains(c.Script, releaseMarker) && (strings.Contains(c.Script, "base64") || strings.Contains(c.Script, "Base64")):
+		// release-marker read (linux `base64` / windows `ToBase64String`) ⇒
+		// report the wanted version is already extracted (cached fast-path).
 		return transport.Result{ExitCode: 0, Stdout: base64.StdEncoding.EncodeToString([]byte(f.markerJSON))}, nil
 	case strings.Contains(c.Script, "kill -9 -$__pgid") || strings.Contains(c.Script, "taskkill /PID"):
 		// The runner watchdog script — the process-tree kill wrapper.
@@ -62,24 +64,36 @@ func (f *fakeRunnerTransport) Upload(ctx context.Context, rd io.Reader, size int
 }
 
 func (f *fakeRunnerTransport) Download(ctx context.Context, remote, local string) error {
-	if strings.Contains(remote, "labdeploy-logs-") && f.archiveSrc != "" {
-		src, err := os.Open(f.archiveSrc)
-		if err != nil {
-			return err
-		}
-		defer src.Close()
-		if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
-			return err
-		}
-		dst, err := os.Create(local)
-		if err != nil {
-			return err
-		}
-		defer dst.Close()
-		_, err = io.Copy(dst, src)
+	if !strings.Contains(remote, "labdeploy-logs-") {
+		return nil
+	}
+	// CollectFiles downloads into <destDir>/<host>/logs.tar.gz where destDir is
+	// dest/results for the results pull and dest/logs for the extra-logs pull.
+	// The grandparent dir name ("results" | "logs") selects which archive to
+	// serve, so results and logs snapshot DISTINCT trees.
+	which := filepath.Base(filepath.Dir(filepath.Dir(local)))
+	src := f.archiveSrc
+	if which == "logs" && f.logsSrc != "" {
+		src = f.logsSrc
+	}
+	if src == "" {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
 		return err
 	}
-	return nil
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		return err
+	}
+	dst, err := os.Create(local)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	_, err = io.Copy(dst, in)
+	return err
 }
 
 var _ transport.Transport = (*fakeRunnerTransport)(nil)
@@ -129,68 +143,176 @@ func cachedMarker() string {
 	return string(b)
 }
 
-// TestRunTestCollectionBeforeFailure proves the "Collection before failure"
-// scenario (DESIGN §5.3; E2E-05): against a fake transport serving the on-target
-// results archive, RunTest fully materializes the local results_dir — the
-// extracted results tree is BYTE-IDENTICAL to the committed golden snapshot AND
-// summary.json is written — and the failing outcome is RETURNED (not lost) so the
-// provider can gate ERR_TEST_FAILED after the tree is persisted.
-func TestRunTestCollectionBeforeFailure(t *testing.T) {
-	golden, err := os.ReadFile(filepath.Join("testdata", "e2e_results", "TestResults", "results.xml"))
-	if err != nil {
-		t.Fatalf("read golden: %v", err)
-	}
-	dest := t.TempDir()
-	archive := filepath.Join(t.TempDir(), "results.tar.gz")
-	makeTarGz(t, archive, "TestResults/results.xml", golden)
+// e2eTestRunWithLogs is e2eTestRun plus a configured extra-log glob, so the
+// full-tree golden proof exercises BOTH the results pull and the logs pull.
+func e2eTestRunWithLogs(destDir string) *spec.TestRun {
+	tr := e2eTestRun(destDir, 600)
+	tr.Collect.Logs = []string{"/var/log/app.log"}
+	return tr
+}
 
+// maskVolatile replaces the three inherently non-deterministic summary.json
+// fields (wall-clock timestamps + elapsed duration) with a fixed sentinel so the
+// rest of the document can be byte-compared to a committed golden.
+func maskVolatile(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("summary.json invalid: %v", err)
+	}
+	for _, k := range []string{"duration_seconds", "started_utc", "finished_utc"} {
+		doc[k] = "MASKED"
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatalf("re-marshal summary: %v", err)
+	}
+	return append(out, '\n')
+}
+
+// TestRunnerTimedOutRequiresMarker locks item 4 of the iter-2 review: a bare exit
+// code equal to timeoutSentinel is NOT a timeout — only the watchdog marker (or a
+// transport-level timeout error) counts. This prevents a command that legitimately
+// returns 124 from being misclassified as ERR_TIMEOUT.
+func TestRunnerTimedOutRequiresMarker(t *testing.T) {
+	cases := []struct {
+		name string
+		res  transport.Result
+		err  error
+		want bool
+	}{
+		{"bare sentinel exit, no marker", transport.Result{ExitCode: timeoutSentinel}, nil, false},
+		{"marker on stdout", transport.Result{ExitCode: timeoutSentinel, Stdout: timeoutMarker}, nil, true},
+		{"marker on stderr", transport.Result{ExitCode: timeoutSentinel, Stderr: timeoutMarker}, nil, true},
+		{"transport deadline error", transport.Result{ExitCode: 0}, context.DeadlineExceeded, true},
+		{"ordinary non-zero exit", transport.Result{ExitCode: 1}, nil, false},
+		{"ordinary exit 124 with output", transport.Result{ExitCode: 124, Stdout: "all good"}, nil, false},
+	}
+	for _, c := range cases {
+		if got := runnerTimedOut(c.res, c.err); got != c.want {
+			t.Errorf("%s: runnerTimedOut = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRunTestEventLogsLandUnderLogsDir locks item 5 of the iter-2 review + E2E-05:
+// collect.windows_event_logs JSON must be written UNDER results_dir/logs (i.e.
+// results_dir/logs/events/<host>/...), NOT a sibling results_dir/events tree.
+func TestRunTestEventLogsLandUnderLogsDir(t *testing.T) {
+	dest := t.TempDir()
 	ft := &fakeRunnerTransport{
-		osKind: spec.OSLinux, host: "lab-01", markerJSON: cachedMarker(),
-		runnerRes:  transport.Result{ExitCode: 1}, // tests failed
-		archiveSrc: archive,
+		osKind: spec.OSWindows, host: "lab-01", markerJSON: cachedMarkerWindows(),
+		runnerRes: transport.Result{ExitCode: 0}, // tests pass; focus is collection layout
 	}
 	e := New()
 	e.NewTransport = func(_ *spec.Target, _ string) (transport.Transport, error) { return ft, nil }
 
-	out, rerr := e.RunTest(context.Background(), e2eTestRun(dest, 600))
+	tr := &spec.TestRun{
+		APIVersion: "labdeploy/v1", Kind: "TestRun",
+		Metadata: spec.Metadata{Name: "smoke"},
+		Target: spec.Target{OS: spec.OSWindows, Hosts: []string{"lab-01"},
+			Transport: spec.TransportWinRM},
+		Artifact: spec.Artifact{Version: "1.2.3", Checksum: "sha256:abc"},
+		Runner:   spec.Runner{Type: "exec", Command: "run.cmd", TimeoutSeconds: 600},
+		Results:  spec.Results{Format: "none"},
+		Collect: spec.Collect{DestinationDir: dest,
+			WindowsEventLogs: []spec.EventLogSpec{{Log: "Application"}}},
+	}
+
+	if _, rerr := e.RunTest(context.Background(), tr); rerr != nil {
+		t.Fatalf("RunTest error: %v", rerr)
+	}
+
+	wantEvents := filepath.Join(dest, "logs", "events", "lab-01", "events-Application.json")
+	if _, err := os.Stat(wantEvents); err != nil {
+		t.Fatalf("event-log JSON not under results_dir/logs/events: %v", err)
+	}
+	// The deprecated sibling location must NOT be used.
+	if _, err := os.Stat(filepath.Join(dest, "events")); err == nil {
+		t.Fatal("event logs written under results_dir/events; must be under results_dir/logs/events")
+	}
+}
+
+// cachedMarkerWindows mirrors cachedMarker for a Windows target (same fields).
+func cachedMarkerWindows() string { return cachedMarker() }
+
+// TestRunTestCollectionBeforeFailure proves the "Collection before failure"
+// scenario (DESIGN §5.3; E2E-05, implementation-plan.md:401): against a fake
+// transport serving DISTINCT on-target results and logs archives, RunTest fully
+// materializes the local results_dir and the ENTIRE tree — results + logs +
+// summary.json — is BYTE-IDENTICAL to a committed golden snapshot (summary's
+// wall-clock/duration fields masked), and the failing outcome is RETURNED (not
+// lost) so the provider can gate ERR_TEST_FAILED only AFTER the tree is persisted.
+func TestRunTestCollectionBeforeFailure(t *testing.T) {
+	goldenRoot := filepath.Join("testdata", "e2e_golden_tree")
+	resultsXML, err := os.ReadFile(filepath.Join(goldenRoot, "results", "lab-01", "TestResults", "results.xml"))
+	if err != nil {
+		t.Fatalf("read golden results: %v", err)
+	}
+	appLog, err := os.ReadFile(filepath.Join(goldenRoot, "logs", "lab-01", "app.log"))
+	if err != nil {
+		t.Fatalf("read golden log: %v", err)
+	}
+
+	dest := t.TempDir()
+	resultsArc := filepath.Join(t.TempDir(), "results.tar.gz")
+	logsArc := filepath.Join(t.TempDir(), "logs.tar.gz")
+	makeTarGz(t, resultsArc, "TestResults/results.xml", resultsXML)
+	makeTarGz(t, logsArc, "app.log", appLog)
+
+	ft := &fakeRunnerTransport{
+		osKind: spec.OSLinux, host: "lab-01", markerJSON: cachedMarker(),
+		runnerRes:  transport.Result{ExitCode: 1}, // tests failed, empty stdout/stderr
+		archiveSrc: resultsArc, logsSrc: logsArc,
+	}
+	e := New()
+	e.NewTransport = func(_ *spec.Target, _ string) (transport.Transport, error) { return ft, nil }
+
+	out, rerr := e.RunTest(context.Background(), e2eTestRunWithLogs(dest))
 	if rerr != nil {
 		t.Fatalf("RunTest returned error (results should be collected and outcome returned): %v", rerr)
 	}
-	if out == nil {
-		t.Fatal("RunTest returned nil outcome")
-	}
-	if out.Passed {
-		t.Fatal("outcome.Passed = true, want false (1 failure at min_pass_rate=1.0)")
+	if out == nil || out.Passed {
+		t.Fatalf("want a non-nil FAILED outcome, got %+v", out)
 	}
 	if out.Total != 4 || out.FailedTests != 1 || out.SkippedTests != 1 || out.PassedTests != 2 {
 		t.Fatalf("counters = total=%d passed=%d failed=%d skipped=%d, want 4/2/1/1",
 			out.Total, out.PassedTests, out.FailedTests, out.SkippedTests)
 	}
 
-	// The extracted results tree must be byte-identical to the golden snapshot.
-	extracted := findFile(t, filepath.Join(dest, "results"), "results.xml")
-	got, err := os.ReadFile(extracted)
+	// Walk the GOLDEN tree; every golden file must exist in dest and be
+	// byte-identical (summary.json compared after masking volatile fields).
+	var compared int
+	err = filepath.Walk(goldenRoot, func(gp string, info os.FileInfo, werr error) error {
+		if werr != nil || info.IsDir() {
+			return werr
+		}
+		rel, err := filepath.Rel(goldenRoot, gp)
+		if err != nil {
+			return err
+		}
+		wantBytes, err := os.ReadFile(gp)
+		if err != nil {
+			return err
+		}
+		gotBytes, err := os.ReadFile(filepath.Join(dest, rel))
+		if err != nil {
+			t.Fatalf("expected artifact %q missing from persisted tree: %v", rel, err)
+		}
+		if rel == "summary.json" {
+			gotBytes = maskVolatile(t, gotBytes)
+		}
+		if string(gotBytes) != string(wantBytes) {
+			t.Fatalf("tree file %q is NOT byte-identical to golden\n--- got ---\n%s\n--- want ---\n%s", rel, gotBytes, wantBytes)
+		}
+		compared++
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("read extracted results: %v", err)
+		t.Fatalf("walk golden: %v", err)
 	}
-	if string(got) != string(golden) {
-		t.Fatalf("extracted results tree is NOT byte-identical to golden\n--- extracted ---\n%s\n--- golden ---\n%s", got, golden)
-	}
-
-	// summary.json must be fully written into the results_dir before return.
-	summaryRaw, err := os.ReadFile(filepath.Join(dest, "summary.json"))
-	if err != nil {
-		t.Fatalf("summary.json not written: %v", err)
-	}
-	var doc map[string]interface{}
-	if err := json.Unmarshal(summaryRaw, &doc); err != nil {
-		t.Fatalf("summary.json invalid: %v", err)
-	}
-	if doc["passed"] != false {
-		t.Errorf("summary.json passed = %v, want false", doc["passed"])
-	}
-	if doc["total"].(float64) != 4 {
-		t.Errorf("summary.json total = %v, want 4", doc["total"])
+	if compared < 5 {
+		t.Fatalf("expected to compare the full results+logs+summary tree, only compared %d files", compared)
 	}
 }
 
