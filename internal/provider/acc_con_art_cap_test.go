@@ -406,34 +406,37 @@ func TestAccCAP01_WindowsConsole(t *testing.T) {
 	))
 }
 
-// CAP-02: W1, keep_releases=2. DESIGN §18.4: after rolling versions forward with
-// keep_releases=2, exactly 2 dirs remain under releases (newest+previous) and the
-// evicted dir is GONE. Sequence:
-//   1. apply 1.0.0, 1.1.0, then 1.2.0 — three distinct release dirs are created, so
-//      keep_releases=2 must PRUNE the oldest (1.0.0). We assert 1.0.0 is ABSENT
-//      (the "pruned dir gone" postcondition) — evaluator item 2.
-//   2. roll the two SURVIVING cached versions {1.1.0, 1.2.0} forward THREE times,
-//      ALTERNATING target each roll (1.1.0→1.2.0→1.1.0). Because the target version
-//      changes every roll, Terraform performs a REAL Update each time; because both
-//      dirs are already on-target, each Update reuses the cache (no FETCH, a fresh
-//      "release cached" record) — evaluator item 1.
-// The three versions are ordinary lab-served artifacts (same env contract as
-// 1.0.0/1.1.0: artifactURL + LABDEPLOY_ACC_SHA_1_2_0_ZIP); no magic build shape.
+// CAP-02: W1, keep_releases=2. DESIGN §18.4: "apply v1.1.0 then v1.0.0-cached
+// rolled forward again ×3 with keep_releases=2 ⇒ after last apply exactly 2 dirs
+// under releases (newest+previous); pruned dir gone". Sequence, using ONLY the
+// DESIGN §18 fixture set {1.0.0, 1.1.0, 1.2.0-bad} (DESIGN.md:824-825):
+//   1. apply 1.1.0, then 1.0.0 (which seeds+caches the version we later roll
+//      forward), then 1.2.0-bad — three distinct release dirs now exist, so
+//      keep_releases=2 must PRUNE the oldest non-protected dir (1.1.0). We assert
+//      1.1.0 is ABSENT (the "pruned dir gone" postcondition) — evaluator item 2.
+//   2. roll the CACHED 1.0.0 forward ×3, alternating with the other survivor
+//      (1.0.0→1.2.0-bad→1.0.0). Because the target version changes each roll,
+//      Terraform performs a REAL Update (no plan no-op); because both dirs are
+//      already on-target, each Update reuses the cache (no FETCH, a fresh "release
+//      cached" record). 1.0.0 is the version rolled forward, per DESIGN.
+// 1.2.0-bad is the fail-start build; as a console_app (no service start, empty
+// verify_command) it stages and switches cleanly, so it is a valid third fixture.
 func TestAccCAP02_KeepReleasesPrune(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
 	logPath := tfLogCapture(t)
 	cfg := map[string]string{
-		"1.1.0": accDeploymentConfig(consoleSpec(t, at, "1.1.0", "zip", "")),
-		"1.2.0": accDeploymentConfig(consoleSpec(t, at, "1.2.0", "zip", "")),
+		"1.0.0":     accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", "")),
+		"1.1.0":     accDeploymentConfig(consoleSpec(t, at, "1.1.0", "zip", "")),
+		"1.2.0-bad": accDeploymentConfig(consoleSpec(t, at, "1.2.0-bad", "zip", "")),
 	}
 	// One measured cached roll-forward to `ver`: truncate the TRACE, apply the
 	// (already-on-target) version, and assert it was a genuine cache reuse (no FETCH)
 	// that left exactly the two retained dirs, both present.
 	cachedRoll := func(n int, ver string) resource.TestStep {
-		other := "1.2.0"
-		if ver == "1.2.0" {
-			other = "1.1.0"
+		other := "1.2.0-bad"
+		if ver == "1.2.0-bad" {
+			other = "1.0.0"
 		}
 		return resource.TestStep{
 			PreConfig: truncateTFLog(t, logPath),
@@ -449,25 +452,27 @@ func TestAccCAP02_KeepReleasesPrune(t *testing.T) {
 		}
 	}
 	runScenario(t, at,
-		// Seed three distinct release dirs (each a fresh FETCH).
-		applyStep(at, accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", "")),
-			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
+		// Seed three distinct release dirs (each a fresh FETCH). 1.0.0 is seeded so it
+		// is cached for the roll-forward; 1.1.0 is the oldest and will be pruned.
 		applyStep(at, cfg["1.1.0"],
-			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0"),
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0")),
+		applyStep(at, cfg["1.0.0"],
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 			checkReleaseCount(at, 2)),
-		// Applying the THIRD version forces keep_releases=2 to prune the oldest (1.0.0).
-		applyStep(at, cfg["1.2.0"],
-			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.2.0"),
+		// Applying the THIRD version forces keep_releases=2 to prune the oldest
+		// non-protected dir (1.1.0). current=1.2.0-bad, previous=1.0.0 are protected.
+		applyStep(at, cfg["1.2.0-bad"],
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.2.0-bad"),
 			checkReleaseCount(at, 2),
-			checkReleaseAbsent(at, "1.0.0", "CAP-02: 1.0.0 must be PRUNED once 1.2.0 makes a third dir (keep_releases=2, pruned dir gone)"),
-			checkReleasePresent(at, "1.1.0", "CAP-02: 1.1.0 remains as the previous release"),
-			checkReleasePresent(at, "1.2.0", "CAP-02: 1.2.0 is the newest release"),
+			checkReleaseAbsent(at, "1.1.0", "CAP-02: 1.1.0 must be PRUNED once 1.2.0-bad makes a third dir (keep_releases=2, pruned dir gone)"),
+			checkReleasePresent(at, "1.0.0", "CAP-02: 1.0.0 remains (it will be rolled forward)"),
+			checkReleasePresent(at, "1.2.0-bad", "CAP-02: 1.2.0-bad is the newest release"),
 		),
-		// Roll the two survivors forward three times, alternating target each roll so
-		// every roll is a genuine Update that reuses the cache.
-		cachedRoll(1, "1.1.0"),
-		cachedRoll(2, "1.2.0"),
-		cachedRoll(3, "1.1.0"),
+		// Roll the CACHED 1.0.0 forward three times, alternating with the other
+		// survivor so every roll is a genuine Update that reuses the cache.
+		cachedRoll(1, "1.0.0"),
+		cachedRoll(2, "1.2.0-bad"),
+		cachedRoll(3, "1.0.0"),
 	)
 }
 

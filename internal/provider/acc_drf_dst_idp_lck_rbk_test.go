@@ -381,12 +381,17 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	t.Cleanup(func() { forceRemoveLock(at, root, app) })
 
 	// Apply A: a REAL, concurrent terraform apply of the SLOW artifact. It acquires
-	// and HOLDS the deployment `.lock` through its whole (slow) deploy.
+	// and HOLDS the deployment `.lock` through its whole (slow) deploy. A records its
+	// OWN elapsed time inside the goroutine (published before close(aDone), so the
+	// main goroutine reads it with a happens-before guarantee); this measures A's
+	// real duration and can NOT be satisfied by apply B's foreground time — item 2.
 	aT := &asyncT{name: "LCK-01/apply-A"}
 	aStart := time.Now()
+	var aElapsed time.Duration
 	aDone := make(chan struct{})
 	go func() {
 		defer close(aDone)
+		defer func() { aElapsed = time.Since(aStart) }()
 		defer aT.runCleanups()
 		resource.Test(aT, resource.TestCase{
 			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
@@ -418,12 +423,13 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	if aT.Failed() {
 		t.Fatalf("LCK-01: apply A (the lock holder) must complete normally, but failed:\n%s", aT.summary())
 	}
-	// VERIFY the slow-artifact contract: apply A must have taken at least the declared
-	// slowfetch delay. If it finished faster, the fixture was NOT actually slow and the
-	// contention window was incidental rather than guaranteed — fail loudly so LCK-01
-	// can never pass on a fast artifact mislabelled `-slowfetch` (evaluator item 4).
-	if aWall := time.Since(aStart); aWall < slowfetch {
-		t.Fatalf("LCK-01: the 1.0.0-slowfetch contract requires apply A to hold the lock ≥%s, but A completed in %s — the slow artifact did not enforce its FETCH delay", slowfetch, aWall)
+	// VERIFY the slow-artifact contract using A's OWN measured elapsed time (recorded
+	// inside A's goroutine, NOT wall time that would include apply B). If A finished
+	// faster than the declared slowfetch delay, the fixture was NOT actually slow and
+	// the contention window was incidental — fail loudly so LCK-01 can never pass on a
+	// fast artifact mislabelled `-slowfetch` (evaluator items 2, 4).
+	if aElapsed < slowfetch {
+		t.Fatalf("LCK-01: the 1.0.0-slowfetch contract requires apply A to hold the lock ≥%s, but A itself completed in %s — the slow artifact did not enforce its FETCH delay", slowfetch, aElapsed)
 	}
 	if err := assertLockAbsent(at.tgt, root, app); err != nil {
 		t.Fatalf("LCK-01: `.lock` must be absent after apply A completes: %v", err)
