@@ -9,8 +9,10 @@
 // The zip is written next to the binary (inside GoReleaser's per-target output
 // directory) so it never collides with the release `archives` stage, which
 // writes the same file name into the dist root. Its contents mirror the release
-// archive exactly: the versioned binary plus README.md (GoReleaser bundles
-// README* by default), so build-hook and release archives are interchangeable.
+// archive exactly: the versioned binary -- stored executable (mode 0755), just
+// as GoReleaser force-sets it -- plus the same auxiliary files GoReleaser
+// bundles by default (README*, LICENSE*, CHANGELOG*), so build-hook and release
+// archives are interchangeable.
 package main
 
 import (
@@ -19,7 +21,31 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 )
+
+// binaryMode mirrors GoReleaser's archive pipeline, which force-sets built
+// binaries to 0755 (config archive.BuildsInfo.Mode) regardless of the mode the
+// build host reports. Windows/NTFS reports a cross-compiled linux binary as
+// mode 0666 (no executable bit); shipping that in the linux zip makes
+// `terraform init`/`plan` fail with `fork/exec ... permission denied` once the
+// binary is installed into the filesystem mirror on a linux runner (DESIGN
+// §16.1). Forcing 0755 keeps the build-hook zip interchangeable with the
+// release archive on every build host.
+const binaryMode os.FileMode = 0o755
+
+// bundledGlobs mirrors GoReleaser's default archive `files` globs (see its
+// internal/pipe/archive Default()), so the build-hook zip bundles exactly what
+// the release `archives` stage does -- including any LICENSE*/CHANGELOG* added
+// to the repo later, which a hard-coded README-only list would silently drop.
+var bundledGlobs = []string{
+	"license*",
+	"LICENSE*",
+	"readme*",
+	"README*",
+	"changelog*",
+	"CHANGELOG*",
+}
 
 func main() {
 	if len(os.Args) != 5 {
@@ -38,10 +64,10 @@ func main() {
 	fmt.Printf("zipbin: wrote %s\n", zipPath)
 }
 
-// writeZip creates zipPath containing binPath (stored under its base name) plus
-// README.md when present, matching the release pipeline's archive layout. The
-// hook runs with the repo root as its working directory, so README.md resolves
-// relative to it.
+// writeZip creates zipPath containing binPath (stored executable under its base
+// name) plus the auxiliary files GoReleaser bundles by default, matching the
+// release pipeline's archive layout. The hook runs with the repo root as its
+// working directory, so the bundled-file globs resolve relative to it.
 func writeZip(zipPath, binPath string) error {
 	out, err := os.Create(zipPath)
 	if err != nil {
@@ -51,21 +77,61 @@ func writeZip(zipPath, binPath string) error {
 
 	zw := zip.NewWriter(out)
 
-	if err := addFile(zw, binPath, filepath.Base(binPath)); err != nil {
+	// GoReleaser adds the default bundled files first (sorted, de-duplicated by
+	// archive name) and the binary last; mirror that ordering and preserve each
+	// bundled file's on-disk mode, exactly as GoReleaser's default file entries
+	// (which carry no explicit mode) do.
+	bundled, err := bundledFiles()
+	if err != nil {
 		return err
 	}
-	// GoReleaser's default archive bundles README*; mirror that so the build-hook
-	// zip is byte-for-content identical to the release archive.
-	if _, statErr := os.Stat("README.md"); statErr == nil {
-		if err := addFile(zw, "README.md", "README.md"); err != nil {
+	for _, name := range bundled {
+		if err := addFile(zw, name, name, 0); err != nil {
 			return err
 		}
 	}
+
+	// Force the provider binary to 0755 so the linux artifact stays executable
+	// even when built on a Windows/NTFS host (see binaryMode).
+	if err := addFile(zw, binPath, filepath.Base(binPath), binaryMode); err != nil {
+		return err
+	}
+
 	return zw.Close()
 }
 
-// addFile copies srcPath into the zip under nameInZip, preserving its file mode.
-func addFile(zw *zip.Writer, srcPath, nameInZip string) error {
+// bundledFiles resolves bundledGlobs against the current (repo-root) working
+// directory into the set of regular files to bundle, de-duplicated by archive
+// name and sorted, matching how GoReleaser evaluates its default archive files.
+func bundledFiles() ([]string, error) {
+	seen := make(map[string]bool)
+	var names []string
+	for _, pattern := range bundledGlobs {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, err
+		}
+		for _, match := range matches {
+			info, err := os.Stat(match)
+			if err != nil {
+				return nil, err
+			}
+			if info.IsDir() || seen[match] {
+				continue
+			}
+			seen[match] = true
+			names = append(names, match)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// addFile copies srcPath into the zip under nameInZip. A non-zero mode is
+// force-set on the entry (mirroring GoReleaser, which forces 0755 on binaries);
+// a zero mode preserves srcPath's on-disk mode, as GoReleaser does for its
+// default bundled files.
+func addFile(zw *zip.Writer, srcPath, nameInZip string, mode os.FileMode) error {
 	in, err := os.Open(srcPath)
 	if err != nil {
 		return err
@@ -83,6 +149,9 @@ func addFile(zw *zip.Writer, srcPath, nameInZip string) error {
 	}
 	hdr.Name = nameInZip
 	hdr.Method = zip.Deflate
+	if mode != 0 {
+		hdr.SetMode(mode)
+	}
 
 	w, err := zw.CreateHeader(hdr)
 	if err != nil {
@@ -91,4 +160,3 @@ func addFile(zw *zip.Writer, srcPath, nameInZip string) error {
 	_, err = io.Copy(w, in)
 	return err
 }
-
