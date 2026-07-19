@@ -28,6 +28,7 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
     Given a labdeploy Windows single-target driven over the real local transport
     When the WSV NOD NET CAP deploy lifecycle runs on the real filesystem, plus the real W1 WinRM matrix under TF_ACC
     Then the console_app deploy reaches its version and the current handle is a real reparse point tracking the release
+    And the node, .NET and vstest toolchains verify on the target and the service control manager is reachable
     And a byte-identical re-apply is idempotent
     And on-host drift is detected and a converging re-apply restores agreement
     And a contended acquire is refused with ERR_LOCKED
@@ -38,6 +39,7 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
     Given a labdeploy Linux single-target driven over the real local transport
     When the CAP-linux console plus DRF DST IDP LCK RBK scenarios run on the real filesystem, plus the real L1 SSH matrix under TF_ACC
     Then the current symlink tracks the deployed release per DESIGN section 18
+    And the console extraction and checksum run through a real POSIX shell and the current symlink uses "ln -sfn" per DESIGN section 18
     And a byte-identical re-apply is idempotent
     And console drift is detected and a re-apply converges
     And a contended acquire is refused with ERR_LOCKED

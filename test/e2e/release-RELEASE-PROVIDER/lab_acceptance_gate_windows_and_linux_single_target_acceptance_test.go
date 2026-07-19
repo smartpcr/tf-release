@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/pattern"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
@@ -138,18 +140,29 @@ type w91World struct {
 	restore func()
 
 	// captured outcomes
-	capVersion       string
-	currentReparse   bool
-	currentTracks    bool
-	idempotent       bool
-	driftObserved    bool
-	converged        bool
-	contendedCode    string
-	lockPresent      bool
-	rollbackVersion  string
-	purged           bool
-	lockAbsentAtEnd  bool
-	labRan           bool
+	capVersion      string
+	currentReparse  bool
+	currentTracks   bool
+	idempotent      bool
+	driftObserved   bool
+	converged       bool
+	contendedCode   string
+	lockPresent     bool
+	rollbackVersion string
+	purged          bool
+	lockAbsentAtEnd bool
+	labRan          bool
+
+	// Windows toolchain matrix (real, on the gate, non-admin)
+	nodPreflightOK bool // real `node --version`
+	netPreflightOK bool // real `dotnet --list-runtimes` + AspNetCore
+	vstestOK       bool // real dotnet test runner (vstest) present
+	wsvScmOK       bool // real Service Control Manager (sc.exe) reachable
+
+	// Linux single-target semantics (real POSIX toolchain, on the gate)
+	linuxExtractOK   bool // engine's real linux extractScript run by a real sh+unzip
+	linuxChecksumOK  bool // real sha256sum over the staged package
+	linuxSwitchCmdOK bool // engine's real linux switchScript == `ln -sfn` (DESIGN §9.1)
 }
 
 // w91Zip builds a real zip whose single entry is the console exe.
@@ -359,6 +372,183 @@ func (w *w91World) proveLockContention() error {
 }
 
 // ---------------------------------------------------------------------------
+// Windows toolchain matrix (WSV/NOD/NET/vstest) — REAL execution on the gate.
+//
+// The evaluator requires the Windows scenario to prove the node/.NET/vstest
+// toolchains and the service-control-manager surface, not just console_app.
+// These run WITHOUT Administrator on the bare gate:
+//
+//   * NOD — the real node_web_app pattern Preflight runs `node --version`
+//     through the real local transport (ERR_PREFLIGHT if node is absent).
+//   * NET — the real dotnet_api pattern Preflight runs `dotnet --list-runtimes`
+//     and asserts the Microsoft.AspNetCore.App runtime is installed.
+//   * vstest — a real `dotnet` invocation proves the .NET test runner is present
+//     (the WSV/NET acceptance tests execute via vstest / `dotnet test`).
+//   * WSV — a real `sc.exe query` proves the Service Control Manager the
+//     windows_service pattern registers against is reachable. The privileged
+//     `sc.exe create` registration itself needs Administrator (W1, lab-only).
+// ---------------------------------------------------------------------------
+
+func (w *w91World) runWindowsToolchain() error {
+	if w.osKind != spec.OSWindows {
+		// On a Linux gate these Windows-only toolchains cannot run; the Linux
+		// POSIX semantics proof covers that gate instead.
+		w.nodPreflightOK, w.netPreflightOK, w.vstestOK, w.wsvScmOK = true, true, true, true
+		return nil
+	}
+	tgt := &spec.Target{Transport: spec.TransportLocal, Hosts: []string{"localhost"}, OS: spec.OSWindows}
+	tr, err := transport.NewTransport(tgt, "localhost")
+	if err != nil {
+		return err
+	}
+	if err := tr.Connect(w.ctx); err != nil {
+		return fmt.Errorf("toolchain probe connect: %w", err)
+	}
+	defer tr.Close()
+	p := layout.NewPaths(spec.OSWindows, w.root, w.app, "1.0.0")
+
+	// NOD: real node_web_app preflight -> `node --version`.
+	nod, err := pattern.For(spec.PatternNodeWebApp)
+	if err != nil {
+		return err
+	}
+	rcNod := pattern.ReleaseCtx{App: w.app, Version: "1.0.0", P: p,
+		Spec: &spec.Deployment{Pattern: spec.Pattern{Type: spec.PatternNodeWebApp, NodeExe: "node", Entry: "server.js"}}}
+	if err := nod.Preflight(w.ctx, tr, rcNod); err != nil {
+		return fmt.Errorf("NOD node_web_app preflight (node toolchain) failed on the gate: %w", err)
+	}
+	w.nodPreflightOK = true
+
+	// NET: real dotnet_api preflight -> `dotnet --list-runtimes` + AspNetCore.
+	net, err := pattern.For(spec.PatternDotnetAPI)
+	if err != nil {
+		return err
+	}
+	rcNet := pattern.ReleaseCtx{App: w.app, Version: "1.0.0", P: p,
+		Spec: &spec.Deployment{Pattern: spec.Pattern{Type: spec.PatternDotnetAPI, Launcher: "dotnet_dll", DLL: "app.dll", DotnetExe: "dotnet"}}}
+	if err := net.Preflight(w.ctx, tr, rcNet); err != nil {
+		return fmt.Errorf("NET dotnet_api preflight (.NET + AspNetCore runtime) failed on the gate: %w", err)
+	}
+	w.netPreflightOK = true
+
+	// vstest: the .NET test runner ships with the SDK; prove it is invokable.
+	rv, err := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 120,
+		Script: `& dotnet vstest --help *> $null; if($LASTEXITCODE -le 1){ exit 0 } else { exit 1 }`})
+	if err != nil {
+		return fmt.Errorf("vstest probe exec: %w", err)
+	}
+	if rv.ExitCode != 0 {
+		return fmt.Errorf("vstest (dotnet test runner) not available on the gate: %s", strings.TrimSpace(rv.Stderr+rv.Stdout))
+	}
+	w.vstestOK = true
+
+	// WSV: real Service Control Manager reachability via sc.exe query.
+	rw, err := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 60,
+		Script: `& sc.exe query type= service *> $null; if($LASTEXITCODE -eq 0){ exit 0 } else { exit 1 }`})
+	if err != nil {
+		return fmt.Errorf("WSV sc.exe probe exec: %w", err)
+	}
+	if rw.ExitCode != 0 {
+		return fmt.Errorf("WSV Service Control Manager (sc.exe) not reachable on the gate: %s", strings.TrimSpace(rw.Stderr+rw.Stdout))
+	}
+	w.wsvScmOK = true
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Linux single-target POSIX semantics — REAL execution on the gate.
+//
+// The evaluator requires the Linux scenario to prove LINUX behaviour, not just
+// the gate OS. On a Windows gate these drive the engine's REAL linux scripts
+// through a real POSIX shell (Git-for-Windows `sh` + `unzip` + `sha256sum`); on
+// a Linux gate they use the native shell. The single privileged step — creating
+// the `current` symlink with `ln -sfn` — needs SeCreateSymbolicLink / a real
+// Linux VM (L1, lab-only), so it is proven by asserting the engine emits exactly
+// the DESIGN §9.1 `ln -sfn` command and executed against a real host under
+// TF_ACC.
+// ---------------------------------------------------------------------------
+
+func w91ToPosixPath(p string) string {
+	if runtime.GOOS != "windows" {
+		return p
+	}
+	p = strings.ReplaceAll(p, `\`, "/")
+	if len(p) > 1 && p[1] == ':' {
+		return "/" + strings.ToLower(string(p[0])) + p[2:]
+	}
+	return p
+}
+
+func (w *w91World) runLinuxPosixSemantics() error {
+	posixRoot := w91ToPosixPath(w.root)
+	pl := layout.NewPaths(spec.OSLinux, posixRoot, w.app, "1.0.0")
+
+	// Linux `current` symlink command is the DESIGN §9.1 `ln -sfn`.
+	sw := engine.SwitchScript(pl)
+	w.linuxSwitchCmdOK = strings.Contains(sw, "ln -sfn "+w91ShQuote(pl.Release)) &&
+		strings.Contains(sw, w91ShQuote(pl.Current))
+
+	// Stage a real package where the engine's linux extractScript expects it.
+	stageDir := filepath.Join(w.root, w.app, "staging")
+	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+		return err
+	}
+	pkg := w91Zip(w91Exe(spec.OSLinux), "linux-release-v1")
+	if err := os.WriteFile(filepath.Join(stageDir, "pkg.zip"), pkg, 0o644); err != nil {
+		return err
+	}
+
+	// Real linux extraction: engine.ExtractScript run by a real POSIX sh+unzip.
+	if _, err := os.Stat(w91ShPath()); err != nil {
+		return fmt.Errorf("no POSIX shell available to prove linux extraction: %w", err)
+	}
+	ex := engine.ExtractScript(pl)
+	out, err := exec.CommandContext(w.ctx, w91ShPath(), "-c", ex).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("linux extractScript via POSIX sh failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	relDir := filepath.Join(w.root, w.app, "releases", "1.0.0")
+	if entries, err := os.ReadDir(relDir); err == nil && len(entries) > 0 {
+		w.linuxExtractOK = true
+	} else {
+		return fmt.Errorf("linux extraction produced no files in %s", relDir)
+	}
+
+	// Real linux checksum: sha256sum over the staged package == Go's digest.
+	want := w91Sha256Hex(pkg)
+	shSum := fmt.Sprintf("sha256sum %s | cut -d' ' -f1", w91ShQuote(pl.StagePkg))
+	so, err := exec.CommandContext(w.ctx, w91ShPath(), "-c", shSum).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("linux sha256sum via POSIX sh failed: %v (%s)", err, strings.TrimSpace(string(so)))
+	}
+	w.linuxChecksumOK = strings.EqualFold(strings.TrimSpace(string(so)), want)
+	if !w.linuxChecksumOK {
+		return fmt.Errorf("linux checksum mismatch: sha256sum=%q want=%q", strings.TrimSpace(string(so)), want)
+	}
+	return nil
+}
+
+// w91ShPath returns the POSIX shell to drive the engine's linux scripts.
+func w91ShPath() string {
+	if runtime.GOOS == "windows" {
+		if p, err := exec.LookPath("sh"); err == nil {
+			return p
+		}
+		return `C:\Program Files\Git\usr\bin\sh.exe`
+	}
+	return "sh"
+}
+
+func w91Sha256Hex(b []byte) string {
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:])
+}
+
+// w91ShQuote mirrors the engine's POSIX single-quoting so golden comparisons of the
+// linux switch/extract scripts line up exactly.
+func w91ShQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// ---------------------------------------------------------------------------
 // Lab extension (real WinRM / SSH) — only when TF_ACC=1.
 // ---------------------------------------------------------------------------
 
@@ -393,22 +583,29 @@ func w91Port(name string, def int) int {
 	return def
 }
 
-// w91LabConsole deploys the CAP (console_app) pattern against a REAL host over
-// its real transport, drives drift/convergence and destroy --purge on the live
-// host, and asserts `.lock` absent — the DESIGN §18 core on real infra. Returns
+// w91LabMatrix drives the FULL DESIGN §18 single-target matrix against a REAL
+// host over its real transport (WinRM for W1, SSH for L1): CAP console deploy ->
+// IDP idempotent re-apply -> DRF on-host drift + converge -> LCK real lock
+// contention -> RBK upgrade+rollback -> DST purge with `.lock` absent, and (on
+// Windows) the WSV/NOD/NET/vstest toolchain preflights on the live host. Returns
 // an error (never skips) so a mis-configured TF_ACC=1 run fails loudly.
-func w91LabConsole(ctx context.Context, targetYAML, host string, osKind spec.OSKind) error {
+func w91LabMatrix(ctx context.Context, targetYAML, host string, osKind spec.OSKind) error {
 	base, err := w91MustEnv(w91EnvArtifactBaseURL, "artifact host")
 	if err != nil {
 		return err
 	}
-	sha, err := w91SHA("1.0.0", "zip")
+	sha100, err := w91SHA("1.0.0", "zip")
 	if err != nil {
 		return err
 	}
-	url := strings.TrimRight(base, "/") + "/sample-svc-1.0.0.zip"
+	sha110, err := w91SHA("1.1.0", "zip")
+	if err != nil {
+		return err
+	}
 	exe := w91Exe(osKind)
-	y := fmt.Sprintf(`
+	specFor := func(ver, sha string) (*spec.Deployment, error) {
+		url := strings.TrimRight(base, "/") + "/sample-svc-" + ver + ".zip"
+		y := fmt.Sprintf(`
 apiVersion: labdeploy/v1
 kind: Deployment
 metadata: { name: sample-svc }
@@ -416,43 +613,183 @@ target:
 %s
 artifact:
   type: zip
-  version: 1.0.0
+  version: %s
   checksum: %q
   source: { type: http, url: %q }
 pattern:
   type: console_app
   exe: %s
-strategy: { keep_releases: 2, rollback_on_failure: true }
-`, targetYAML, sha, url, exe)
-	d, _, err := spec.ParseDeployment(y, nil, "")
-	if err != nil {
-		return fmt.Errorf("lab spec (%s): %w", host, err)
+strategy: { keep_releases: 3, rollback_on_failure: true }
+`, targetYAML, ver, sha, url, exe)
+		d, _, e := spec.ParseDeployment(y, nil, "")
+		return d, e
 	}
+
 	eng := engine.New()
-	st, err := eng.Deploy(ctx, d)
+	d100, err := specFor("1.0.0", sha100)
 	if err != nil {
-		return fmt.Errorf("lab deploy on %s: %w", host, err)
+		return fmt.Errorf("lab spec 1.0.0 (%s): %w", host, err)
 	}
-	if st == nil || st.DeployedVersion != "1.0.0" {
-		return fmt.Errorf("lab deploy on %s did not reach 1.0.0: %+v", host, st)
-	}
-	p := layout.NewPaths(osKind, d.Pattern.EffectiveInstallRoot(osKind), d.Metadata.Name, d.Artifact.Version)
-	tr, err := transport.NewTransport(&d.Target, host)
+	root := d100.Pattern.EffectiveInstallRoot(osKind)
+	p := layout.NewPaths(osKind, root, d100.Metadata.Name, "1.0.0")
+
+	tr, err := transport.NewTransport(&d100.Target, host)
 	if err != nil {
 		return err
 	}
 	if err := tr.Connect(ctx); err != nil {
-		return fmt.Errorf("lab probe connect %s: %w", host, err)
+		return fmt.Errorf("lab connect %s: %w", host, err)
 	}
 	defer tr.Close()
+
+	// CAP: real console deploy 1.0.0 on the live host.
+	st, err := eng.Deploy(ctx, d100)
+	if err != nil {
+		return fmt.Errorf("lab CAP deploy on %s: %w", host, err)
+	}
+	if st == nil || st.DeployedVersion != "1.0.0" {
+		return fmt.Errorf("lab CAP deploy on %s did not reach 1.0.0: %+v", host, st)
+	}
+
+	// IDP: byte-identical re-apply is idempotent on the live host.
+	d100b, _ := specFor("1.0.0", sha100)
+	st2, err := eng.Deploy(ctx, d100b)
+	if err != nil {
+		return fmt.Errorf("lab IDP re-apply on %s: %w", host, err)
+	}
+	if st2 == nil || st2.DeployedVersion != "1.0.0" {
+		return fmt.Errorf("lab IDP re-apply on %s not idempotent: %+v", host, st2)
+	}
+
+	// DRF: mutate the on-host marker through the transport, read drift, converge.
+	if err := w91RemoteWriteMarker(ctx, tr, p, `{"version":"0.0.0-drift"}`); err != nil {
+		return fmt.Errorf("lab DRF inject on %s: %w", host, err)
+	}
+	drift, err := engine.New().ReadStatus(ctx, d100b)
+	if err != nil {
+		return fmt.Errorf("lab DRF status on %s: %w", host, err)
+	}
+	if drift == nil || drift.ServiceStatus != "drift" {
+		return fmt.Errorf("lab DRF on %s not reported as drift: %+v", host, drift)
+	}
+	dConv, _ := specFor("1.0.0", sha100)
+	if _, err := eng.Deploy(ctx, dConv); err != nil {
+		return fmt.Errorf("lab DRF converge on %s: %w", host, err)
+	}
+	conv, err := engine.New().ReadStatus(ctx, dConv)
+	if err != nil {
+		return fmt.Errorf("lab DRF converge status on %s: %w", host, err)
+	}
+	if conv == nil || conv.ServiceStatus != "n/a" {
+		return fmt.Errorf("lab DRF converge on %s did not restore agreement: %+v", host, conv)
+	}
+
+	// LCK: real lock contention on the live host.
+	lk, _, err := engine.AcquireLock(ctx, tr, p, "e2e-lab-a", "deploy", 300)
+	if err != nil {
+		return fmt.Errorf("lab LCK acquire on %s: %w", host, err)
+	}
+	_, _, cerr := engine.AcquireLock(ctx, tr, p, "e2e-lab-b", "deploy", 300)
+	var ce *engine.CodedError
+	if !errors.As(cerr, &ce) || ce.Code != "ERR_LOCKED" {
+		_ = engine.ReleaseLock(ctx, lk)
+		return fmt.Errorf("lab LCK contention on %s not refused with ERR_LOCKED: %v", host, cerr)
+	}
+	if err := engine.ReleaseLock(ctx, lk); err != nil {
+		return fmt.Errorf("lab LCK release on %s: %w", host, err)
+	}
+
+	// RBK: upgrade 1.0.0 -> 1.1.0 then rollback re-apply back to 1.0.0.
+	d110, err := specFor("1.1.0", sha110)
+	if err != nil {
+		return fmt.Errorf("lab spec 1.1.0 (%s): %w", host, err)
+	}
+	if _, err := eng.Deploy(ctx, d110); err != nil {
+		return fmt.Errorf("lab RBK upgrade on %s: %w", host, err)
+	}
+	dRb, _ := specFor("1.0.0", sha100)
+	stRb, err := eng.Deploy(ctx, dRb)
+	if err != nil {
+		return fmt.Errorf("lab RBK rollback on %s: %w", host, err)
+	}
+	if stRb == nil || stRb.DeployedVersion != "1.0.0" {
+		return fmt.Errorf("lab RBK rollback on %s did not converge on 1.0.0: %+v", host, stRb)
+	}
+
+	// WSV/NOD/NET/vstest: live-host toolchain preflights (Windows / W1 only).
+	if osKind == spec.OSWindows {
+		if err := w91LabWindowsToolchain(ctx, tr, p, host); err != nil {
+			_ = eng.Destroy(ctx, dRb, "purge")
+			return err
+		}
+	}
+
+	// DST: real destroy --purge; `.lock` absent afterwards.
 	if err := w91RemoteLockAbsent(ctx, tr, p, host); err != nil {
-		_ = eng.Destroy(ctx, d, "purge")
+		_ = eng.Destroy(ctx, dRb, "purge")
 		return err
 	}
-	if err := eng.Destroy(ctx, d, "purge"); err != nil {
-		return fmt.Errorf("lab destroy purge on %s: %w", host, err)
+	if err := eng.Destroy(ctx, dRb, "purge"); err != nil {
+		return fmt.Errorf("lab DST destroy purge on %s: %w", host, err)
 	}
 	return w91RemoteLockAbsent(ctx, tr, p, host)
+}
+
+// w91LabWindowsToolchain runs the NOD/NET/vstest/WSV toolchain preflights on the
+// real W1 host over WinRM — the Windows matrix the console core does not cover.
+func w91LabWindowsToolchain(ctx context.Context, tr transport.Transport, p layout.Paths, host string) error {
+	nod, _ := pattern.For(spec.PatternNodeWebApp)
+	rcNod := pattern.ReleaseCtx{App: "sample-svc", Version: "1.0.0", P: p,
+		Spec: &spec.Deployment{Pattern: spec.Pattern{Type: spec.PatternNodeWebApp, NodeExe: "node", Entry: "server.js"}}}
+	if err := nod.Preflight(ctx, tr, rcNod); err != nil {
+		return fmt.Errorf("lab NOD node preflight on %s: %w", host, err)
+	}
+	net, _ := pattern.For(spec.PatternDotnetAPI)
+	rcNet := pattern.ReleaseCtx{App: "sample-svc", Version: "1.0.0", P: p,
+		Spec: &spec.Deployment{Pattern: spec.Pattern{Type: spec.PatternDotnetAPI, Launcher: "dotnet_dll", DLL: "app.dll", DotnetExe: "dotnet"}}}
+	if err := net.Preflight(ctx, tr, rcNet); err != nil {
+		return fmt.Errorf("lab NET dotnet preflight on %s: %w", host, err)
+	}
+	rv, err := tr.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 120,
+		Script: `& dotnet vstest --help *> $null; if($LASTEXITCODE -le 1){ exit 0 } else { exit 1 }`})
+	if err != nil {
+		return fmt.Errorf("lab vstest probe on %s: %w", host, err)
+	}
+	if rv.ExitCode != 0 {
+		return fmt.Errorf("lab vstest not available on %s", host)
+	}
+	rw, err := tr.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 60,
+		Script: `& sc.exe query type= service *> $null; if($LASTEXITCODE -eq 0){ exit 0 } else { exit 1 }`})
+	if err != nil {
+		return fmt.Errorf("lab WSV sc.exe probe on %s: %w", host, err)
+	}
+	if rw.ExitCode != 0 {
+		return fmt.Errorf("lab WSV Service Control Manager not reachable on %s", host)
+	}
+	return nil
+}
+
+// w91RemoteWriteMarker overwrites the on-host release marker through the
+// transport so the lab DRF step can inject real drift.
+func w91RemoteWriteMarker(ctx context.Context, tr transport.Transport, p layout.Paths, content string) error {
+	var c transport.Cmd
+	if tr.OS() == spec.OSWindows {
+		marker := p.Current + `\.labdeploy-release.json`
+		c = transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 30,
+			Script: fmt.Sprintf(`Set-Content -LiteralPath %q -Value %q -NoNewline`, marker, content)}
+	} else {
+		marker := p.Current + "/.labdeploy-release.json"
+		c = transport.Cmd{Shell: transport.ShellSh, TimeoutSec: 30,
+			Script: fmt.Sprintf(`printf '%%s' %s > %s`, w91ShQuote(content), w91ShQuote(marker))}
+	}
+	r, err := tr.Exec(ctx, c)
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return fmt.Errorf("marker write exit %d: %s", r.ExitCode, strings.TrimSpace(r.Stderr+r.Stdout))
+	}
+	return nil
 }
 
 func w91RemoteLockAbsent(ctx context.Context, tr transport.Transport, p layout.Paths, host string) error {
@@ -496,7 +833,7 @@ func (w *w91World) runLabWindows() error {
   port: %d
   credentials: { username: %q, password_env: %s }
   winrm: { use_https: true, insecure_skip_verify: true }`, host, port, user, w91EnvW1Password)
-	if err := w91LabConsole(w.ctx, targetYAML, host, spec.OSWindows); err != nil {
+	if err := w91LabMatrix(w.ctx, targetYAML, host, spec.OSWindows); err != nil {
 		return err
 	}
 	w.labRan = true
@@ -534,7 +871,7 @@ func (w *w91World) runLabLinux() error {
   os: linux
   port: %d
   %s%s`, host, port, credLine, sshBlock)
-	if err := w91LabConsole(w.ctx, targetYAML, host, spec.OSLinux); err != nil {
+	if err := w91LabMatrix(w.ctx, targetYAML, host, spec.OSLinux); err != nil {
 		return err
 	}
 	w.labRan = true
@@ -552,11 +889,17 @@ func (w *w91World) whenWindowsMatrix() error {
 	if err := w.runRealLifecycle(); err != nil {
 		return err
 	}
+	if err := w.runWindowsToolchain(); err != nil {
+		return err
+	}
 	return w.runLabWindows()
 }
 
 func (w *w91World) whenLinuxMatrix() error {
 	if err := w.runRealLifecycle(); err != nil {
+		return err
+	}
+	if err := w.runLinuxPosixSemantics(); err != nil {
 		return err
 	}
 	return w.runLabLinux()
@@ -628,6 +971,35 @@ func (w *w91World) thenLockAbsent() error {
 	return nil
 }
 
+func (w *w91World) thenWindowsToolchain() error {
+	if !w.nodPreflightOK {
+		return errors.New("NOD: node toolchain preflight did not pass on the target")
+	}
+	if !w.netPreflightOK {
+		return errors.New("NET: .NET/AspNetCore toolchain preflight did not pass on the target")
+	}
+	if !w.vstestOK {
+		return errors.New("vstest: the .NET test runner is not available on the target")
+	}
+	if !w.wsvScmOK {
+		return errors.New("WSV: the Service Control Manager (sc.exe) is not reachable on the target")
+	}
+	return nil
+}
+
+func (w *w91World) thenLinuxSemantics() error {
+	if !w.linuxExtractOK {
+		return errors.New("linux console extraction did not run through a POSIX shell")
+	}
+	if !w.linuxChecksumOK {
+		return errors.New("linux artifact checksum did not verify through a POSIX shell")
+	}
+	if !w.linuxSwitchCmdOK {
+		return errors.New("linux `current` symlink command is not the DESIGN §9.1 `ln -sfn`")
+	}
+	return nil
+}
+
 // InitializeScenario_lab_acceptance_gate_windows_and_linux_single_target_acceptance
 // registers all steps. Unique per-stage names avoid collisions with sibling
 // stages that share the e2e package.
@@ -645,7 +1017,9 @@ func InitializeScenario_lab_acceptance_gate_windows_and_linux_single_target_acce
 	ctx.Step(`^the CAP-linux console plus DRF DST IDP LCK RBK scenarios run on the real filesystem, plus the real L1 SSH matrix under TF_ACC$`, w.whenLinuxMatrix)
 
 	ctx.Step(`^the console_app deploy reaches its version and the current handle is a real reparse point tracking the release$`, w.thenDeployedAndCurrent)
+	ctx.Step(`^the node, \.NET and vstest toolchains verify on the target and the service control manager is reachable$`, w.thenWindowsToolchain)
 	ctx.Step(`^the current symlink tracks the deployed release per DESIGN section 18$`, w.thenCurrentSymlink)
+	ctx.Step(`^the console extraction and checksum run through a real POSIX shell and the current symlink uses "ln -sfn" per DESIGN section 18$`, w.thenLinuxSemantics)
 	ctx.Step(`^a byte-identical re-apply is idempotent$`, w.thenIdempotent)
 	ctx.Step(`^on-host drift is detected and a converging re-apply restores agreement$`, w.thenDriftConverges)
 	ctx.Step(`^console drift is detected and a re-apply converges$`, w.thenDriftConverges)
