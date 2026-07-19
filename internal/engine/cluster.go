@@ -184,13 +184,27 @@ func (e *Engine) deployCluster(ctx context.Context, s *spec.Deployment) (*Status
 	return e.clusterRollingUpdate(ctx, cc, strings.ToLower(owner))
 }
 
+// clusterAllCurrent reports whether EVERY node's manifest already matches the
+// spec version+checksum AND records a cleanly-finalized last operation. A node
+// whose last_operation.result=="failed" is NOT treated as current even when its
+// version/checksum match, so the idempotency short-circuit (IDP-02) does not fire
+// on a failed-but-current manifest. The cluster failure finalizes (U7
+// preferred-owner ordering, create C2..C4, cleanup, stop) record current=new and
+// checksum=new; without this guard clusterAllCurrent would return true, the
+// short-circuit would return a NO-OP success, the failed step would never be
+// re-attempted, and Read/ReconcileManifest would append "!failed" on every apply
+// forever — the opposite of DESIGN §10.4's "forces a converging apply". Excluding
+// the failed result re-enters clusterRollingUpdate/clusterCreate so the failed
+// operation re-runs to convergence, matching the non-cluster paths (which keep
+// current=prev on failure so re-apply likewise does not short-circuit).
 func (e *Engine) clusterAllCurrent(ctx context.Context, cc *clusterCtx) (bool, *Manifest) {
 	var first *Manifest
 	for _, h := range cc.hosts {
 		m, err := ReadManifest(ctx, cc.tr[h], cc.paths(h, cc.s.Artifact.Version))
 		if err != nil || m == nil ||
 			m.CurrentVersion != cc.s.Artifact.Version ||
-			m.ArtifactChecksum != cc.s.Artifact.Checksum {
+			m.ArtifactChecksum != cc.s.Artifact.Checksum ||
+			m.LastOperation.Result == "failed" {
 			return false, nil
 		}
 		if first == nil {
