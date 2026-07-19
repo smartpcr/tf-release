@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="e2e-smoke" tests="4" failures="1" errors="0" skipped="1" time="1.50">
+  <testcase name="login_succeeds" classname="Smoke" time="0.20"/>
+  <testcase name="dashboard_loads" classname="Smoke" time="0.30"/>
+  <testcase name="report_export" classname="Smoke" time="0.40">
+    <failure message="expected 200 got 500">stack trace here</failure>
+  </testcase>
+  <testcase name="legacy_flow" classname="Smoke" time="0.10">
+    <skipped/>
+  </testcase>
+</testsuite>

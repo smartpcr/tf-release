@@ -227,6 +227,12 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		return ok(""), nil
 
+	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
+		// Checked before the taskkill/PID case because the runner watchdog
+		// wrapper legitimately embeds `taskkill /PID ... /T /F` (process-tree
+		// kill); the runner command token must win the dispatch.
+		return transport.Result{}, fmt.Errorf("runner transport blew up")
+
 	case strings.Contains(s, "taskkill /PID"): // S2 FORCE_KILL escalation
 		f.mark("FORCE_KILL")
 		if f.fail["forcekill"] {
@@ -269,9 +275,6 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		f.mark("HEALTH")
 		return ok(""), nil
-
-	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
-		return transport.Result{}, fmt.Errorf("runner transport blew up")
 
 	case strings.Contains(s, "Rename-Item -ErrorAction Stop 'node_modules' 'node_modules.bak'"): // NodeWebApp.BackupDeps
 		if f.fail["depbackup"] {
@@ -1509,7 +1512,7 @@ func TestRunPostStagingFailureKeepsRelease(t *testing.T) {
 		t.Fatalf("test release should have been extracted; log=%v", f.log)
 	}
 	// ... but the fully-extracted release must survive the post-staging failure.
-	release := `C:\deploy\sample-svc-e2e-tests\releases\1.0.0`
+	release := `C:\deploy\_tests\sample-svc-e2e\releases\1.0.0`
 	if strings.Contains(joined, "RM "+release) {
 		t.Fatalf("post-staging failure must NOT delete the extracted release; log=%v", f.log)
 	}
@@ -1532,7 +1535,7 @@ func TestRunStagingFailureRemovesRelease(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected extract failure")
 	}
-	release := `C:\deploy\sample-svc-e2e-tests\releases\1.0.0`
+	release := `C:\deploy\_tests\sample-svc-e2e\releases\1.0.0`
 	if !strings.Contains(strings.Join(f.log, ">"), "RM "+release) {
 		t.Fatalf("pre-execution staging failure must remove the partial release; log=%v", f.log)
 	}

@@ -36,10 +36,21 @@ type Status struct {
 type Engine struct {
 	// NewTransport is swappable for fake-transport unit tests (DESIGN §17).
 	NewTransport func(t *spec.Target, host string) (transport.Transport, error)
-	Warnings     []string
+	// Now is swappable for deterministic-clock unit tests (e.g. byte-identical
+	// summary.json golden proofs). nil ⇒ time.Now.
+	Now      func() time.Time
+	Warnings []string
 }
 
 func New() *Engine { return &Engine{NewTransport: transport.NewTransport} }
+
+// now returns the engine clock (deterministic in tests, wall-clock in prod).
+func (e *Engine) now() time.Time {
+	if e.Now != nil {
+		return e.Now()
+	}
+	return time.Now()
+}
 
 func (e *Engine) warnf(format string, a ...interface{}) {
 	e.Warnings = append(e.Warnings, fmt.Sprintf(format, a...))
