@@ -228,7 +228,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	env := layout.MergeEnv(layout.BuiltinEnv(tr.Metadata.Name, tr.Artifact.Version, p, 0), tr.Runner.Env)
 	cmdline := runnerCommand(tr)
 	timeout := tr.Runner.EffectiveTimeout()
-	startedAt := time.Now()
+	startedAt := e.now()
 
 	var r transport.Result
 	var xerr error
@@ -247,7 +247,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 		script := runnerScriptLinux(workDir, cmdline, timeout)
 		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, Env: env, TimeoutSec: backstopTimeout(timeout)})
 	}
-	duration := int(time.Since(startedAt).Seconds())
+	duration := int(e.now().Sub(startedAt).Seconds())
 
 	// COLLECT (always) — results dirs + configured logs + event logs. This block
 	// runs even when the runner timed out or the transport failed, so partial
@@ -341,7 +341,7 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	out.Summary = summarize(out, exitOK, rateOK)
 	// The summary.json is a REQUIRED artifact (DESIGN §7.4); a marshal/write
 	// failure must fail the op rather than silently yield an outcome without it.
-	if werr := writeSummaryJSON(dest, tr, out, startedAt); werr != nil {
+	if werr := writeSummaryJSON(dest, tr, out, startedAt, e.now()); werr != nil {
 		return out, coded("ERR_TEST_FAILED", host, "TEST", werr)
 	}
 	return out, nil
@@ -483,7 +483,7 @@ func summarize(o *TestOutcome, exitOK, rateOK bool) string {
 // -1 counters). It RETURNS an error on marshal/write failure so the caller can
 // treat a missing required artifact as an op failure instead of silently
 // succeeding.
-func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started time.Time) error {
+func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started, finished time.Time) error {
 	passRate := computePassRate(tr.Results.Format, logs.Counters{
 		Total: o.Total, Passed: o.PassedTests, Failed: o.FailedTests, Skipped: o.SkippedTests,
 	})
@@ -505,7 +505,7 @@ func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started tim
 		},
 		"error_code":   "",
 		"started_utc":  started.UTC().Format(time.RFC3339),
-		"finished_utc": time.Now().UTC().Format(time.RFC3339),
+		"finished_utc": finished.UTC().Format(time.RFC3339),
 	}
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

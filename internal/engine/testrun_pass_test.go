@@ -162,7 +162,7 @@ func TestWriteSummaryJSON(t *testing.T) {
 	out := &TestOutcome{Passed: true, ExitCode: 0, Total: 4, PassedTests: 3, FailedTests: 0, SkippedTests: 1, DurationSeconds: 12}
 
 	dir := t.TempDir()
-	if err := writeSummaryJSON(dir, tr, out, time.Unix(0, 0)); err != nil {
+	if err := writeSummaryJSON(dir, tr, out, time.Unix(0, 0), time.Unix(0, 0)); err != nil {
 		t.Fatalf("writeSummaryJSON: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "summary.json"))
@@ -188,7 +188,7 @@ func TestWriteSummaryJSON(t *testing.T) {
 
 	// A non-existent destination dir must surface a write error, not be swallowed.
 	missing := filepath.Join(dir, "no", "such", "dir")
-	if err := writeSummaryJSON(missing, tr, out, time.Unix(0, 0)); err == nil {
+	if err := writeSummaryJSON(missing, tr, out, time.Unix(0, 0), time.Unix(0, 0)); err == nil {
 		t.Fatal("writeSummaryJSON to a non-existent dir should return an error")
 	}
 }

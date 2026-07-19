@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
@@ -151,24 +152,12 @@ func e2eTestRunWithLogs(destDir string) *spec.TestRun {
 	return tr
 }
 
-// maskVolatile replaces the three inherently non-deterministic summary.json
-// fields (wall-clock timestamps + elapsed duration) with a fixed sentinel so the
-// rest of the document can be byte-compared to a committed golden.
-func maskVolatile(t *testing.T, raw []byte) []byte {
-	t.Helper()
-	var doc map[string]interface{}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("summary.json invalid: %v", err)
-	}
-	for _, k := range []string{"duration_seconds", "started_utc", "finished_utc"} {
-		doc[k] = "MASKED"
-	}
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		t.Fatalf("re-marshal summary: %v", err)
-	}
-	return append(out, '\n')
-}
+// goldenClock is the deterministic instant injected into the engine for the
+// byte-identical golden proof: with started==finished the summary.json's
+// started_utc/finished_utc are fixed and duration_seconds is 0, so the WHOLE
+// persisted tree (including summary.json) can be byte-compared to the committed
+// snapshot with NO masking.
+func goldenClock() time.Time { return time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC) }
 
 // TestRunnerTimedOutRequiresMarker locks item 4 of the iter-2 review: a bare exit
 // code equal to timeoutSentinel is NOT a timeout — only the watchdog marker (or a
@@ -267,6 +256,7 @@ func TestRunTestCollectionBeforeFailure(t *testing.T) {
 	}
 	e := New()
 	e.NewTransport = func(_ *spec.Target, _ string) (transport.Transport, error) { return ft, nil }
+	e.Now = goldenClock // freeze the clock ⇒ summary.json is deterministic (no masking)
 
 	out, rerr := e.RunTest(context.Background(), e2eTestRunWithLogs(dest))
 	if rerr != nil {
@@ -280,40 +270,61 @@ func TestRunTestCollectionBeforeFailure(t *testing.T) {
 			out.Total, out.PassedTests, out.FailedTests, out.SkippedTests)
 	}
 
-	// Walk the GOLDEN tree; every golden file must exist in dest and be
-	// byte-identical (summary.json compared after masking volatile fields).
-	var compared int
-	err = filepath.Walk(goldenRoot, func(gp string, info os.FileInfo, werr error) error {
-		if werr != nil || info.IsDir() {
-			return werr
-		}
-		rel, err := filepath.Rel(goldenRoot, gp)
-		if err != nil {
-			return err
-		}
-		wantBytes, err := os.ReadFile(gp)
-		if err != nil {
-			return err
-		}
+	// EXACT byte-identical tree equality (evaluator iter-3 item 2). Build the set
+	// of relative paths for BOTH trees and compare in BOTH directions:
+	//   (1) every golden file exists in dest and is byte-identical, AND
+	//   (2) dest contains NO file that is absent from golden (no stray artifacts).
+	// summary.json is compared WITHOUT masking — the frozen clock makes it
+	// deterministic, so the persisted tree itself is the preservation proof.
+	goldenSet := relFileSet(t, goldenRoot)
+	destSet := relFileSet(t, dest)
+	for rel := range goldenSet {
 		gotBytes, err := os.ReadFile(filepath.Join(dest, rel))
 		if err != nil {
 			t.Fatalf("expected artifact %q missing from persisted tree: %v", rel, err)
 		}
-		if rel == "summary.json" {
-			gotBytes = maskVolatile(t, gotBytes)
+		wantBytes, err := os.ReadFile(filepath.Join(goldenRoot, rel))
+		if err != nil {
+			t.Fatalf("read golden %q: %v", rel, err)
 		}
 		if string(gotBytes) != string(wantBytes) {
 			t.Fatalf("tree file %q is NOT byte-identical to golden\n--- got ---\n%s\n--- want ---\n%s", rel, gotBytes, wantBytes)
 		}
-		compared++
+	}
+	for rel := range destSet {
+		if _, ok := goldenSet[rel]; !ok {
+			t.Fatalf("persisted tree has UNEXPECTED file %q not present in the golden snapshot", rel)
+		}
+	}
+	if len(goldenSet) != len(destSet) {
+		t.Fatalf("tree file-set size mismatch: golden=%d dest=%d (%v vs %v)", len(goldenSet), len(destSet), goldenSet, destSet)
+	}
+	if len(goldenSet) < 5 {
+		t.Fatalf("expected to compare the full results+logs+summary tree, only have %d files", len(goldenSet))
+	}
+}
+
+// relFileSet returns the set of slash-normalized file paths (relative to root)
+// for every regular file beneath root, so two trees can be compared for exact
+// set-equality in both directions.
+func relFileSet(t *testing.T, root string) map[string]bool {
+	t.Helper()
+	set := map[string]bool{}
+	err := filepath.Walk(root, func(p string, info os.FileInfo, werr error) error {
+		if werr != nil || info.IsDir() {
+			return werr
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		set[filepath.ToSlash(rel)] = true
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("walk golden: %v", err)
+		t.Fatalf("walk %q: %v", root, err)
 	}
-	if compared < 5 {
-		t.Fatalf("expected to compare the full results+logs+summary tree, only compared %d files", compared)
-	}
+	return set
 }
 
 // TestRunTestTimeoutKillsTree proves the "Timeout kills tree" scenario (DESIGN

@@ -5,18 +5,18 @@
     ],
     "min_pass_rate": 1
   },
-  "duration_seconds": "MASKED",
+  "duration_seconds": 0,
   "error_code": "",
   "exit_code": 1,
   "failed": 1,
-  "finished_utc": "MASKED",
+  "finished_utc": "2024-01-01T00:00:00Z",
   "host": "lab-01",
   "name": "smoke",
   "pass_rate": 0.6666666666666666,
   "passed": false,
   "passed_tests": 2,
   "skipped": 1,
-  "started_utc": "MASKED",
+  "started_utc": "2024-01-01T00:00:00Z",
   "total": 4,
   "version": "1.2.3"
 }

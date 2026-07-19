@@ -75,18 +75,27 @@ resource "labdeploy_e2e_test" "smoke" {
 `, deploymentSpec, e2eSpec)
 }
 
-// TestAccE2EDeploymentIDOrdersAfterDeployment is the implementation-plan.md:404
-// "deployment_id ordering under apply" proof. It runs the BUILT provider under a
-// real `terraform` binary via the terraform-plugin-testing harness (proto v6
-// reattach) and plans a config where
+// TestAccE2EDeploymentIDOrdersAfterDeployment is the plan-harness portion of the
+// implementation-plan.md:404 "deployment_id ordering under apply" proof. It runs
+// the BUILT provider under a real `terraform` binary via the terraform-plugin-
+// testing harness (proto v6 reattach) and plans a config where
 // `labdeploy_e2e_test.smoke.deployment_id = labdeploy_deployment.dep.id`.
 //
-// A PLAN is sufficient (and infra-free): if — and only if — Terraform Core built
-// the dependency edge from the reference, the deployment's not-yet-known id
-// propagates into the test's deployment_id, making it unknown ("known after
-// apply"). The plan check asserts exactly that, which proves Core orders the
-// e2e_test create after the deployment create. It self-skips unless TF_ACC=1 and
-// a terraform binary are available, so it never affects the plain `go test` gate.
+// A PLAN is sufficient (and infra-free) to prove the Terraform Core dependency
+// EDGE: if — and only if — Core built the edge from the reference, the
+// deployment's not-yet-known id propagates into the test's deployment_id, making
+// it unknown ("known after apply"). The plan check asserts exactly that, which
+// proves Core will order the e2e_test create after the deployment create.
+//
+// DEFERRED (operator decision, iter-4): observing the real Create SIDE-EFFECT
+// sequence under a *completed* apply is NOT asserted here because the provider's
+// Create dials the target host (engine.New() at the plugin-server boundary has no
+// transport seam), so a green apply needs a live lab target. That full apply-
+// ordering proof is deferred to a dedicated integration workstream with real lab
+// infra. The apply attempt below therefore fails infra-free at the transport and
+// is tolerated via ExpectError; the EDGE (not the side-effect sequence) is the
+// claim this test proves. It self-skips unless TF_ACC=1 and a terraform binary
+// are available, so it never affects the plain `go test` gate.
 func TestAccE2EDeploymentIDOrdersAfterDeployment(t *testing.T) {
 	host, namespace, name := splitAddress(t, Address)
 	if name != "labdeploy" {
