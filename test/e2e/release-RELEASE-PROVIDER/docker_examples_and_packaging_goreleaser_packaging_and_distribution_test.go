@@ -41,6 +41,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -59,6 +60,7 @@ const grBuildVersion = "0.0.0-e2e"
 type grConfig struct {
 	Builds   []grBuild   `yaml:"builds"`
 	Archives []grArchive `yaml:"archives"`
+	Snapshot grSnapshot  `yaml:"snapshot"`
 }
 
 type grBuild struct {
@@ -85,6 +87,10 @@ type grArchive struct {
 	NameTemplate string `yaml:"name_template"`
 }
 
+type grSnapshot struct {
+	VersionTemplate string `yaml:"version_template"`
+}
+
 // grBuildResult caches the one-time packaging build shared across both
 // scenarios so scenario 2 inspects the exact binaries scenario 1 produced.
 type grBuildResult struct {
@@ -92,9 +98,14 @@ type grBuildResult struct {
 	build   grBuild
 	distDir string
 	// zips maps the "<os>_<arch>" target token to the produced zip path.
-	zips           map[string]string
-	usedGoreleaser bool
-	err            error
+	zips map[string]string
+	// snapshotVersion is the version the real goreleaser --snapshot build stamps
+	// into artifact names, resolved independently of any produced artifact name
+	// (from the committed snapshot.version_template) so the name check isn't
+	// circular. Empty on the replication path, which uses grBuildVersion.
+	snapshotVersion string
+	usedGoreleaser  bool
+	err             error
 }
 
 var (
@@ -206,6 +217,7 @@ func grRunBuild() grBuildResult {
 			}
 			res.distDir = dist
 			res.usedGoreleaser = true
+			res.snapshotVersion = grSnapshotVersion(root, res.cfg)
 			grScanZips(&res)
 			return res
 		}
@@ -408,6 +420,12 @@ func (w *grWorld) snapshotBuildRuns() error {
 	if !grContains(w.res.build.Goarch, "amd64") {
 		return fmt.Errorf("goreleaser build goarch must include amd64, got %v", w.res.build.Goarch)
 	}
+	// The archive-name assertion derives the expected --snapshot version from
+	// this template (grSnapshotVersion), independently of the produced zip name,
+	// so a config that dropped it would silently defeat that check.
+	if strings.TrimSpace(w.res.cfg.Snapshot.VersionTemplate) == "" {
+		return fmt.Errorf("goreleaser config must declare snapshot.version_template so the --snapshot archive version is deterministic")
+	}
 	return nil
 }
 
@@ -442,10 +460,14 @@ func (w *grWorld) eachZipNamedAndContainsBinary() error {
 	if len(w.res.zips) == 0 {
 		return fmt.Errorf("no zips were produced by the snapshot build")
 	}
+	// The expected version is derived independently of the produced artifact
+	// names (grExpectedVersion), so a binary entry stamped with the wrong version
+	// is caught rather than compared against a version parsed back out of itself.
+	wantVersion := grExpectedVersion(w.res)
 	for token, zipPath := range w.res.zips {
 		parts := strings.SplitN(token, "_", 2)
 		goos, goarch := parts[0], parts[1]
-		binPrefix := grRender(w.res.build.Binary, grVersionFromZip(zipPath), goos, goarch, "")
+		binPrefix := grRender(w.res.build.Binary, wantVersion, goos, goarch, "")
 		// GoReleaser appends the platform executable suffix; windows binaries
 		// (both from the real tool and the faithful replication) carry `.exe`.
 		if goos == "windows" {
@@ -539,26 +561,83 @@ func grKeys(m map[string]string) []string {
 	return ks
 }
 
-// grVersionFromZip extracts the version token from a produced zip filename,
-// e.g. terraform-provider-labdeploy_v<version>_<os>_<arch>.zip.
-var grVersionRe = regexp.MustCompile(`terraform-provider-labdeploy_v(.+)_(?:linux|windows)_(?:amd64|arm64|386)\.zip$`)
+// grBaseVersion returns the semver base goreleaser derives `.Version` from for a
+// --snapshot build: the current tag with its `v` prefix stripped, or 0.0.0 when
+// the repo has no tags. It is read from git, independently of any produced
+// artifact name.
+func grBaseVersion(root string) string {
+	out, err := exec.Command("git", "-C", root, "describe", "--tags", "--abbrev=0").Output()
+	if err != nil {
+		return "0.0.0"
+	}
+	v := strings.TrimPrefix(strings.TrimSpace(string(out)), "v")
+	if v == "" {
+		return "0.0.0"
+	}
+	return v
+}
 
-func grVersionFromZip(zipPath string) string {
-	m := grVersionRe.FindStringSubmatch(filepath.Base(zipPath))
-	if m == nil {
+// grIncPatch mirrors goreleaser's `incpatch` template function (Masterminds
+// semver IncPatch): it drops any build metadata, and if the version carries a
+// prerelease it strips that without bumping, otherwise it increments the patch.
+func grIncPatch(v string) string {
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
+	}
+	pre := ""
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		pre, v = v[i+1:], v[:i]
+	}
+	parts := strings.SplitN(v, ".", 3)
+	for len(parts) < 3 {
+		parts = append(parts, "0")
+	}
+	patch, _ := strconv.Atoi(parts[2])
+	if pre == "" {
+		patch++
+	}
+	return fmt.Sprintf("%s.%s.%d", parts[0], parts[1], patch)
+}
+
+// grSnapshotVersion resolves the committed snapshot.version_template to the
+// version goreleaser stamps into a `--snapshot` build. It renders the tokens the
+// committed template uses (`{{ incpatch .Version }}` and `{{ .Version }}`) from
+// git, independently of any produced artifact name, so the archive-name
+// assertion can actually catch a wrong / mis-stamped version. It falls back to
+// grBuildVersion only when no template is declared.
+func grSnapshotVersion(root string, cfg grConfig) string {
+	tmpl := cfg.Snapshot.VersionTemplate
+	if strings.TrimSpace(tmpl) == "" {
 		return grBuildVersion
 	}
-	return m[1]
+	base := grBaseVersion(root)
+	inc := grIncPatch(base)
+	r := strings.NewReplacer(
+		"{{ incpatch .Version }}", inc, "{{incpatch .Version}}", inc,
+		"{{ .Version }}", base, "{{.Version}}", base,
+	)
+	return r.Replace(tmpl)
+}
+
+// grExpectedVersion is the version the packaging build is expected to stamp into
+// artifact names, derived independently of any produced artifact name: the fixed
+// grBuildVersion on the replication path, and the committed
+// snapshot.version_template (resolved by grSnapshotVersion) on the real
+// goreleaser --snapshot path. Deriving it independently -- rather than parsing it
+// back out of the artifact name -- is what lets the name assertions catch a
+// wrong / mis-stamped version.
+func grExpectedVersion(res *grBuildResult) string {
+	if res.usedGoreleaser && res.snapshotVersion != "" {
+		return res.snapshotVersion
+	}
+	return grBuildVersion
 }
 
 // grExpectedZipName renders the archive name_template (falling back to the
-// documented filesystem-mirror pattern) for the given target.
+// documented filesystem-mirror pattern) for the given target, using the
+// independently-known expected version.
 func grExpectedZipName(res *grBuildResult, goos, goarch string) string {
-	version := grBuildVersion
-	// When the real zip was produced by a snapshot build, honor its version.
-	if z, ok := res.zips[goos+"_"+goarch]; ok {
-		version = grVersionFromZip(z)
-	}
+	version := grExpectedVersion(res)
 	tmpl := "terraform-provider-labdeploy_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 	if len(res.cfg.Archives) > 0 && res.cfg.Archives[0].NameTemplate != "" {
 		tmpl = res.cfg.Archives[0].NameTemplate
