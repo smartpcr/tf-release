@@ -47,6 +47,7 @@ var _ transport.Transport = (*probeRecorder)(nil)
 // ERR_HEALTH_CHECK once timeout_seconds elapses — and MUST NOT run the full
 // 30/60s per-probe timeout past the budget (evaluator item 1).
 func TestHealthBudgetExhaustion(t *testing.T) {
+	realSecondHealthTick(t)
 	rec := &probeRecorder{os: spec.OSWindows, exit: 1, stdout: "connection refused"}
 	hc := &spec.HealthCheck{
 		Type:                "http",
@@ -90,6 +91,7 @@ func TestHealthBudgetExhaustion(t *testing.T) {
 // deadline and MUST NOT be allowed to complete past the budget (evaluator
 // item 1 — "still runs a probe after deadline exhaustion").
 func TestHealthHardDeadlineCancelsProbe(t *testing.T) {
+	realSecondHealthTick(t)
 	rec := &probeRecorder{os: spec.OSLinux, exit: 0, execDelay: 10 * time.Second}
 	hc := &spec.HealthCheck{
 		Type:                "tcp",
@@ -117,6 +119,7 @@ func TestHealthHardDeadlineCancelsProbe(t *testing.T) {
 // TestHealthPassesFirstProbe: a healthy probe returns nil immediately after the
 // initial delay, without waiting out the budget.
 func TestHealthPassesFirstProbe(t *testing.T) {
+	realSecondHealthTick(t)
 	rec := &probeRecorder{os: spec.OSLinux, exit: 0}
 	hc := &spec.HealthCheck{
 		Type:                "tcp",
@@ -140,6 +143,7 @@ func TestHealthPassesFirstProbe(t *testing.T) {
 // TestHealthContextCancel: a cancelled context aborts the loop with
 // ERR_HEALTH_CHECK rather than sleeping out the budget.
 func TestHealthContextCancel(t *testing.T) {
+	realSecondHealthTick(t)
 	rec := &probeRecorder{os: spec.OSLinux, exit: 1}
 	hc := &spec.HealthCheck{
 		Type:                "tcp",
