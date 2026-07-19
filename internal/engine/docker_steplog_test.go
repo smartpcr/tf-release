@@ -25,6 +25,7 @@ type dockerNode struct {
 	inspectErrAfterRun bool // `docker inspect {{.Image}}` fails only AFTER a docker run has executed
 	didRun        bool     // set once any docker run script has been dispatched
 	removeScripts []string // standalone `docker rm -f` scripts (rollback name teardown), in order
+	removeErr     bool     // standalone `docker rm -f` fails with a GENUINE (non-"No such") error
 }
 
 func (n *dockerNode) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
@@ -71,6 +72,11 @@ func (n *dockerNode) Exec(ctx context.Context, c transport.Cmd) (transport.Resul
 		// rm+run script matched the `docker run` case above, so this only fires for
 		// dc.Remove of a renamed failed container.
 		n.removeScripts = append(n.removeScripts, s)
+		if n.removeErr {
+			// Simulate the daemon REJECTING removal (not a "No such container"):
+			// exit 21 is the pattern's genuine-failure sentinel.
+			return transport.Result{ExitCode: 21, Stderr: "Error response from daemon: cannot remove container"}, nil
+		}
 		return ok(""), nil
 	}
 	return n.fakeHost.Exec(ctx, c)
@@ -521,6 +527,60 @@ func TestDockerRollbackRenamedContainerRemovesFailed(t *testing.T) {
 	m := string(n.fakeHost.files[dockerManifestPath])
 	if !strings.Contains(m, `"docker://sample-old"`) || strings.Contains(m, `"docker://sample-new"`) {
 		t.Fatalf("rolled_back manifest CurrentRelease must be the prior name docker://sample-old, not the desired name: %s", m)
+	}
+}
+
+// TestDockerRollbackRenameCleanupFailureAborts covers evaluator iter8 item 1:
+// when the failed container was started under a CHANGED name and its `docker rm
+// -f` teardown fails for a GENUINE reason (daemon rejects removal — NOT "No such
+// container"), the engine must NOT restore the old container alongside the still-
+// running failed one and must NOT report rolled_back. It must surface
+// ERR_ROLLBACK_FAILED (MACHINE IN UNKNOWN STATE) and never issue the restore run.
+func TestDockerRollbackRenameCleanupFailureAborts(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:v1img"}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	// Phase 1: land 1.0.0 under sample-old.
+	s1 := dockerSpec(t, "1.0.0")
+	s1.Pattern.ContainerName = "sample-old"
+	if _, err := eng.Deploy(context.Background(), s1); err != nil {
+		t.Fatalf("phase-1 deploy 1.0.0 should succeed: %v", err)
+	}
+
+	// Phase 2: rename to sample-new; health fails, so rollback starts — but the
+	// teardown of the failed sample-new container is REJECTED by the daemon.
+	n.runImage = "sha256:v2img"
+	n.rollbackImage = "sha256:v1img"
+	n.runScripts = nil
+	n.removeScripts = nil
+	n.removeErr = true
+	n.fakeHost.healthGate = func() bool { return n.image == "sha256:v2img" }
+
+	s2 := dockerSpec(t, "2.0.0")
+	s2.Pattern.ContainerName = "sample-new"
+	_, err := eng.Deploy(context.Background(), s2)
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_ROLLBACK_FAILED" {
+		t.Fatalf("a genuine rename-cleanup removal failure must surface ERR_ROLLBACK_FAILED, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "MACHINE IN UNKNOWN STATE host=lab-01") {
+		t.Fatalf("rollback cleanup failure must report MACHINE IN UNKNOWN STATE: %v", err)
+	}
+	// The restore run must NOT have executed — restoring next to the un-removed
+	// failed container is exactly what we must avoid.
+	for _, s := range n.runScripts {
+		if strings.Contains(s, "sha256:v1img") {
+			t.Fatalf("rollback must NOT restore the old image while the failed container removal failed:\n%s", s)
+		}
+	}
+	// The engine must NOT record a rolled_back state.
+	m := string(n.fakeHost.files[dockerManifestPath])
+	if strings.Contains(m, `"result": "rolled_back"`) {
+		t.Fatalf("a failed rename cleanup must not be recorded as rolled_back: %s", m)
+	}
+	if !strings.Contains(m, `"result": "failed"`) {
+		t.Fatalf("a failed rollback must persist a failed manifest: %s", m)
 	}
 }
 

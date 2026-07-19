@@ -200,18 +200,37 @@ func (d *DockerContainer) Snapshot(rc ReleaseCtx) DockerConfigSnapshot {
 // a `docker run`. Used on rollback to tear down a container that a failed update
 // started under a CHANGED desired name before restoring the prior container name,
 // so a name change cannot leave both the failed and the restored container
-// running (evaluator iter7 item 2). Best-effort: an absent container is not an
-// error.
+// running (evaluator iter7 item 2). Classifies via SENTINEL EXIT CODES — 0 =
+// removed, 20 = "No such container" (already absent, the desired end state), else
+// = a GENUINE removal failure (daemon rejected removal, permission, CLI error)
+// surfaced as a coded ERR_ROLLBACK_FAILED so the engine does NOT restore the old
+// container alongside the still-running failed one and does NOT record a bogus
+// rolled_back state (evaluator iter8 item 1).
 func (d *DockerContainer) Remove(ctx context.Context, t transport.Transport, name string) error {
 	qn := d.q(t, name)
 	var script string
 	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf("docker rm -f %s 2>$null | Out-Null\nexit 0", qn)
+		script = fmt.Sprintf(`$out = (docker rm -f %s 2>&1 | Out-String).Trim()
+if($LASTEXITCODE -eq 0){ exit 0 }
+if($out -match 'No such'){ exit 20 }
+[Console]::Error.Write($out); exit 21`, qn)
 	} else {
-		script = fmt.Sprintf("docker rm -f %s >/dev/null 2>&1 || true", qn)
+		script = fmt.Sprintf(`out=$(docker rm -f %s 2>&1); rc=$?
+if [ $rc -eq 0 ]; then exit 0; fi
+case "$out" in *"No such"*) exit 20;; esac
+printf '%%s' "$out" >&2; exit 21`, qn)
 	}
-	_, err := d.run(ctx, t, "ROLLBACK", script, nil, 120)
-	return err
+	r, err := d.run(ctx, t, "ROLLBACK", script, nil, 120)
+	if err != nil {
+		return err
+	}
+	switch r.ExitCode {
+	case 0, 20:
+		return nil // removed, or already absent — both leave no failed container
+	default:
+		return stepErr("ERR_ROLLBACK_FAILED", t.Host(), "ROLLBACK",
+			fmt.Errorf("docker rm -f of failed container %q failed (exit %d): %s", name, r.ExitCode, truncOut(r)))
+	}
 }
 
 func (d *DockerContainer) runArgs(t transport.Transport, rc ReleaseCtx) string {

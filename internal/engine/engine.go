@@ -575,12 +575,17 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		// about to `docker run` the old image under the PRIOR name — `RunNew` only
 		// `rm -f`s the prior name, so the failed container would survive and both
 		// would run. Tear the failed container down first (evaluator iter7 item 2).
+		// A GENUINE removal failure (daemon rejected removal) must ABORT the restore
+		// and be surfaced as a rollback failure — restoring the old container next
+		// to the still-running failed one and reporting rolled_back would be a lie
+		// (evaluator iter8 item 1). Remove treats "No such container" as success.
+		var rerr error
 		if newName := rc.Spec.Pattern.ContainerName; newName != "" && newName != rbRC.Spec.Pattern.ContainerName {
-			if remErr := dc.Remove(ctx, t, newName); remErr != nil {
-				e.warnf("docker rollback: removing failed container %q on %s: %v", newName, host, remErr)
-			}
+			rerr = dc.Remove(ctx, t, newName)
 		}
-		rerr := dc.RunNew(ctx, t, rbRC, oldImage)
+		if rerr == nil {
+			rerr = dc.RunNew(ctx, t, rbRC, oldImage)
+		}
 		if rerr == nil {
 			// HEALTH(prev): re-check with the PRIOR release's probe (carried in
 			// rbRC.Spec.HealthCheck via the snapshot), not the rejected desired one,
