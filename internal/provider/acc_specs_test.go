@@ -1353,11 +1353,53 @@ func checkSecretAbsentInLog(path, secretEnv, why string) func(*terraform.State) 
 	}
 }
 
+// scQCCaptureFromLog reconstructs the full successful `sc qc capture` TRACE record
+// from a hclog PLAIN (key=value) log. TF_LOG_PATH renders records in go-hclog's
+// plain-text mode, where a field whose VALUE contains newlines — here `sc_qc`, the
+// multi-line `sc.exe qc` output — is NOT written inline. It is emitted as an
+// indented continuation block:
+//
+//	... [TRACE] sc qc capture: service=SampleSvc host=W1
+//	  sc_qc=
+//	  | SERVICE_NAME: SampleSvc
+//	  |         SERVICE_START_NAME : .\svcuser
+//
+// so the sc.exe body (SERVICE_NAME, SERVICE_START_NAME, and any leaked secret)
+// lives on the `  | ` continuation lines, NOT on the message line. This finds the
+// first success record (the `sc qc capture failed` record is deliberately skipped)
+// and folds its `  sc_qc=` header and `  | ` continuation lines back into a single
+// string. Returns "" when no success record is present.
+func scQCCaptureFromLog(lines []string) string {
+	for i, ln := range lines {
+		if !strings.Contains(ln, "sc qc capture") || strings.Contains(ln, "sc qc capture failed") {
+			continue
+		}
+		parts := []string{ln}
+		for _, cont := range lines[i+1:] {
+			t := strings.TrimSpace(cont)
+			switch {
+			case strings.HasPrefix(t, "sc_qc="):
+				// The multi-line field header (`  sc_qc=`) — carries no value.
+			case strings.HasPrefix(t, "|"):
+				// A `  | ` continuation line — strip the prefix and keep the text.
+				parts = append(parts, strings.TrimPrefix(strings.TrimPrefix(t, "|"), " "))
+			default:
+				// First non-continuation line ends this record's block.
+				return strings.Join(parts, "\n")
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
 // checkSCQCTraceRedacted proves DESIGN §18.5 WSV-08 directly: the provider MUST
 // have emitted an `sc qc capture` record into the TRACE log (presence), and the
 // account password MUST be absent from THAT record specifically (redaction of the
-// logged capture, not merely whole-log absence). It locates the sc qc capture line
-// and asserts the secret value does not appear within it.
+// logged capture, not merely whole-log absence). It reconstructs the capture — the
+// message line PLUS its `  | ` continuation lines, since go-hclog renders the
+// multi-line sc_qc field as an indented block (see scQCCaptureFromLog) — and
+// asserts the secret value does not appear within it.
 func checkSCQCTraceRedacted(path, secretEnv, why string) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		secret := os.Getenv(secretEnv)
@@ -1368,19 +1410,14 @@ func checkSCQCTraceRedacted(path, secretEnv, why string) func(*terraform.State) 
 		if err != nil {
 			return fmt.Errorf("%s: read TRACE log: %w", why, err)
 		}
-		var capture string
-		for _, ln := range lines {
-			if strings.Contains(ln, "sc qc capture") {
-				capture = ln
-				break
-			}
-		}
+		capture := scQCCaptureFromLog(lines)
 		if capture == "" {
 			return fmt.Errorf("%s: no successful `sc qc capture` record found in the TRACE log; the provider must emit one at TRACE (DESIGN §18.5)", why)
 		}
 		// The record must carry the ACTUAL service configuration, not an empty or
 		// error capture — otherwise redaction is proven against nothing. sc.exe qc
-		// prints SERVICE_NAME and the account under SERVICE_START_NAME.
+		// prints SERVICE_NAME and the account under SERVICE_START_NAME; both live on
+		// the folded-in `  | ` continuation lines of the reconstructed capture.
 		if !strings.Contains(capture, "SERVICE_NAME") || !strings.Contains(capture, "SERVICE_START_NAME") {
 			return fmt.Errorf("%s: the `sc qc capture` record does not contain the expected sc.exe service configuration (SERVICE_NAME/SERVICE_START_NAME); capture may be empty", why)
 		}
