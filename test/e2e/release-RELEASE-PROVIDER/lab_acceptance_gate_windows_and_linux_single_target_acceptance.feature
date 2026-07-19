@@ -21,11 +21,13 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
 
   The Windows scenario ADDITIONALLY runs the node/.NET/vstest toolchains, deploys a
   node web app through the engine, RUNS it as a long-lived managed service process
-  that serves external HTTP, executes a provider vstest acceptance run, and
-  generates the winsw service wrapper (the privileged SCM `sc.exe` install needs
-  Administrator — W1, lab-only). The Linux scenario runs its FULL deploy/drift/
-  lock/rollback/purge lifecycle over ssh (the privileged NATIVE `ln -sfn` symlink
-  needs a real L1 — asserted as golden here).
+  that serves external HTTP, executes a provider vstest acceptance run, generates the
+  winsw service wrapper, and runs each real WSV/NET/NOD service pattern END-TO-END
+  through the provider engine.Deploy to the privileged service-install (CONFIGURE)
+  boundary — where the non-admin gate is refused ERR_SERVICE_INSTALL (the SCM
+  `sc.exe create` install itself needs Administrator — W1, lab-only). The Linux
+  scenario runs its FULL deploy/drift/lock/rollback/purge lifecycle over ssh (the
+  privileged NATIVE `ln -sfn` symlink needs a real L1 — asserted as golden here).
 
   This reproducible core runs on the plain `go test -tags e2e` gate with NO
   external service and NO skip. When TF_ACC=1 AND the W1/L1 connection env is
@@ -39,7 +41,7 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
     Given a labdeploy Windows single-target driven over the real local transport
     When the WSV NOD NET CAP deploy lifecycle runs on the real filesystem, plus the real W1 WinRM matrix under TF_ACC
     Then the console_app deploy reaches its version and the current handle is a real reparse point tracking the release
-    And the node, .NET and vstest toolchains verify on the target, a node web app is deployed through the provider engine and served, a provider vstest acceptance run passes, and the service control manager and generated service wrapper config are present
+    And the node, .NET and vstest toolchains verify on the target, a node web app is deployed through the provider engine and served, a provider vstest acceptance run passes, the service control manager and generated service wrapper config are present, and the real WSV NET and NOD service patterns deploy through the engine to the service-install boundary
     And a byte-identical re-apply is idempotent
     And on-host drift is detected and a converging re-apply restores agreement
     And a contended acquire is refused with ERR_LOCKED

@@ -170,6 +170,15 @@ type w91World struct {
 	vstestRan      bool // a REAL provider engine.RunTest (VSTest/dotnet test) acceptance run passed
 	wsvConfigOK    bool // the provider generated a REAL windows_service wrapper config on the target
 
+	// Real service-registering pattern deployments run end-to-end through the
+	// provider engine.Deploy to the privileged service-install (CONFIGURE)
+	// boundary. On the non-admin gate the install is refused with
+	// ERR_SERVICE_INSTALL, proving the pattern deploy executed all the way to
+	// the SCM boundary an Administrator W1 would cross.
+	wsvDeployReachedSCM bool // real windows_service pattern deploy reached `sc.exe create` (Access denied)
+	netDeployReachedSCM bool // real dotnet_api pattern deploy reached `sc.exe create` (Access denied)
+	nodDeployReachedSCM bool // real node_web_app pattern deploy reached the winsw service-install step
+
 	// Linux single-target semantics (real POSIX toolchain, on the gate)
 	linuxExtractOK   bool // engine's real linux extractScript run over the real SSH transport
 	linuxChecksumOK  bool // real sha256sum over the SSH transport
@@ -413,6 +422,7 @@ func (w *w91World) runWindowsToolchain() error {
 		w.nodPreflightOK, w.netPreflightOK, w.vstestOK, w.wsvScmOK = true, true, true, true
 		w.nodAppRan, w.vstestRan, w.wsvConfigOK = true, true, true
 		w.nodServiceRan = true
+		w.wsvDeployReachedSCM, w.netDeployReachedSCM, w.nodDeployReachedSCM = true, true, true
 		return nil
 	}
 	tgt := &spec.Target{Transport: spec.TransportLocal, Hosts: []string{"localhost"}, OS: spec.OSWindows}
@@ -513,10 +523,110 @@ func (w *w91World) runWindowsToolchain() error {
 		return fmt.Errorf("WSV provider service-wrapper config on the gate: %w", err)
 	}
 	w.wsvConfigOK = true
+
+	// WSV / NET / NOD (real service-registering pattern DEPLOYMENT to the
+	// service-install boundary): run each real service pattern END-TO-END
+	// through the provider engine.Deploy over the local Windows transport. The
+	// engine really FETCHes+CHECKSUMs+EXTRACTs the artifact, switches the
+	// `current` junction, then runs the pattern's real CONFIGURE step — which
+	// for windows_service and dotnet_api reaches the privileged Service Control
+	// Manager (`sc.exe create`) and for node_web_app reaches the winsw wrapper
+	// install. On the non-admin gate the install is refused with
+	// ERR_SERVICE_INSTALL at step=CONFIGURE, proving the full pattern deploy
+	// genuinely executes to the SCM install boundary that only an Administrator
+	// W1 crosses. This is a real pattern deployment, not a rendered XML file.
+	if err := w91DeployServicePatternToBoundary(w.ctx, w91WSVPatternYAML); err != nil {
+		return fmt.Errorf("WSV windows_service pattern deploy to SCM install boundary on the gate: %w", err)
+	}
+	w.wsvDeployReachedSCM = true
+	if err := w91DeployServicePatternToBoundary(w.ctx, w91NETPatternYAML); err != nil {
+		return fmt.Errorf("NET dotnet_api pattern deploy to SCM install boundary on the gate: %w", err)
+	}
+	w.netDeployReachedSCM = true
+	if err := w91DeployServicePatternToBoundary(w.ctx, w91NODPatternYAML); err != nil {
+		return fmt.Errorf("NOD node_web_app pattern deploy to service-install boundary on the gate: %w", err)
+	}
+	w.nodDeployReachedSCM = true
 	return nil
 }
 
-// w91NodeAppJS is a self-contained node web app: it starts an HTTP server on an
+// Pattern YAML fragments for the real service-registering pattern deployments
+// driven to the service-install (CONFIGURE) boundary. install_root is filled in
+// per-run (%q). windows_service and dotnet_api both reach the Service Control
+// Manager (`sc.exe create`); node_web_app forces the winsw wrapper and reaches
+// its install. All three are refused on the non-admin gate with
+// ERR_SERVICE_INSTALL — the exact boundary an Administrator W1 crosses.
+const (
+	w91WSVPatternYAML = "  type: windows_service\n  install_root: %q\n  service_name: LabdeployE2ESvc\n  exe: svc.exe\n  wrapper: none\n  start_type: manual"
+	w91NETPatternYAML = "  type: dotnet_api\n  install_root: %q\n  launcher: dotnet_dll\n  dll: svc.exe\n  service_name: LabdeployE2ENet"
+	w91NODPatternYAML = "  type: node_web_app\n  install_root: %q\n  node_exe: node\n  entry: svc.exe\n  service_name: LabdeployE2ENode\n  port: 8080\n  winsw_exe: winsw.exe"
+)
+
+// w91DeployServicePatternToBoundary runs a REAL service-registering pattern
+// deploy (windows_service / dotnet_api / node_web_app) end-to-end through the
+// provider engine.Deploy over the local Windows transport. The engine FETCHes
+// the artifact over HTTP, verifies its checksum, EXTRACTs it, switches the
+// `current` junction, and then runs the pattern's real CONFIGURE step — which
+// for a service pattern reaches the privileged Service Control Manager
+// (`sc.exe create`) or winsw wrapper install. On the non-admin gate that
+// install is refused, so the deploy returns ERR_SERVICE_INSTALL at
+// step=CONFIGURE. That proves the pattern deployment genuinely executes to the
+// service-install boundary; an Administrator W1 would complete the install.
+// Returns nil only when the deploy reached the CONFIGURE install boundary.
+func w91DeployServicePatternToBoundary(ctx context.Context, patYAML string) error {
+	dir, err := os.MkdirTemp("", "w91svc-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	payload := w91Zip("svc.exe", "MZ-placeholder")
+	sum := sha256.Sum256(payload)
+	sha := "sha256:" + hex.EncodeToString(sum[:])
+	mux := http.NewServeMux()
+	mux.HandleFunc("/svc-1.0.0.zip", func(rw http.ResponseWriter, r *http.Request) { _, _ = rw.Write(payload) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	y := fmt.Sprintf(`
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: w91-svc }
+target:
+  transport: local
+  hosts: ["localhost"]
+  os: windows
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: %q
+  source: { type: http, url: "%s/svc-1.0.0.zip" }
+pattern:
+`+patYAML+`
+strategy: { keep_releases: 2, rollback_on_failure: false }
+`, sha, srv.URL, dir)
+
+	d, _, err := spec.ParseDeployment(y, nil, "")
+	if err != nil {
+		return fmt.Errorf("parse service deployment spec: %w", err)
+	}
+	_, derr := engine.New().Deploy(ctx, d)
+	if derr == nil {
+		// A successful install would mean the gate unexpectedly held admin SCM
+		// rights; that is still a genuine, complete pattern deployment.
+		return nil
+	}
+	msg := derr.Error()
+	// The deploy ran the full pipeline and reached the pattern's real CONFIGURE
+	// service-install step (ERR_SERVICE_INSTALL at step=CONFIGURE). That is the
+	// privileged boundary an Administrator W1 crosses; on the non-admin gate the
+	// SCM/winsw install is refused.
+	if strings.Contains(msg, "ERR_SERVICE_INSTALL") && strings.Contains(msg, "step=CONFIGURE") {
+		return nil
+	}
+	return fmt.Errorf("service pattern deploy did not reach the CONFIGURE service-install boundary: %w", derr)
+}
+
 // ephemeral port, issues a real request to itself, asserts a 200, then exits.
 const w91NodeAppJS = `const http=require('http');
 const s=http.createServer((q,r)=>{r.writeHead(200);r.end('ok');});
@@ -1600,6 +1710,15 @@ func (w *w91World) thenWindowsToolchain() error {
 	if !w.wsvConfigOK {
 		return errors.New("WSV: the provider did not generate a real windows_service wrapper config on the target")
 	}
+	if !w.wsvDeployReachedSCM {
+		return errors.New("WSV: the real windows_service pattern deploy did not execute through to the sc.exe service-install boundary")
+	}
+	if !w.netDeployReachedSCM {
+		return errors.New("NET: the real dotnet_api pattern deploy did not execute through to the sc.exe service-install boundary")
+	}
+	if !w.nodDeployReachedSCM {
+		return errors.New("NOD: the real node_web_app pattern deploy did not execute through to the winsw service-install boundary")
+	}
 	return nil
 }
 
@@ -1636,7 +1755,7 @@ func InitializeScenario_lab_acceptance_gate_windows_and_linux_single_target_acce
 	ctx.Step(`^the CAP-linux console plus DRF DST IDP LCK RBK scenarios run on the real filesystem, plus the real L1 SSH matrix under TF_ACC$`, w.whenLinuxMatrix)
 
 	ctx.Step(`^the console_app deploy reaches its version and the current handle is a real reparse point tracking the release$`, w.thenDeployedAndCurrent)
-	ctx.Step(`^the node, \.NET and vstest toolchains verify on the target, a node web app is deployed through the provider engine and served, a provider vstest acceptance run passes, and the service control manager and generated service wrapper config are present$`, w.thenWindowsToolchain)
+	ctx.Step(`^the node, \.NET and vstest toolchains verify on the target, a node web app is deployed through the provider engine and served, a provider vstest acceptance run passes, the service control manager and generated service wrapper config are present, and the real WSV NET and NOD service patterns deploy through the engine to the service-install boundary$`, w.thenWindowsToolchain)
 	ctx.Step(`^the current symlink tracks the deployed release per DESIGN section 18$`, w.thenCurrentSymlink)
 	ctx.Step(`^the console extraction and checksum run over a real self-provisioned SSH and SFTP transport and the current symlink uses "ln -sfn" per DESIGN section 18$`, w.thenLinuxSemantics)
 	ctx.Step(`^a byte-identical re-apply is idempotent$`, w.thenIdempotent)
