@@ -402,23 +402,39 @@ exit %d`, psq(workDir), psq(cmdline), timeout*1000, timeoutMarker, timeoutSentin
 // whole group (`kill -9 -<pgid>`) when timeout is exceeded, prints the timeout
 // marker, and exits with the timeout sentinel (DESIGN §5.3; E2E-04). timeout<=0
 // runs the command unwrapped.
+//
+// The timeout is signalled DETERMINISTICALLY by the WATCHDOG itself, never
+// inferred from watchdog liveness. On expiry the watchdog echoes the marker,
+// drops a flag file, THEN force-kills the group — so once `wait $__pgid` returns
+// (the group is dead) the marker is already emitted and the flag is already
+// present, making both the marker and the sentinel exit reliable. The prior
+// `kill -0 $__watch` liveness check was racy: after the watchdog SIGKILLs the
+// group and exits it becomes an unreaped zombie, so `kill -0` still reported it
+// ALIVE; control then took the normal-exit branch, never printed the marker, and
+// exited 137 (128+9) instead of the 124 sentinel — so runnerTimedOut() saw no
+// marker/timeout error and the engine misread the timeout as an ordinary test
+// failure (violating E2E-04). On normal completion the still-sleeping watchdog
+// is cancelled (and reaped) before it can fire, so no marker/flag is produced and
+// the command's real exit code is preserved. The marker is emitted independently
+// of the flag file, so ERR_TIMEOUT is still recognized even if $TMPDIR is not
+// writable (the flag then only refines the sentinel exit code).
 func runnerScriptLinux(workDir, cmdline string, timeout int) string {
 	if timeout <= 0 {
 		return fmt.Sprintf("cd %s && %s", shq(workDir), cmdline)
 	}
 	return fmt.Sprintf(`cd %s || exit 1
+__tmo="${TMPDIR:-/tmp}/.labdeploy-timeout.$$"
+rm -f "$__tmo"
 setsid sh -c %s &
 __pgid=$!
-( sleep %d; kill -9 -$__pgid 2>/dev/null ) &
+( sleep %d; echo '%s' >&2; : > "$__tmo"; kill -9 -$__pgid 2>/dev/null ) &
 __watch=$!
 wait $__pgid
 __rc=$?
-if kill -0 $__watch 2>/dev/null; then
-  kill $__watch 2>/dev/null
-else
-  echo '%s' >&2
-  __rc=%d
-fi
+kill $__watch 2>/dev/null
+wait $__watch 2>/dev/null
+if [ -f "$__tmo" ]; then __rc=%d; fi
+rm -f "$__tmo"
 exit $__rc`, shq(workDir), shq(cmdline), timeout, timeoutMarker, timeoutSentinel)
 }
 
