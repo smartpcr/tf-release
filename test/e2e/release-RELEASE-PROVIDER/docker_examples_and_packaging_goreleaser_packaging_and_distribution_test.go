@@ -234,7 +234,10 @@ func grRunBuild() grBuildResult {
 // grReplicateBuild executes, for every goos/goarch in the build matrix, the go
 // build the config declares (with its exact env/flags/ldflags) and then runs
 // the config's real post-build hook (tools/zipbin). It returns the dist dir the
-// per-target zips were written into.
+// per-target zips were written into. The created dist dir is returned even on a
+// mid-build error (only an os.MkdirTemp failure yields ""), so the suite-level
+// t.Cleanup removing grResult.distDir never leaks the temp tree on a partial
+// build.
 func grReplicateBuild(root string, b grBuild) (string, error) {
 	dist, err := os.MkdirTemp("", "gr-e2e-dist-")
 	if err != nil {
@@ -248,7 +251,7 @@ func grReplicateBuild(root string, b grBuild) (string, error) {
 		for _, goarch := range b.Goarch {
 			targetDir := filepath.Join(dist, fmt.Sprintf("%s_%s_%s", b.ID, goos, goarch))
 			if err := os.MkdirAll(targetDir, 0o755); err != nil {
-				return "", err
+				return dist, err
 			}
 			binName := grRender(b.Binary, grBuildVersion, goos, goarch, "")
 			if goos == "windows" {
@@ -269,7 +272,7 @@ func grReplicateBuild(root string, b grBuild) (string, error) {
 			cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch)
 			cmd.Env = append(cmd.Env, b.Env...) // e.g. CGO_ENABLED=0
 			if out, err := cmd.CombinedOutput(); err != nil {
-				return "", fmt.Errorf("go build %s/%s failed: %v\n%s", goos, goarch, err, out)
+				return dist, fmt.Errorf("go build %s/%s failed: %v\n%s", goos, goarch, err, out)
 			}
 
 			// Run the config's real post-build hook (tools/zipbin), rendered
@@ -284,7 +287,7 @@ func grReplicateBuild(root string, b grBuild) (string, error) {
 				hook.Dir = root
 				hook.Env = os.Environ()
 				if out, err := hook.CombinedOutput(); err != nil {
-					return "", fmt.Errorf("post hook %q failed: %v\n%s", line, err, out)
+					return dist, fmt.Errorf("post hook %q failed: %v\n%s", line, err, out)
 				}
 			}
 		}
@@ -671,6 +674,21 @@ func InitializeScenario_docker_examples_and_packaging_goreleaser_packaging_and_d
 // TestE2E_docker_examples_and_packaging_goreleaser_packaging_and_distribution is
 // the go test entrypoint for the Stage 8.3 godog suite.
 func TestE2E_docker_examples_and_packaging_goreleaser_packaging_and_distribution(t *testing.T) {
+	// The packaging build is cached package-wide (grOnce) and writes multi-MB
+	// cross-compiled binaries + zips into either <root>/dist (real goreleaser
+	// --snapshot) or an os.MkdirTemp "gr-e2e-dist-*" dir (replication path).
+	// Register removal of that dist tree once the suite finishes so repeated
+	// `go test` runs on a long-lived gate host don't pile up artifacts.
+	// grResult.distDir is populated the first time a scenario triggers the build
+	// (grEnsureBuilt) and is set even when the replication build errors mid-way;
+	// it is "" (a no-op remove) only when no build ran. t.Cleanup runs after the
+	// test body returns, including after the t.Fatal below.
+	t.Cleanup(func() {
+		if grResult.distDir != "" {
+			_ = os.RemoveAll(grResult.distDir)
+		}
+	})
+
 	suite := godog.TestSuite{
 		ScenarioInitializer: InitializeScenario_docker_examples_and_packaging_goreleaser_packaging_and_distribution,
 		Options: &godog.Options{
