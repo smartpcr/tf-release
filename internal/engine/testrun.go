@@ -93,12 +93,13 @@ func noResultCounters() logs.Counters {
 	return logs.Counters{Total: -1, Passed: -1, Failed: -1, Skipped: -1}
 }
 
-// computePassRate is the SINGLE source of truth for pass_rate, shared by
-// evaluatePass and writeSummaryJSON so the persisted rate always agrees with the
+// computePassRate is the SINGLE source of truth for the pass_rate VALUE, shared
+// by evaluatePass and writeSummaryJSON so the persisted rate agrees with the
 // verdict (DESIGN §7.3 `pass_rate = passed/(total-skipped)`). It returns:
 //   - -1 when results.format is none|empty (nothing measured),
 //   - passed/(total-skipped) when at least one non-skipped test ran,
-//   - 0 when a format was parsed but zero tests ran (fails the gate; E2E-07),
+//   - 0 when a format was parsed but zero tests ran (rate is NOT enforced in
+//     this case — see evaluatePass — but 0 is the reported value),
 //   - 1 when tests ran but every one was skipped (no failures ⇒ vacuous pass).
 func computePassRate(format string, c logs.Counters) float64 {
 	if format != "trx" && format != "junit" {
@@ -115,11 +116,12 @@ func computePassRate(format string, c logs.Counters) float64 {
 }
 
 // evaluatePass applies pass_criteria (DESIGN §7.3) in-process: the runner exit
-// code must be in the allowed set AND — only when a result format was parsed —
-// the pass rate (see computePassRate) must be >= min_pass_rate. When
-// results.format is none the rate gate is skipped entirely (rateOK=true) and the
-// verdict rides purely on exit_codes. Pure function so it is unit-testable
-// without a transport.
+// code must be in the allowed set AND — only when a result format was parsed and
+// at least one test was reported (`total > 0`, DESIGN §7 line 372) — the pass
+// rate (see computePassRate) must be >= min_pass_rate. When results.format is
+// none OR no tests were reported, the rate gate is skipped entirely
+// (rateOK=true) and the verdict rides purely on exit_codes. Pure function so it
+// is unit-testable without a transport.
 func evaluatePass(exitCode int, format string, c logs.Counters, pc *spec.PassCriteria) (passed, exitOK, rateOK bool) {
 	for _, code := range pc.EffectiveExitCodes() {
 		if exitCode == code {
@@ -128,7 +130,9 @@ func evaluatePass(exitCode int, format string, c logs.Counters, pc *spec.PassCri
 		}
 	}
 	rateOK = true
-	if format == "trx" || format == "junit" {
+	// min_pass_rate is enforced ONLY when a format was parsed and total > 0
+	// (DESIGN §7 line 372); a zero-test run is exit-code-only.
+	if (format == "trx" || format == "junit") && c.Total > 0 {
 		rateOK = computePassRate(format, c) >= pc.EffectiveMinPassRate()
 	}
 	return exitOK && rateOK, exitOK, rateOK

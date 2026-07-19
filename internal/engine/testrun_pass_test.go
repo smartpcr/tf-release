@@ -64,10 +64,18 @@ func TestEvaluatePass(t *testing.T) {
 			pc:       spec.PassCriteria{ExitCodes: []int{7}}, passed: true, exitOK: true, rateOK: true,
 		},
 		{
-			// Zero tests discovered never clears the rate gate (E2E-07 edge).
-			name: "trx zero tests", exit: 0, format: "trx",
+			// Zero tests reported: min_pass_rate is NOT enforced (DESIGN §7 line
+			// 372 "only enforced when total>0"); verdict is exit-code-only.
+			name: "trx zero tests exit-code-only", exit: 0, format: "trx",
 			counters: logs.Counters{Total: 0, Passed: 0, Failed: 0, Skipped: 0},
-			pc:       spec.PassCriteria{}, passed: false, exitOK: true, rateOK: false,
+			pc:       spec.PassCriteria{}, passed: true, exitOK: true, rateOK: true,
+		},
+		{
+			// Zero tests reported but a failing exit code still fails the run
+			// (exit gate applies regardless of the skipped rate gate).
+			name: "trx zero tests bad exit", exit: 1, format: "trx",
+			counters: logs.Counters{Total: 0, Passed: 0, Failed: 0, Skipped: 0},
+			pc:       spec.PassCriteria{}, passed: false, exitOK: false, rateOK: true,
 		},
 		{
 			// All tests skipped (total>0, total==skipped): no failures ⇒ pass_rate
