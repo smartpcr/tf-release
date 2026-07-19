@@ -260,8 +260,10 @@ func TestClusterRollingUpdateOrderSingleMove(t *testing.T) {
 	}
 
 	// Passives updated in hosts order: the SWITCH steps emitted BEFORE the single
-	// failover belong to the passives lab-02 then lab-03 (U3), in that order. The
-	// old owner lab-01's SWITCH happens in U6 (after the move).
+	// failover must be EXACTLY the passives lab-02 then lab-03 (U3), in that order
+	// and nothing else. The old owner lab-01's SWITCH happens in U6 (after the
+	// move), so it must NOT appear here. An exact-equality check (not a
+	// subsequence) catches a premature owner switch or an out-of-order passive.
 	var preMoveSwitchHosts []string
 	for _, s := range steps {
 		if s.step == "MOVE_GROUP" {
@@ -271,11 +273,10 @@ func TestClusterRollingUpdateOrderSingleMove(t *testing.T) {
 			preMoveSwitchHosts = append(preMoveSwitchHosts, s.host)
 		}
 	}
-	assertSubsequence(t, preMoveSwitchHosts, []string{"lab-02", "lab-03"})
-	for _, h := range preMoveSwitchHosts {
-		if h == "lab-01" {
-			t.Fatalf("owner lab-01 must NOT be switched before the failover (pre-move switches=%v)", preMoveSwitchHosts)
-		}
+	wantOrder := []string{"lab-02", "lab-03"}
+	if !equalStrings(preMoveSwitchHosts, wantOrder) {
+		t.Fatalf("pre-move passive SWITCH order must be EXACTLY %v (hosts order, no owner, no dupes), got %v",
+			wantOrder, preMoveSwitchHosts)
 	}
 
 	// The role ends owned by the FIRST passive (lab-02), which is running the new
@@ -297,6 +298,121 @@ func TestClusterRollingUpdateOrderSingleMove(t *testing.T) {
 		m := string(n.fakeHost.files[`C:\deploy\sample-svc\manifest.json`])
 		if !strings.Contains(m, `"result": "success"`) || !strings.Contains(m, `"current_version": "2.0.0"`) {
 			t.Fatalf("host %s must record a success manifest at 2.0.0: %q", n.host, m)
+		}
+	}
+}
+
+// equalStrings reports whether two string slices are element-wise equal (same
+// length, same order). Used to assert exact step-order contracts.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestClusterRollingUpdateFirstNewHealthRollback covers the workstream Scenario
+// "Cluster health rollback": given a 2-node WSFC (owner lab-01, passive lab-02)
+// where the health check FAILS on `firstNew` (lab-02) at U5 immediately after the
+// single U4 failover, the engine must (DESIGN §9.5 R1..R5):
+//   1. move the role BACK to the original owner (lab-01),
+//   2. restore BOTH nodes' junctions to the PREVIOUS version (1.0.0), and
+//   3. finalize `rolled_back` manifests recording current_version=1.0.0.
+// This is distinct from TestStepLogClusterMultiHostUpdateRollback, whose health
+// fails LATER on the preferred owner after U6/U7; here the failure is on firstNew
+// at U5 (before the old owner is ever touched), which is the exact scenario the
+// acceptance criteria name.
+func TestClusterRollingUpdateFirstNewHealthRollback(t *testing.T) {
+	payload := []byte("cluster v2 zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  true, svc: "SampleSvc", owner: "lab-01", state: "Online",
+	}
+	newNode := func(host string) *clusterNode {
+		f := newFakeHost(host)
+		f.svc = "Running"
+		f.current = `C:\deploy\sample-svc\releases\1.0.0`
+		seedManifest(t, f, `C:\deploy\sample-svc\manifest.json`, &Manifest{
+			Schema: 1, App: "sample-svc", Pattern: "cluster_generic_service",
+			CurrentVersion: "1.0.0", ArtifactChecksum: "sha256:old",
+			CurrentRelease:  `C:\deploy\sample-svc\releases\1.0.0`,
+			ProviderVersion: ProviderVersion,
+			LastOperation:   LastOp{Type: "deploy", Result: "success"},
+		})
+		return &clusterNode{fakeHost: f, cl: cl}
+	}
+	n1 := newNode("lab-01")
+	n2 := newNode("lab-02")
+	// firstNew = lab-02 (the sole passive). Its health FAILS while it is on the
+	// new 2.0.0 junction (U5), and passes once its junction is restored to 1.0.0
+	// during rollback — so the failure is squarely at U5 on firstNew.
+	n2.fakeHost.healthGate = func() bool { return strings.Contains(n2.fakeHost.current, "2.0.0") }
+
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	var buf bytes.Buffer
+	ctx := tflogtest.RootLogger(context.Background(), &buf)
+	// No preferred owner ⇒ the ONLY failover before the health failure is the U4
+	// move onto firstNew; the rollback then adds the R1 move back to the owner.
+	_, err := eng.Deploy(ctx, clusterUpdateSpecHosts(t, url, sum, []string{"lab-01", "lab-02"}, ""))
+	if err == nil {
+		t.Fatal("a firstNew health failure at U5 must roll back and surface the original error")
+	}
+	if !strings.Contains(err.Error(), "rolled back to 1.0.0") {
+		t.Fatalf("expected rollback-to-previous error, got: %v", err)
+	}
+
+	// 1. Role moved BACK to the original owner lab-01.
+	if cl.owner != "lab-01" {
+		t.Fatalf("role must return to the original owner lab-01 after rollback, got owner=%q", cl.owner)
+	}
+
+	steps := captureSteps(t, &buf)
+	// Exactly two failovers: U4 forward onto firstNew, then R1 back to the owner.
+	if got := countStep(steps, "MOVE_GROUP"); got != 2 {
+		t.Fatalf("firstNew rollback must emit exactly 2 MOVE_GROUP (U4 forward + R1 back), got %d: %v",
+			got, stepNames(steps))
+	}
+	if countStep(steps, "ROLLBACK") == 0 {
+		t.Fatalf("expected a ROLLBACK step record: %v", stepNames(steps))
+	}
+
+	// 2. BOTH nodes' junctions restored to the previous version (1.0.0), none left
+	//    pointing at the new 2.0.0 release.
+	for _, n := range []*clusterNode{n1, n2} {
+		if !strings.Contains(n.fakeHost.current, "1.0.0") {
+			t.Fatalf("host %s junction must be restored to previous version 1.0.0; junction=%q",
+				n.host, n.fakeHost.current)
+		}
+		if strings.Contains(n.fakeHost.current, "2.0.0") {
+			t.Fatalf("host %s junction must NOT remain on new version 2.0.0 after rollback; junction=%q",
+				n.host, n.fakeHost.current)
+		}
+	}
+
+	// 3. Both manifests read `rolled_back` at current_version=1.0.0.
+	for _, n := range []*clusterNode{n1, n2} {
+		m := string(n.fakeHost.files[`C:\deploy\sample-svc\manifest.json`])
+		if !strings.Contains(m, `"result": "rolled_back"`) {
+			t.Fatalf("host %s manifest must record result=rolled_back: %q", n.host, m)
+		}
+		if !strings.Contains(m, `"current_version": "1.0.0"`) {
+			t.Fatalf("host %s rolled_back manifest must record current_version=1.0.0: %q", n.host, m)
+		}
+		if strings.Contains(m, `"result": "success"`) {
+			t.Fatalf("host %s must NOT record a success manifest after rollback: %q", n.host, m)
 		}
 	}
 }
