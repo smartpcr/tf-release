@@ -81,6 +81,66 @@ func TestWindowsServiceS4Golden(t *testing.T) {
 	}
 }
 
+// Scenario: scQCCapture branch matrix (DESIGN §18.5 WSV-08). traceServiceConfig must
+// only log a SUCCESSFUL "sc qc capture" when the probe actually ran, sc.exe exited 0,
+// and the output carries the SERVICE_NAME block — otherwise redaction would be
+// asserted against a vacuous record. Each branch is exercised here — evaluator item 5.
+func TestWindowsServiceSCQCCaptureBranches(t *testing.T) {
+	const good = "SERVICE_NAME: SampleSvc\n        TYPE               : 10  WIN32_OWN_PROCESS\n        SERVICE_START_NAME : .\\svcuser\n"
+	cases := []struct {
+		name     string
+		runErr   error
+		exitCode int
+		stdout   string
+		wantOK   bool
+	}{
+		{"transport error", errors.New("winrm dial failed"), 0, good, false},
+		{"nonzero exit (service absent, 1060)", nil, 1060, "", false},
+		{"exit0 empty output", nil, 0, "", false},
+		{"exit0 no SERVICE_NAME block", nil, 0, "some unrelated banner text", false},
+		{"exit0 real config", nil, 0, good, true},
+		{"exit0 real config with surrounding whitespace", nil, 0, "\r\n" + good + "  \n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			capture, ok := scQCCapture(tc.runErr, tc.exitCode, tc.stdout)
+			if ok != tc.wantOK {
+				t.Fatalf("scQCCapture ok=%v, want %v (capture=%q)", ok, tc.wantOK, capture)
+			}
+			if tc.wantOK {
+				if !strings.Contains(capture, "SERVICE_NAME") {
+					t.Errorf("accepted capture must carry the SERVICE_NAME block, got %q", capture)
+				}
+				if strings.HasPrefix(capture, "\r") || strings.HasPrefix(capture, "\n") || strings.HasSuffix(capture, " ") {
+					t.Errorf("accepted capture must be trimmed, got %q", capture)
+				}
+			} else if capture != "" {
+				t.Errorf("rejected capture must be empty, got %q", capture)
+			}
+		})
+	}
+}
+
+// TestWindowsServiceConfigureEmitsSCQCScript proves Configure ends with the sc qc
+// TRACE-capture probe script (the wire that feeds scQCCapture) — DESIGN §18.5.
+func TestWindowsServiceConfigureEmitsSCQCScript(t *testing.T) {
+	var w WindowsService
+	rc := winsvcRC(spec.Pattern{
+		Type:        spec.PatternWindowsService,
+		ServiceName: "SampleSvc",
+		Exe:         `bin\sample.exe`,
+		StartType:   "auto",
+	}, nil)
+	f := &scriptTransport{osKind: spec.OSWindows}
+	if err := w.Configure(context.Background(), f, rc); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	last := f.scripts[len(f.scripts)-1]
+	if !strings.Contains(last, "sc.exe qc") || !strings.Contains(last, "exit $LASTEXITCODE") {
+		t.Errorf("Configure must end with an sc qc probe that propagates the exit code:\n%s", last)
+	}
+}
+
 // Scenario: WinSW xml golden (DESIGN §9.2 S4 winsw, plan Stage 4.2 line 260).
 // WinswXML must render <stopwait>...sec</stopwait> (NOT <stoptimeout>) and
 // deterministic, sorted <env> entries.

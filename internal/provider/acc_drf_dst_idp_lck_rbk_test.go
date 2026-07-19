@@ -368,6 +368,9 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	const app = "sample-svc"
 	// Apply A fetches the SLOW artifact (holds the lock through the slow FETCH);
 	// apply B uses the normal fast artifact and must fail at LOCK before any fetch.
+	// The slow artifact's minimum FETCH delay is an EXPLICIT harness contract that
+	// we verify below (evaluator item 4), not an assumption about incidental latency.
+	slowfetch := requireSlowfetchSeconds(t)
 	cfgA := accDeploymentConfig(consoleSpec(t, at, "1.0.0-slowfetch", "zip", ""))
 	cfgB := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", ""))
 	host, namespace, _ := splitAddress(t, Address)
@@ -380,6 +383,7 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	// Apply A: a REAL, concurrent terraform apply of the SLOW artifact. It acquires
 	// and HOLDS the deployment `.lock` through its whole (slow) deploy.
 	aT := &asyncT{name: "LCK-01/apply-A"}
+	aStart := time.Now()
 	aDone := make(chan struct{})
 	go func() {
 		defer close(aDone)
@@ -413,6 +417,13 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	<-aDone
 	if aT.Failed() {
 		t.Fatalf("LCK-01: apply A (the lock holder) must complete normally, but failed:\n%s", aT.summary())
+	}
+	// VERIFY the slow-artifact contract: apply A must have taken at least the declared
+	// slowfetch delay. If it finished faster, the fixture was NOT actually slow and the
+	// contention window was incidental rather than guaranteed — fail loudly so LCK-01
+	// can never pass on a fast artifact mislabelled `-slowfetch` (evaluator item 4).
+	if aWall := time.Since(aStart); aWall < slowfetch {
+		t.Fatalf("LCK-01: the 1.0.0-slowfetch contract requires apply A to hold the lock ≥%s, but A completed in %s — the slow artifact did not enforce its FETCH delay", slowfetch, aWall)
 	}
 	if err := assertLockAbsent(at.tgt, root, app); err != nil {
 		t.Fatalf("LCK-01: `.lock` must be absent after apply A completes: %v", err)

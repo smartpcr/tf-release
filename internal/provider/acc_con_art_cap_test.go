@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
-
-	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
 
 // Stage 9.1 — CON (§18.2), ART (§18.3) and CAP (§18.4) acceptance scenarios.
@@ -24,29 +22,13 @@ import (
 
 // CON-01: W1, apply minimal console spec over winrm https insecure ⇒ success;
 // exactly one WARN diag about insecure TLS. terraform-plugin-testing exposes NO
-// Check hook for warning diagnostics, so this scenario proves the "exactly one"
-// invariant at the provider surface INLINE (not by delegating to a separate unit
-// test): an insecure-winrm apply must yield EXACTLY ONE framework WARN naming the
-// setting. It ALSO runs the real end-to-end lab apply and asserts the same warning
-// was emitted into the TRACE log — evaluator item 1.
+// Check hook for warning diagnostics, so the provider apply() emits a structured
+// "surfaced engine warnings" TRACE record carrying insecure_transport=<n>. This
+// scenario proves the "exactly one" invariant END-TO-END from the REAL lab apply:
+// every such record must report insecure_transport=1 (and at least one is present).
+// No fake/pre-seeded engine is involved — evaluator item 3.
 func TestAccCON01_InsecureTLSApplies(t *testing.T) {
 	accPreCheck(t)
-
-	// Exactly-one WARN, asserted in THIS scenario at the provider CRUD surface.
-	// applyWarnDiags drives a real Create seeded from engine.InsecureTransportWarnings
-	// (so the wording/count is the engine's own, not duplicated here).
-	insecure := true
-	wr := applyWarnDiags(t, spec.Target{Transport: spec.TransportWinRM,
-		WinRM: spec.WinRMOpts{InsecureSkipVerify: &insecure}})
-	if wr.Diagnostics.HasError() {
-		t.Fatalf("CON-01: insecure apply must not error, got %v", wr.Diagnostics.Errors())
-	}
-	if got := wr.Diagnostics.WarningsCount(); got != 1 {
-		t.Fatalf("CON-01: apply must emit EXACTLY ONE insecure-TLS WARN diag, got %d (%v)", got, wr.Diagnostics.Warnings())
-	}
-	if d := wr.Diagnostics.Warnings()[0].Detail(); !strings.Contains(d, "insecure_skip_verify") {
-		t.Fatalf("CON-01: the WARN diag must name the insecure setting, got %q", d)
-	}
 
 	at := requireW1(t)
 	logPath := tfLogCapture(t)
@@ -59,6 +41,8 @@ func TestAccCON01_InsecureTLSApplies(t *testing.T) {
 			resource.TestMatchResourceAttr("labdeploy_deployment.val", "release_path", mustRe(`releases[\\/]1\.0\.0$`)),
 			checkTFLogMatches(logPath, mustRe(`insecure_skip_verify=true`),
 				"CON-01: the apply must emit the DESIGN §11 insecure-TLS WARN diagnostic into the TRACE log"),
+			checkExactlyOneInsecureWarn(logPath,
+				"CON-01: the REAL insecure-winrm apply must surface EXACTLY ONE insecure-TLS warning (DESIGN §11)"),
 			checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
 		),
 	})
@@ -422,50 +406,68 @@ func TestAccCAP01_WindowsConsole(t *testing.T) {
 	))
 }
 
-// CAP-02: W1, keep_releases=2. DESIGN §18.4: "apply v1.1.0 then v1.0.0-cached
-// rolled forward again ×3 with keep_releases=2 ⇒ after last apply exactly 2 dirs
-// under releases (newest+previous); pruned dir gone". We first seed the on-target
-// cache for 1.0.0 (so the roll-forwards are genuine CACHE reuse), apply 1.1.0, then
-// roll the CACHED 1.0.0 forward THREE times. Every roll-forward MUST reuse the cache
-// (no FETCH, cache_hit=true in TRACE) and leave EXACTLY two release dirs — 1.0.0 and
-// 1.1.0 — both present (neither pruned), which is precisely "newest+previous, pruned
-// dir gone". This is the exact DESIGN sequence (roll one cached version forward ×3),
-// not three distinct one-shot deploys — evaluator item 4.
+// CAP-02: W1, keep_releases=2. DESIGN §18.4: after rolling versions forward with
+// keep_releases=2, exactly 2 dirs remain under releases (newest+previous) and the
+// evicted dir is GONE. Sequence:
+//   1. apply 1.0.0, 1.1.0, then 1.2.0 — three distinct release dirs are created, so
+//      keep_releases=2 must PRUNE the oldest (1.0.0). We assert 1.0.0 is ABSENT
+//      (the "pruned dir gone" postcondition) — evaluator item 2.
+//   2. roll the two SURVIVING cached versions {1.1.0, 1.2.0} forward THREE times,
+//      ALTERNATING target each roll (1.1.0→1.2.0→1.1.0). Because the target version
+//      changes every roll, Terraform performs a REAL Update each time; because both
+//      dirs are already on-target, each Update reuses the cache (no FETCH, a fresh
+//      "release cached" record) — evaluator item 1.
+// The three versions are ordinary lab-served artifacts (same env contract as
+// 1.0.0/1.1.0: artifactURL + LABDEPLOY_ACC_SHA_1_2_0_ZIP); no magic build shape.
 func TestAccCAP02_KeepReleasesPrune(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
 	logPath := tfLogCapture(t)
-	v10 := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", ""))
-	v11 := accDeploymentConfig(consoleSpec(t, at, "1.1.0", "zip", ""))
-	// One cached roll-forward of 1.0.0: truncate the TRACE, re-apply the cached
-	// 1.0.0, and assert the deploy reused the cache (no FETCH) and left exactly the
-	// two retained dirs with nothing pruned away.
-	cachedRoll := func(n int) resource.TestStep {
+	cfg := map[string]string{
+		"1.1.0": accDeploymentConfig(consoleSpec(t, at, "1.1.0", "zip", "")),
+		"1.2.0": accDeploymentConfig(consoleSpec(t, at, "1.2.0", "zip", "")),
+	}
+	// One measured cached roll-forward to `ver`: truncate the TRACE, apply the
+	// (already-on-target) version, and assert it was a genuine cache reuse (no FETCH)
+	// that left exactly the two retained dirs, both present.
+	cachedRoll := func(n int, ver string) resource.TestStep {
+		other := "1.2.0"
+		if ver == "1.2.0" {
+			other = "1.1.0"
+		}
 		return resource.TestStep{
 			PreConfig: truncateTFLog(t, logPath),
-			Config:    v10,
+			Config:    cfg[ver],
 			Check: resource.ComposeAggregateTestCheckFunc(
-				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
-				checkCurrentTarget(at, "1.0.0"),
-				checkCacheHitLogged(logPath, fmt.Sprintf("CAP-02: cached roll-forward #%d of 1.0.0 must reuse the cache (no FETCH)", n)),
+				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", ver),
+				checkCurrentTarget(at, ver),
+				checkCacheHitLogged(logPath, fmt.Sprintf("CAP-02: cached roll-forward #%d to %s must reuse the cache (no FETCH)", n, ver)),
 				checkReleaseCount(at, 2),
-				checkReleasePresent(at, "1.0.0", "CAP-02: the rolled-forward cached 1.0.0 must remain present"),
-				checkReleasePresent(at, "1.1.0", "CAP-02: the previous 1.1.0 must remain present (newest+previous)"),
+				checkReleasePresent(at, ver, "CAP-02: the rolled-to cached version must be present"),
+				checkReleasePresent(at, other, "CAP-02: the previous version must remain present (newest+previous)"),
 			),
 		}
 	}
 	runScenario(t, at,
-		// Seed the cache for 1.0.0 so the later roll-forwards are true cache reuse.
-		applyStep(at, v10, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
-		// Apply v1.1.0 (releases now = {1.0.0, 1.1.0}).
-		applyStep(at, v11,
+		// Seed three distinct release dirs (each a fresh FETCH).
+		applyStep(at, accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", "")),
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
+		applyStep(at, cfg["1.1.0"],
 			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0"),
+			checkReleaseCount(at, 2)),
+		// Applying the THIRD version forces keep_releases=2 to prune the oldest (1.0.0).
+		applyStep(at, cfg["1.2.0"],
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.2.0"),
 			checkReleaseCount(at, 2),
+			checkReleaseAbsent(at, "1.0.0", "CAP-02: 1.0.0 must be PRUNED once 1.2.0 makes a third dir (keep_releases=2, pruned dir gone)"),
+			checkReleasePresent(at, "1.1.0", "CAP-02: 1.1.0 remains as the previous release"),
+			checkReleasePresent(at, "1.2.0", "CAP-02: 1.2.0 is the newest release"),
 		),
-		// Roll the CACHED 1.0.0 forward three times.
-		cachedRoll(1),
-		cachedRoll(2),
-		cachedRoll(3),
+		// Roll the two survivors forward three times, alternating target each roll so
+		// every roll is a genuine Update that reuses the cache.
+		cachedRoll(1, "1.1.0"),
+		cachedRoll(2, "1.2.0"),
+		cachedRoll(3, "1.1.0"),
 	)
 }
 

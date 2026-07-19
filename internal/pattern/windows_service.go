@@ -185,22 +185,20 @@ func (w *WindowsService) traceServiceConfig(ctx context.Context, t transport.Tra
 & sc.exe qc %s | Out-String
 exit $LASTEXITCODE`, psq(svc))
 	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, nil, 60)
-	if err != nil {
-		tflog.Trace(ctx, "sc qc capture failed", map[string]interface{}{"service": svc, "host": t.Host(), "error": err.Error()})
-		return
+	exitCode := 0
+	stdout := ""
+	if err == nil {
+		exitCode, stdout = r.ExitCode, r.Stdout
 	}
-	capture := strings.TrimSpace(r.Stdout)
-	// Only accept a capture that actually carries the service configuration. An
-	// empty or error output (sc.exe non-zero, or stdout without the SERVICE_NAME
-	// block) must NOT be logged as a successful "sc qc capture", so a redaction
-	// assertion can never pass against a vacuous record (DESIGN §18.5 WSV-08).
-	if r.ExitCode != 0 || !strings.Contains(capture, "SERVICE_NAME") {
-		tflog.Trace(ctx, "sc qc capture failed", map[string]interface{}{
-			"service":   svc,
-			"host":      t.Host(),
-			"exit_code": r.ExitCode,
-			"reason":    "sc.exe qc returned no service configuration",
-		})
+	capture, ok := scQCCapture(err, exitCode, stdout)
+	if !ok {
+		fields := map[string]interface{}{"service": svc, "host": t.Host(), "exit_code": exitCode}
+		if err != nil {
+			fields["error"] = err.Error()
+		} else {
+			fields["reason"] = "sc.exe qc returned no service configuration"
+		}
+		tflog.Trace(ctx, "sc qc capture failed", fields)
 		return
 	}
 	tflog.Trace(ctx, "sc qc capture", map[string]interface{}{
@@ -208,6 +206,23 @@ exit $LASTEXITCODE`, psq(svc))
 		"host":    t.Host(),
 		"sc_qc":   capture,
 	})
+}
+
+// scQCCapture decides whether an `sc.exe qc` probe produced a usable, REAL service
+// configuration capture. It returns the trimmed capture and ok=true ONLY when the
+// probe ran (runErr==nil), sc.exe exited 0, AND the output carries the SERVICE_NAME
+// block; otherwise ok=false so the caller logs a failure rather than a vacuous
+// "successful" capture that a redaction assertion could pass against (DESIGN §18.5
+// WSV-08). Kept as a pure function so every branch is unit-testable.
+func scQCCapture(runErr error, exitCode int, stdout string) (string, bool) {
+	if runErr != nil {
+		return "", false
+	}
+	capture := strings.TrimSpace(stdout)
+	if exitCode != 0 || !strings.Contains(capture, "SERVICE_NAME") {
+		return "", false
+	}
+	return capture, true
 }
 
 // writeServiceEnv = S5: HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Environment.

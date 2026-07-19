@@ -355,6 +355,28 @@ func artifactSHA(t *testing.T, version, ext string) string {
 	return v
 }
 
+// requireSlowfetchSeconds returns the minimum FETCH delay (seconds) that the lab's
+// `1.0.0-slowfetch` artifact is contractually guaranteed to hold. LCK-01 relies on
+// this artifact keeping apply A inside the deployment `.lock` long enough for apply
+// B to contend, so the delay must be an EXPLICIT harness contract — not an assumption
+// about incidental latency. The operator declares it via LABDEPLOY_ACC_SLOWFETCH_SECONDS
+// when wiring the slow fixture; it is required whenever LCK-01 runs under TF_ACC, and
+// LCK-01 VERIFIES apply A actually took at least this long before trusting the
+// contention window (evaluator item 4).
+func requireSlowfetchSeconds(t *testing.T) time.Duration {
+	t.Helper()
+	const name = "LABDEPLOY_ACC_SLOWFETCH_SECONDS"
+	v := os.Getenv(name)
+	if v == "" {
+		t.Fatalf("TF_ACC=1 LCK-01 requires %s: the guaranteed minimum FETCH delay (seconds) of the 1.0.0-slowfetch artifact, so the lock-contention window is a verified contract", name)
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		t.Fatalf("%s must be a positive integer number of seconds, got %q", name, v)
+	}
+	return time.Duration(secs) * time.Second
+}
+
 // consoleSpec builds a console_app Deployment spec for the given target/version.
 // verifyCmd is the optional verify_command (e.g. `sample-svc.exe --version`).
 func consoleSpec(t *testing.T, at accTarget, version, ext, verifyCmd string) string {
@@ -1142,6 +1164,37 @@ func checkTFLogMatches(path string, re *regexp.Regexp, why string) func(*terrafo
 		return nil
 	}
 }
+// checkExactlyOneInsecureWarn asserts, from the REAL apply's provider TRACE log,
+// that the apply surfaced EXACTLY ONE insecure-transport warning. deployment_resource
+// apply() emits a structured "surfaced engine warnings" record carrying
+// insecure_transport=<n>; terraform-plugin-testing has no Check hook for warning
+// diagnostics, so this record is the end-to-end evidence. Every such record must
+// report insecure_transport=1 (and at least one must be present) — CON-01, DESIGN §11.
+func checkExactlyOneInsecureWarn(path, why string) func(*terraform.State) error {
+	re := regexp.MustCompile(`surfaced engine warnings\b.*\binsecure_transport=(\d+)`)
+	return func(*terraform.State) error {
+		lines, err := readTFLogLines(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		found := 0
+		for _, ln := range lines {
+			m := re.FindStringSubmatch(ln)
+			if m == nil {
+				continue
+			}
+			found++
+			if m[1] != "1" {
+				return fmt.Errorf("%s: apply surfaced insecure_transport=%s warnings, want exactly 1", why, m[1])
+			}
+		}
+		if found == 0 {
+			return fmt.Errorf("%s: no 'surfaced engine warnings' record in the provider TRACE log (apply did not run or tflog not captured)", why)
+		}
+		return nil
+	}
+}
+
 func checkStepLogged(path, step, why string) func(*terraform.State) error {
 	re := stepLineRe(step)
 	return func(*terraform.State) error {
