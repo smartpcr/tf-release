@@ -1,5 +1,5 @@
-printf '%s' "$LD_REG_PW" | docker login registry.example.com -u 'svc' --password-stdin || { echo 'docker login failed' >&2; exit 40; }
+printf '%s' "$LD_REG_PW" | docker login 'registry.example.com' -u 'svc' --password-stdin || { echo 'docker login failed' >&2; exit 40; }
 docker pull 'registry.example.com/app:2.0.0'; code=$?
-docker logout registry.example.com >/dev/null 2>&1 || true
+docker logout 'registry.example.com' >/dev/null 2>&1 || true
 [ $code -eq 0 ] || exit 40
 exit 0

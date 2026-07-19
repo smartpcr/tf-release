@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -20,6 +21,9 @@ type dockerNode struct {
 	pullErr       bool
 	runErr        bool     // docker run fails for BOTH the new ref and the rollback ref
 	runScripts    []string // every `docker run` script, in order (new ref then rollback ref)
+	inspectErr    bool     // ALL `docker inspect {{.Image}}` probes fail with a transport error
+	inspectErrAfterRun bool // `docker inspect {{.Image}}` fails only AFTER a docker run has executed
+	didRun        bool     // set once any docker run script has been dispatched
 }
 
 func (n *dockerNode) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
@@ -31,6 +35,12 @@ func (n *dockerNode) Exec(ctx context.Context, c transport.Cmd) (transport.Resul
 		}
 		return ok(""), nil
 	case strings.Contains(s, "docker inspect") && strings.Contains(s, "{{.Image}}"):
+		// Simulate a genuine transport failure of the D3 inspect. inspectErr fails
+		// the PRE-run probe (rollback anchor cannot be recorded); inspectErrAfterRun
+		// fails only the POST-run probe (new container already running).
+		if n.inspectErr || (n.inspectErrAfterRun && n.didRun) {
+			return transport.Result{}, fmt.Errorf("transport: docker inspect unreachable")
+		}
 		return ok(n.image), nil
 	case strings.Contains(s, "docker inspect") && strings.Contains(s, "{{.State.Running}}"):
 		if n.image == "" {
@@ -39,6 +49,7 @@ func (n *dockerNode) Exec(ctx context.Context, c transport.Cmd) (transport.Resul
 		return ok("running"), nil
 	case strings.Contains(s, "docker run"):
 		n.runScripts = append(n.runScripts, s)
+		n.didRun = true
 		if n.runErr {
 			return transport.Result{ExitCode: 44, Stderr: "run failed"}, nil
 		}
@@ -231,6 +242,102 @@ func TestDockerHealthFailureRollsBackPrevVersion(t *testing.T) {
 	// The new-version run advertised 2.0.0 (sanity).
 	if !strings.Contains(n.runScripts[0], "LD_VERSION=2.0.0") {
 		t.Errorf("new-version run must advertise LD_VERSION=2.0.0:\n%s", n.runScripts[0])
+	}
+}
+
+// dockerSpecPorts is dockerSpec plus explicit container ports, letting a test
+// mutate the container CONFIGURATION at a fixed version (evaluator iter3 item 3).
+func dockerSpecPorts(t *testing.T, version string, ports ...string) *spec.Deployment {
+	t.Helper()
+	d := dockerSpec(t, version)
+	d.Pattern.Ports = ports
+	return d
+}
+
+// TestDockerPreRunInspectErrorAbortsBeforeRemoval covers evaluator iter3 item 1:
+// when the PRE-run D3 inspect fails with a transport error, the engine must abort
+// BEFORE D4 `rm -f`/`docker run` — removing the live container without a recorded
+// rollback image would strand the target. No run script must execute and no
+// success manifest may be written.
+func TestDockerPreRunInspectErrorAbortsBeforeRemoval(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "sha256:live", inspectErr: true}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	_, err := eng.Deploy(context.Background(), dockerSpec(t, "2.0.0"))
+	if err == nil {
+		t.Fatal("a failed pre-run D3 inspect must abort the deploy")
+	}
+	if len(n.runScripts) != 0 {
+		t.Fatalf("no container may be removed/run when the rollback image could not be recorded; runScripts=%v", n.runScripts)
+	}
+	if m := string(n.fakeHost.files[dockerManifestPath]); strings.Contains(m, `"result": "success"`) {
+		t.Fatalf("must not persist a success manifest after a pre-run inspect failure: %s", m)
+	}
+}
+
+// TestDockerPostRunInspectFailurePersistsNewVersionFailedState covers evaluator
+// iter3 item 2: when the POST-run inspect fails, the new container is ALREADY
+// running, so the engine must not simply error while Terraform still points at
+// the old version. It must persist a FAILED manifest at the NEW version so Read
+// reports drift and a re-apply reconverges, and surface a coded FINALIZE error.
+func TestDockerPostRunInspectFailurePersistsNewVersionFailedState(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:newimg", inspectErrAfterRun: true}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	_, err := eng.Deploy(context.Background(), dockerSpec(t, "2.0.0"))
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_CONNECT" || ce.Step != "FINALIZE" {
+		t.Fatalf("post-run inspect failure must surface a FINALIZE/ERR_CONNECT coded error, got %v", err)
+	}
+	if len(n.runScripts) == 0 {
+		t.Fatalf("the new container must have been started before the post-run inspect: runScripts=%v", n.runScripts)
+	}
+	m := string(n.fakeHost.files[dockerManifestPath])
+	if m == "" {
+		t.Fatalf("a post-run inspect failure must persist a failed manifest for reconvergence; none written (log=%v)", n.fakeHost.log)
+	}
+	if !strings.Contains(m, `"current_version": "2.0.0"`) || !strings.Contains(m, `"result": "failed"`) {
+		t.Fatalf("failed manifest must record the NEW version 2.0.0 with result=failed (so Read shows drift): %s", m)
+	}
+	if strings.Contains(m, `"result": "success"`) {
+		t.Fatalf("must not record success when the image id could not be inspected: %s", m)
+	}
+}
+
+// TestDockerSameVersionConfigChangeRedeploys covers evaluator iter3 item 3: a
+// same-version change to the container configuration (here: ports) must NOT be a
+// silent no-op. Idempotency is keyed off ConfigFingerprint, so an identical spec
+// re-applies as a no-op while a changed spec triggers a fresh docker run.
+func TestDockerSameVersionConfigChangeRedeploys(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:img"}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	// Phase 1: initial deploy of 2.0.0 with a single port.
+	if _, err := eng.Deploy(context.Background(), dockerSpecPorts(t, "2.0.0", "8080:8080")); err != nil {
+		t.Fatalf("phase-1 deploy should succeed: %v", err)
+	}
+	afterFirst := len(n.runScripts)
+	if afterFirst == 0 {
+		t.Fatalf("phase-1 must have run the container")
+	}
+
+	// Phase 2: identical spec ⇒ true no-op (same version, same fingerprint, running).
+	if _, err := eng.Deploy(context.Background(), dockerSpecPorts(t, "2.0.0", "8080:8080")); err != nil {
+		t.Fatalf("phase-2 identical re-apply should succeed: %v", err)
+	}
+	if len(n.runScripts) != afterFirst {
+		t.Fatalf("identical same-version re-apply must be a no-op (no new docker run); runs %d→%d", afterFirst, len(n.runScripts))
+	}
+
+	// Phase 3: same version but a CHANGED port ⇒ different fingerprint ⇒ redeploy.
+	if _, err := eng.Deploy(context.Background(), dockerSpecPorts(t, "2.0.0", "8080:8080", "9090:9090")); err != nil {
+		t.Fatalf("phase-3 config-change re-apply should succeed: %v", err)
+	}
+	if len(n.runScripts) <= afterFirst {
+		t.Fatalf("a same-version CONFIG change must redeploy (new docker run), but runs stayed %d", len(n.runScripts))
 	}
 }
 

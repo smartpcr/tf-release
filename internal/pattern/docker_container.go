@@ -2,6 +2,8 @@ package pattern
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"sort"
@@ -55,7 +57,10 @@ func imageRef(a *spec.Artifact) string {
 	return src.Image + ":" + tag
 }
 
-// Pull = D1+D2 (+D7 logout). Login credentials travel via env/stdin only.
+// Pull = D1+D2 (+D7 logout). Login credentials travel via env/stdin only. Every
+// interpolated value (registry, username, image ref) is single-quoted for the
+// target shell via `q` so registry/image/user metacharacters cannot be
+// interpreted (DESIGN §9.6 D1/D2).
 func (d *DockerContainer) Pull(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
 	a := &rc.Spec.Artifact
 	ref := imageRef(a)
@@ -67,15 +72,21 @@ func (d *DockerContainer) Pull(ctx context.Context, t transport.Transport, rc Re
 	login, logout := "", ""
 	if a.Source.Auth.Username != "" && a.Source.Auth.PasswordEnv != "" {
 		env["LD_REG_PW"] = os.Getenv(a.Source.Auth.PasswordEnv)
+		regArg := ""
+		if registry != "" {
+			regArg = " " + d.q(t, registry)
+		}
+		user := d.q(t, a.Source.Auth.Username)
 		if t.OS() == spec.OSWindows {
-			login = fmt.Sprintf(`$env:LD_REG_PW | docker login %s -u %s --password-stdin
-if($LASTEXITCODE -ne 0){ Write-Error 'docker login failed'; exit 40 }`, registry, psq(a.Source.Auth.Username))
-			logout = fmt.Sprintf("docker logout %s | Out-Null", registry)
+			login = fmt.Sprintf(`$env:LD_REG_PW | docker login%s -u %s --password-stdin
+if($LASTEXITCODE -ne 0){ Write-Error 'docker login failed'; exit 40 }`, regArg, user)
+			logout = fmt.Sprintf("docker logout%s | Out-Null", regArg)
 		} else {
-			login = fmt.Sprintf(`printf '%%s' "$LD_REG_PW" | docker login %s -u '%s' --password-stdin || { echo 'docker login failed' >&2; exit 40; }`, registry, a.Source.Auth.Username)
-			logout = fmt.Sprintf("docker logout %s >/dev/null 2>&1 || true", registry)
+			login = fmt.Sprintf(`printf '%%s' "$LD_REG_PW" | docker login%s -u %s --password-stdin || { echo 'docker login failed' >&2; exit 40; }`, regArg, user)
+			logout = fmt.Sprintf("docker logout%s >/dev/null 2>&1 || true", regArg)
 		}
 	}
+	qref := d.q(t, ref)
 	var script string
 	if t.OS() == spec.OSWindows {
 		script = fmt.Sprintf(`%s
@@ -83,13 +94,13 @@ docker pull %s
 $code=$LASTEXITCODE
 %s
 if($code -ne 0){ exit 40 }
-exit 0`, login, ref, logout)
+exit 0`, login, qref, logout)
 	} else {
 		script = fmt.Sprintf(`%s
-docker pull '%s'; code=$?
+docker pull %s; code=$?
 %s
 [ $code -eq 0 ] || exit 40
-exit 0`, login, ref, logout)
+exit 0`, login, qref, logout)
 	}
 	r, err := d.run(ctx, t, "FETCH", script, env, 1800)
 	if err != nil {
@@ -103,14 +114,14 @@ exit 0`, login, ref, logout)
 
 // CurrentImageID = D3, "" when container absent.
 func (d *DockerContainer) CurrentImageID(ctx context.Context, t transport.Transport, rc ReleaseCtx) (string, error) {
-	name := rc.Spec.Pattern.ContainerName
+	qn := d.q(t, rc.Spec.Pattern.ContainerName)
 	var script string
 	if t.OS() == spec.OSWindows {
 		script = fmt.Sprintf(`docker inspect -f '{{.Image}}' %s 2>$null
 if($LASTEXITCODE -ne 0){ Write-Output '' }
-exit 0`, name)
+exit 0`, qn)
 	} else {
-		script = fmt.Sprintf(`docker inspect -f '{{.Image}}' '%s' 2>/dev/null || echo ''`, name)
+		script = fmt.Sprintf(`docker inspect -f '{{.Image}}' %s 2>/dev/null || echo ''`, qn)
 	}
 	r, err := d.run(ctx, t, "STAGE", script, nil, 60)
 	if err != nil {
@@ -126,7 +137,7 @@ func (d *DockerContainer) runArgs(t transport.Transport, rc ReleaseCtx) string {
 		restart = "unless-stopped"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "-d --name %s --restart %s", d.q(t, p.ContainerName), restart)
+	fmt.Fprintf(&b, "-d --name %s --restart %s", d.q(t, p.ContainerName), d.q(t, restart))
 	for _, pt := range p.Ports {
 		fmt.Fprintf(&b, " -p %s", d.q(t, pt))
 	}
@@ -192,12 +203,12 @@ func (d *DockerContainer) Configure(ctx context.Context, t transport.Transport, 
 }
 
 func (d *DockerContainer) Stop(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
-	name := rc.Spec.Pattern.ContainerName
+	qn := d.q(t, rc.Spec.Pattern.ContainerName)
 	var script string
 	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf("docker stop %s 2>$null | Out-Null\nexit 0", name)
+		script = fmt.Sprintf("docker stop %s 2>$null | Out-Null\nexit 0", qn)
 	} else {
-		script = fmt.Sprintf("docker stop '%s' >/dev/null 2>&1 || true", name)
+		script = fmt.Sprintf("docker stop %s >/dev/null 2>&1 || true", qn)
 	}
 	_, err := d.run(ctx, t, "STOP", script, nil, 120)
 	return err
@@ -208,16 +219,16 @@ func (d *DockerContainer) Start(ctx context.Context, t transport.Transport, rc R
 }
 
 func (d *DockerContainer) Status(ctx context.Context, t transport.Transport, rc ReleaseCtx) (string, error) {
-	name := rc.Spec.Pattern.ContainerName
+	qn := d.q(t, rc.Spec.Pattern.ContainerName)
 	var script string
 	if t.OS() == spec.OSWindows {
 		script = fmt.Sprintf(`$s = docker inspect -f '{{.State.Running}}' %s 2>$null
 if($LASTEXITCODE -ne 0){ Write-Output 'not_installed'; exit 0 }
 if($s -match 'true'){ Write-Output 'running' } else { Write-Output 'stopped' }
-exit 0`, name)
+exit 0`, qn)
 	} else {
-		script = fmt.Sprintf(`s=$(docker inspect -f '{{.State.Running}}' '%s' 2>/dev/null) || { echo not_installed; exit 0; }
-[ "$s" = "true" ] && echo running || echo stopped`, name)
+		script = fmt.Sprintf(`s=$(docker inspect -f '{{.State.Running}}' %s 2>/dev/null) || { echo not_installed; exit 0; }
+[ "$s" = "true" ] && echo running || echo stopped`, qn)
 	}
 	r, err := d.run(ctx, t, "STATUS", script, nil, 60)
 	if err != nil {
@@ -227,13 +238,53 @@ exit 0`, name)
 }
 
 func (d *DockerContainer) Uninstall(ctx context.Context, t transport.Transport, rc ReleaseCtx, purge bool) error {
-	name := rc.Spec.Pattern.ContainerName
+	qn := d.q(t, rc.Spec.Pattern.ContainerName)
 	var script string
 	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf("docker rm -f %s 2>$null | Out-Null\nexit 0", name)
+		script = fmt.Sprintf("docker rm -f %s 2>$null | Out-Null\nexit 0", qn)
 	} else {
-		script = fmt.Sprintf("docker rm -f '%s' >/dev/null 2>&1 || true", name)
+		script = fmt.Sprintf("docker rm -f %s >/dev/null 2>&1 || true", qn)
 	}
 	_, err := d.run(ctx, t, "CONFIGURE", script, nil, 120)
 	return err
+}
+
+// ConfigFingerprint hashes the MUTABLE docker_container settings — image ref
+// (tag or digest), container name, restart policy, ports, volumes, run_args and
+// the rendered env — so the engine can tell a same-version CONFIGURATION change
+// (new tag/digest, ports, env, volumes, restart, run args) apart from a true
+// no-op and avoid silently ignoring it (DESIGN §10.1). Ports/volumes/env are
+// order-normalized; run_args keep author order (docker flag order is meaningful).
+func (d *DockerContainer) ConfigFingerprint(rc ReleaseCtx) string {
+	p := rc.Spec.Pattern
+	restart := p.RestartPolicy
+	if restart == "" {
+		restart = "unless-stopped"
+	}
+	h := sha256.New()
+	fmt.Fprintf(h, "ref=%s\n", imageRef(&rc.Spec.Artifact))
+	fmt.Fprintf(h, "name=%s\n", p.ContainerName)
+	fmt.Fprintf(h, "restart=%s\n", restart)
+	ports := append([]string(nil), p.Ports...)
+	sort.Strings(ports)
+	for _, x := range ports {
+		fmt.Fprintf(h, "port=%s\n", x)
+	}
+	vols := append([]string(nil), p.Volumes...)
+	sort.Strings(vols)
+	for _, x := range vols {
+		fmt.Fprintf(h, "vol=%s\n", x)
+	}
+	for _, x := range p.RunArgs {
+		fmt.Fprintf(h, "arg=%s\n", x)
+	}
+	keys := make([]string, 0, len(rc.Env))
+	for k := range rc.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(h, "env=%s=%s\n", k, rc.Env[k])
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

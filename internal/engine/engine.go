@@ -490,7 +490,11 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 	host := t.Host()
 	sl = sl.forHost(host)
 	started := time.Now().UTC()
-	if m != nil && m.CurrentVersion == s.Artifact.Version {
+	if m != nil && m.CurrentVersion == s.Artifact.Version && m.Extra["config_hash"] == dc.ConfigFingerprint(rc) {
+		// True no-op only when the version AND the mutable container configuration
+		// (image ref/ports/env/volumes/restart/run_args) are unchanged AND running
+		// (DESIGN §10.1). A same-version config change has a different fingerprint
+		// and falls through to a redeploy instead of being silently ignored.
 		if st, err := dc.Status(ctx, t, rc); err == nil && st == "running" {
 			return statusFrom(m, host, st), nil
 		}
@@ -509,7 +513,16 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 	if perr != nil {
 		return nil, perr
 	}
-	if cur, err := dc.CurrentImageID(ctx, t, rc); err == nil && cur != "" {
+	// D3 (pre-run inspect): record the live image id as the rollback anchor. A
+	// TRANSPORT error here must abort BEFORE D4 `rm -f` — destroying the running
+	// container with no recorded rollback image would leave the target
+	// unrecoverable (evaluator iter3 item 1). An absent container is reported as
+	// ("", nil) by CurrentImageID, so only a real failure surfaces an error.
+	cur, cerr := dc.CurrentImageID(ctx, t, rc)
+	if cerr != nil {
+		return nil, cerr
+	}
+	if cur != "" {
 		oldImage = cur
 	}
 	runErr := sl.timed(ctx, "START", func() error { return dc.Start(ctx, t, rc) }) // rm -f old + run new
@@ -580,7 +593,7 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 			rm := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
 				CurrentVersion: prev, CurrentRelease: "docker://" + rc.Spec.Pattern.ContainerName,
 				ProviderVersion: ProviderVersion,
-				Extra:           map[string]string{"image_id": oldImage},
+				Extra:           map[string]string{"image_id": oldImage, "config_hash": dc.ConfigFingerprint(rbRC)},
 				LastOperation: LastOp{Type: "deploy", Result: "rolled_back",
 					Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 			}
@@ -598,19 +611,27 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		return nil, fmt.Errorf("%w; rolled back to previous image %s", runErr, short(oldImage))
 	}
 	// D3-equivalent post-run inspect: the recorded image id backs a FUTURE
-	// rollback, so a missing/failed inspect means the deploy is NOT durably
-	// recorded — fail closed instead of persisting a success manifest with an
-	// empty image_id (evaluator iter2 item 1).
+	// rollback. The new container is ALREADY RUNNING at this point, so a missing/
+	// failed inspect must NOT just error out and leave Terraform pointing at the
+	// OLD version while the machine runs the new one (evaluator iter3 item 2).
+	// Persist a FAILED manifest at the NEW version so Read reports drift
+	// (deployed_version = "<new>!failed") and a re-apply converges the state to
+	// match the actually-running container.
 	newImage, ierr := dc.CurrentImageID(ctx, t, rc)
 	if ierr != nil || strings.TrimSpace(newImage) == "" {
-		return nil, coded("ERR_CONNECT", host, "FINALIZE",
-			fmt.Errorf("container started but its image id could not be recorded (inspect err=%v, image_id=%q); deploy not durably recorded", ierr, newImage))
+		fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, s.Artifact.Version, strings.TrimSpace(newImage), started)
+		out := coded("ERR_CONNECT", host, "FINALIZE",
+			fmt.Errorf("container started at %s but its image id could not be recorded (inspect err=%v, image_id=%q); recorded failed state for reconvergence", s.Artifact.Version, ierr, newImage))
+		if fmErr != nil {
+			return nil, coded("ERR_CONNECT", host, "FINALIZE", fmt.Errorf("%v; failed-manifest write error: %v", out, fmErr))
+		}
+		return nil, out
 	}
 	nm := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
 		CurrentVersion: s.Artifact.Version, PreviousVersion: prev,
 		CurrentRelease:  "docker://" + rc.Spec.Pattern.ContainerName,
 		ProviderVersion: ProviderVersion,
-		Extra:           map[string]string{"image_id": newImage},
+		Extra:           map[string]string{"image_id": newImage, "config_hash": dc.ConfigFingerprint(rc)},
 		LastOperation: LastOp{Type: "deploy", Result: "success",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}

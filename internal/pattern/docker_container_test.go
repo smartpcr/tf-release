@@ -69,10 +69,10 @@ func TestDockerRunScriptGoldenLinux(t *testing.T) {
 	checkGolden(t, "docker_pull_linux.golden", fp.scripts[0])
 	// D1 login uses --password-stdin (credential never on the command line), and
 	// D7 logout must run because D1 ran.
-	if !strings.Contains(fp.scripts[0], "docker login registry.example.com -u 'svc' --password-stdin") {
+	if !strings.Contains(fp.scripts[0], "docker login 'registry.example.com' -u 'svc' --password-stdin") {
 		t.Errorf("FETCH must perform D1 login via --password-stdin:\n%s", fp.scripts[0])
 	}
-	if !strings.Contains(fp.scripts[0], "docker logout registry.example.com") {
+	if !strings.Contains(fp.scripts[0], "docker logout 'registry.example.com'") {
 		t.Errorf("FETCH must perform D7 logout because D1 login ran:\n%s", fp.scripts[0])
 	}
 	if !strings.Contains(fp.scripts[0], "docker pull 'registry.example.com/app:2.0.0'") {
@@ -92,7 +92,7 @@ func TestDockerRunScriptGoldenLinux(t *testing.T) {
 		t.Errorf("START must perform D4 rm -f:\n%s", fr.scripts[0])
 	}
 	for _, want := range []string{
-		"--restart always",
+		"--restart 'always'",
 		"-p '8080:8080'", "-p '9090:9090'",
 		"-v '/srv/data:/data'",
 		`-e 'ASPNETCORE_ENVIRONMENT=Production'`,
@@ -172,10 +172,10 @@ func TestDockerRunScriptGoldenWindows(t *testing.T) {
 		t.Fatalf("Pull: %v", err)
 	}
 	checkGolden(t, "docker_pull_windows.golden", fp.scripts[0])
-	if !strings.Contains(fp.scripts[0], "$env:LD_REG_PW | docker login registry.example.com -u 'svc' --password-stdin") {
+	if !strings.Contains(fp.scripts[0], "$env:LD_REG_PW | docker login 'registry.example.com' -u 'svc' --password-stdin") {
 		t.Errorf("windows FETCH must login via --password-stdin:\n%s", fp.scripts[0])
 	}
-	if !strings.Contains(fp.scripts[0], "docker logout registry.example.com") {
+	if !strings.Contains(fp.scripts[0], "docker logout 'registry.example.com'") {
 		t.Errorf("windows FETCH must logout because login ran:\n%s", fp.scripts[0])
 	}
 
@@ -294,3 +294,111 @@ func TestDockerPreflightFail(t *testing.T) {
 		t.Fatalf("Preflight must succeed when `docker version` exits 0: %v", err)
 	}
 }
+
+// Scenario: complete container-name quoting (evaluator iter3 item 4). The
+// container name flows into D2 rm -f, D3 inspect (CurrentImageID), Status,
+// Stop and Uninstall. A name carrying shell metacharacters must be rendered as
+// a single-quoted literal on EVERY path so neither sh nor PowerShell can
+// interpret it; the raw metacharacter sequence must never appear unquoted.
+func TestDockerContainerNameMetacharSafe(t *testing.T) {
+	inj := "svc; rm -rf / #$(id)"
+	src := spec.Source{Type: "docker_registry", Image: "registry.example.com/app", Tag: "2.0.0"}
+
+	for _, os := range []spec.OSKind{spec.OSLinux, spec.OSWindows} {
+		pat := dockerPattern()
+		pat.ContainerName = inj
+		rc := dockerRC(os, pat, src, nil)
+		wantLit := "'" + inj + "'" // sh and PS both single-quote; no apostrophe in inj
+
+		type probe struct {
+			name string
+			run  func(tr *scriptTransport) error
+		}
+		d := &DockerContainer{}
+		probes := []probe{
+			{"Start(rm -f + run)", func(tr *scriptTransport) error { return d.Start(context.Background(), tr, rc) }},
+			{"CurrentImageID(inspect)", func(tr *scriptTransport) error {
+				tr.queue = []transport.Result{{ExitCode: 0, Stdout: ""}}
+				_, err := d.CurrentImageID(context.Background(), tr, rc)
+				return err
+			}},
+			{"Status(inspect)", func(tr *scriptTransport) error {
+				tr.queue = []transport.Result{{ExitCode: 0, Stdout: "running"}}
+				_, err := d.Status(context.Background(), tr, rc)
+				return err
+			}},
+			{"Stop", func(tr *scriptTransport) error { return d.Stop(context.Background(), tr, rc) }},
+			{"Uninstall", func(tr *scriptTransport) error { return d.Uninstall(context.Background(), tr, rc, false) }},
+		}
+		for _, pr := range probes {
+			tr := &scriptTransport{osKind: os}
+			if err := pr.run(tr); err != nil {
+				t.Fatalf("%s/%s: %v", os, pr.name, err)
+			}
+			joined := strings.Join(tr.scripts, "\n")
+			if !strings.Contains(joined, wantLit) {
+				t.Errorf("%s/%s: container name must be single-quoted literal %q:\n%s", os, pr.name, wantLit, joined)
+			}
+			// The bare, unquoted injection must never appear (would allow `rm -rf /`).
+			bare := "-f " + inj
+			if strings.Contains(joined, bare) {
+				t.Errorf("%s/%s: container name rendered unquoted (injection):\n%s", os, pr.name, joined)
+			}
+		}
+	}
+}
+
+// Scenario: same-version configuration fingerprint (evaluator iter3 item 3). The
+// engine keys idempotency off ConfigFingerprint so a same-version change to the
+// mutable container settings is NOT a silent no-op. The fingerprint must change
+// when image ref, ports, env, volumes, restart policy or run_args change, and be
+// stable (order-insensitive for ports/volumes/env) otherwise.
+func TestDockerConfigFingerprint(t *testing.T) {
+	d := &DockerContainer{}
+	src := spec.Source{Type: "docker_registry", Image: "registry.example.com/app", Tag: "2.0.0"}
+	base := dockerRC(spec.OSLinux, dockerPattern(), src, map[string]string{"A": "1", "B": "2"})
+	baseFP := d.ConfigFingerprint(base)
+
+	// Identical config ⇒ identical fingerprint (no-op).
+	if got := d.ConfigFingerprint(dockerRC(spec.OSLinux, dockerPattern(), src, map[string]string{"A": "1", "B": "2"})); got != baseFP {
+		t.Errorf("identical config must produce identical fingerprint:\n base=%s\n got =%s", baseFP, got)
+	}
+
+	// Each mutable dimension must move the fingerprint.
+	mut := map[string]ReleaseCtx{
+		"image tag": dockerRC(spec.OSLinux, dockerPattern(),
+			spec.Source{Type: "docker_registry", Image: "registry.example.com/app", Tag: "2.0.1"},
+			map[string]string{"A": "1", "B": "2"}),
+	}
+	patDigest := dockerPattern()
+	mut["digest"] = dockerRC(spec.OSLinux, patDigest,
+		spec.Source{Type: "docker_registry", Image: "registry.example.com/app", Digest: "sha256:deadbeef"},
+		map[string]string{"A": "1", "B": "2"})
+	patPorts := dockerPattern()
+	patPorts.Ports = []string{"1234:1234"}
+	mut["ports"] = dockerRC(spec.OSLinux, patPorts, src, map[string]string{"A": "1", "B": "2"})
+	patVols := dockerPattern()
+	patVols.Volumes = []string{"/x:/y"}
+	mut["volumes"] = dockerRC(spec.OSLinux, patVols, src, map[string]string{"A": "1", "B": "2"})
+	patRestart := dockerPattern()
+	patRestart.RestartPolicy = "no"
+	mut["restart"] = dockerRC(spec.OSLinux, patRestart, src, map[string]string{"A": "1", "B": "2"})
+	patArgs := dockerPattern()
+	patArgs.RunArgs = []string{"--pull=always"}
+	mut["run_args"] = dockerRC(spec.OSLinux, patArgs, src, map[string]string{"A": "1", "B": "2"})
+	mut["env"] = dockerRC(spec.OSLinux, dockerPattern(), src, map[string]string{"A": "9", "B": "2"})
+	for name, rc := range mut {
+		if got := d.ConfigFingerprint(rc); got == baseFP {
+			t.Errorf("changing %s must change the fingerprint, but it stayed %s", name, baseFP)
+		}
+	}
+
+	// Order-insensitive for ports/volumes/env (map + sorted slices).
+	patReorder := dockerPattern()
+	patReorder.Ports = []string{"9090:9090", "8080:8080"}
+	reorder := dockerRC(spec.OSLinux, patReorder, src, map[string]string{"B": "2", "A": "1"})
+	if got := d.ConfigFingerprint(reorder); got != baseFP {
+		t.Errorf("reordered ports/env must NOT change the fingerprint:\n base=%s\n got =%s", baseFP, got)
+	}
+}
+
