@@ -287,6 +287,12 @@ func TestE2E_e2e_test_resource_and_results_testrun_spec_and_result_parsing(t *te
 			Format:   "pretty",
 			Paths:    []string{"e2e_test_resource_and_results_testrun_spec_and_result_parsing.feature"},
 			TestingT: t,
+			// Strict makes godog fail the run on undefined, pending, or ambiguous
+			// steps (v0.15.1 suite.shouldFail returns s.strict for those). Without
+			// it a future Gherkin reword/typo — or a new step added without a
+			// step-def — is reported "undefined" yet the suite still returns 0,
+			// silently turning this acceptance scenario into a green no-op.
+			Strict: true,
 		},
 	}
 	if suite.Run() != 0 {
