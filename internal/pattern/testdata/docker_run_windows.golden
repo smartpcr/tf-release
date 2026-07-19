@@ -1,0 +1,4 @@
+docker rm -f sample 2>$null | Out-Null
+docker run -d --name sample --restart always -p 8080:8080 -p 9090:9090 -e "ASPNETCORE_ENVIRONMENT=Production" -e "LD_APP=sample-svc" -e "LD_RELEASE_DIR=C:\deploy\sample-svc\current" -e "LD_SHARED_DIR=C:\deploy\sample-svc\shared" -e "LD_VERSION=2.0.0" -v /srv/data:/data --pull=never registry.example.com/app:2.0.0
+if($LASTEXITCODE -ne 0){ exit 44 }
+exit 0

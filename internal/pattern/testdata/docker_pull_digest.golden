@@ -1,0 +1,5 @@
+
+docker pull 'registry.example.com/app@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'; code=$?
+
+[ $code -eq 0 ] || exit 40
+exit 0
