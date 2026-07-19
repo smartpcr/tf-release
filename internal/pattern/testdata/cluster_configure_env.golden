@@ -1,0 +1,5 @@
+$ErrorActionPreference='Stop'
+$k='HKLM:\SYSTEM\CurrentControlSet\Services\SampleSvc'
+if(-not (Test-Path $k)){ exit 46 }
+try{ Set-ItemProperty -Path $k -Name Environment -Type MultiString -Value @('ASPNETCORE_ENVIRONMENT=Production','LD_APP=payments-svc','LD_RELEASE_DIR=C:\deploy\payments-svc\current','LD_SHARED_DIR=C:\deploy\payments-svc\shared','LD_VERSION=1.2.0') -ErrorAction Stop }catch{ exit 46 }
+exit 0

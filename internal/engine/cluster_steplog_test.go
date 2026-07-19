@@ -33,6 +33,8 @@ type fakeCluster struct {
 	state string
 
 	statusErr bool // when true, the pattern Status probe returns a transport error
+
+	ownerNodeFail bool // when true, Set-ClusterOwnerNode (SetPreferredOwners) fails
 }
 
 var reNodeArg = regexp.MustCompile(`-Node '([^']+)'`)
@@ -65,6 +67,9 @@ func (n *clusterNode) Exec(ctx context.Context, c transport.Cmd) (transport.Resu
 		n.cl.state = "Online"
 		return ok(""), nil
 	case strings.Contains(s, "Set-ClusterOwnerNode"): // SetPreferredOwners
+		if n.cl.ownerNodeFail {
+			return transport.Result{ExitCode: 46, Stderr: "owner not a cluster node"}, nil
+		}
 		return ok(""), nil
 	case strings.Contains(s, "Stop-ClusterGroup"): // StopGroup
 		n.cl.state = "Offline"
@@ -192,6 +197,111 @@ func TestStepLogClusterMultiHostUpdateRollback(t *testing.T) {
 		}
 		if s.version == "" {
 			t.Fatalf("step %q on %q missing version", s.step, s.host)
+		}
+	}
+}
+
+// TestClusterConflictNoMutationBeforeError covers evaluator iter2 item 4 /
+// DESIGN §9.5 CLU-06: when the WSFC role already exists bound to a DIFFERENT
+// service, the deploy must abort with ERR_SERVICE_INSTALL (naming BOTH services)
+// BEFORE any lock is acquired or any staging/switch/configure/mutating cluster
+// script runs — the conflict modifies nothing, on any node or in the cluster.
+func TestClusterConflictNoMutationBeforeError(t *testing.T) {
+	payload := []byte("cluster conflict zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	// Role present but bound to `other-svc`; spec wants `SampleSvc` ⇒ CLU-06.
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  true, svc: "other-svc", owner: "lab-01", state: "Online",
+	}
+	n1 := &clusterNode{fakeHost: newFakeHost("lab-01"), cl: cl}
+	n2 := &clusterNode{fakeHost: newFakeHost("lab-02"), cl: cl}
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	_, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("expected ERR_SERVICE_INSTALL when the role is bound to a different service")
+	}
+	if !strings.Contains(err.Error(), "ERR_SERVICE_INSTALL") {
+		t.Fatalf("role/service binding conflict must map to ERR_SERVICE_INSTALL, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "other-svc") || !strings.Contains(err.Error(), "SampleSvc") {
+		t.Fatalf("conflict error must name BOTH the bound service and the spec service, got: %v", err)
+	}
+
+	// Nothing modified: no lock/staging/switch/configure ran on ANY node.
+	for _, n := range []*clusterNode{n1, n2} {
+		for _, m := range n.fakeHost.log {
+			if m == "LOCK" || m == "EXTRACT" || m == "CONFIGURE" || strings.HasPrefix(m, "SWITCH->") {
+				t.Errorf("host %s performed a mutating step %q before conflict detection: %v", n.host, m, n.fakeHost.log)
+			}
+		}
+	}
+	// The cluster state is untouched: role still bound to other-svc and Online.
+	if !cl.role || cl.svc != "other-svc" || cl.state != "Online" {
+		t.Errorf("conflict must not mutate cluster state, got role=%v svc=%q state=%q", cl.role, cl.svc, cl.state)
+	}
+}
+
+// TestClusterUpdatePreferredOwnerFailurePropagates covers evaluator iter3 item 1/2:
+// during a rolling UPDATE, a failed Set-ClusterOwnerNode (U7 preferred-owner
+// persistence) must FAIL the deploy with ERR_SERVICE_INSTALL and record a FAILED
+// manifest — it must NOT be swallowed as a warning and finalized as success,
+// which would falsely report the preferred_owner change applied.
+func TestClusterUpdatePreferredOwnerFailurePropagates(t *testing.T) {
+	payload := []byte("cluster v2 zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+
+	// Role exists (owner lab-01) ⇒ rolling-update path; the update runs healthy
+	// through U6/U7 and only the Set-ClusterOwnerNode call fails.
+	cl := &fakeCluster{
+		nodes: []string{"lab-01", "lab-02"},
+		role:  true, svc: "SampleSvc", owner: "lab-01", state: "Online",
+		ownerNodeFail: true,
+	}
+	newNode := func(host string) *clusterNode {
+		f := newFakeHost(host)
+		f.svc = "Running"
+		seedManifest(t, f, `C:\deploy\sample-svc\manifest.json`, &Manifest{
+			Schema: 1, App: "sample-svc", Pattern: "cluster_generic_service",
+			CurrentVersion: "1.0.0", ArtifactChecksum: "sha256:old",
+			CurrentRelease:  `C:\deploy\sample-svc\releases\1.0.0`,
+			ProviderVersion: ProviderVersion,
+			LastOperation:   LastOp{Type: "deploy", Result: "success"},
+		})
+		return &clusterNode{fakeHost: f, cl: cl}
+	}
+	n1 := newNode("lab-01")
+	n2 := newNode("lab-02")
+	nodes := map[string]*clusterNode{"lab-01": n1, "lab-02": n2}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		return nodes[strings.ToLower(host)], nil
+	}
+
+	_, err := eng.Deploy(context.Background(), clusterUpdateSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("a failed Set-ClusterOwnerNode during rolling update must fail the deploy, not finalize success")
+	}
+	if !strings.Contains(err.Error(), "ERR_SERVICE_INSTALL") {
+		t.Fatalf("preferred-owner persistence failure must surface ERR_SERVICE_INSTALL, got: %v", err)
+	}
+	// The manifest must be recorded FAILED, never success — the preferred_owner
+	// config did not actually apply.
+	for _, n := range []*clusterNode{n1, n2} {
+		m := string(n.fakeHost.files[`C:\deploy\sample-svc\manifest.json`])
+		if strings.Contains(m, `"result": "success"`) {
+			t.Fatalf("host %s must NOT record a success manifest when Set-ClusterOwnerNode failed: %q", n.host, m)
+		}
+		if !strings.Contains(m, `"result": "failed"`) {
+			t.Fatalf("host %s must persist a failed manifest after the preferred-owner failure: %q", n.host, m)
 		}
 	}
 }
