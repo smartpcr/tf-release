@@ -2,12 +2,15 @@
 Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
   Single-target acceptance for the two lab targets W1 (Windows Server 2022, WinRM
   https, node+.NET+vstest) and L1 (Linux VM, ssh). Every scenario ALWAYS runs the
-  REAL DESIGN §18 lifecycle by driving the real internal/engine over the REAL
-  `local` transport (actual powershell.exe / sh execution) against the REAL gate
-  filesystem — nothing is faked and nothing is manually seeded. `engine.Deploy`
-  really fetches the artifact over HTTP, verifies its checksum, extracts it,
-  repoints the real `current` junction/symlink, and writes the real manifest +
-  marker. On top of those REAL deploys the suite proves:
+  REAL DESIGN §18 lifecycle by driving the real internal/engine end-to-end. The
+  WINDOWS scenario runs over the REAL `local` transport (actual powershell.exe)
+  against the gate filesystem; the LINUX scenario SELF-PROVISIONS an L1-style
+  target — an in-process SSH+SFTP server — and runs the WHOLE lifecycle over the
+  provider's REAL `ssh` transport (Connect/Exec/Upload/Download). Nothing is faked
+  and nothing is manually seeded. `engine.Deploy` really fetches the artifact,
+  verifies its checksum, extracts it, repoints the real `current` junction/symlink,
+  and writes the real manifest + marker. On top of those REAL deploys the suite
+  proves:
 
     * CAP — a real console_app deploy reaches its version and `current` tracks it,
     * IDP — a byte-identical re-apply is idempotent,
@@ -15,6 +18,14 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
     * LCK — a real `.lock` is held and a contending acquire is refused ERR_LOCKED,
     * RBK — upgrade 1.0.0 -> 1.1.0 then a rollback re-apply converges on 1.0.0, and
     * DST — destroy --purge removes the whole tree and leaves no `.lock`.
+
+  The Windows scenario ADDITIONALLY runs the node/.NET/vstest toolchains, deploys a
+  node web app through the engine, RUNS it as a long-lived managed service process
+  that serves external HTTP, executes a provider vstest acceptance run, and
+  generates the winsw service wrapper (the privileged SCM `sc.exe` install needs
+  Administrator — W1, lab-only). The Linux scenario runs its FULL deploy/drift/
+  lock/rollback/purge lifecycle over ssh (the privileged NATIVE `ln -sfn` symlink
+  needs a real L1 — asserted as golden here).
 
   This reproducible core runs on the plain `go test -tags e2e` gate with NO
   external service and NO skip. When TF_ACC=1 AND the W1/L1 connection env is

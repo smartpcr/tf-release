@@ -36,6 +36,7 @@ type w91SSHServer struct {
 	clientPEM string
 	shPath    string
 	env       []string
+	shimDir   string
 	wg        sync.WaitGroup
 	closed    int32
 }
@@ -81,31 +82,71 @@ func w91StartSSHServer() (*w91SSHServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Git-for-Windows ships no `flock`, which the engine's POSIX lock scripts
+	// require (`command -v flock || exit 70`). Provide a small PATH-prepended
+	// shim so the REAL lock/CAS lifecycle can run over SSH; mutual exclusion is
+	// still enforced by the engine's file-content compare-and-swap on `.lock`.
+	shimDir, err := w91WriteShims()
+	if err != nil {
+		ln.Close()
+		return nil, err
+	}
 	s := &w91SSHServer{
 		ln:        ln,
 		port:      ln.Addr().(*net.TCPAddr).Port,
 		clientPEM: string(pem.EncodeToMemory(blk)),
 		shPath:    w91ShPath(),
-		env:       w91ServerEnv(),
+		shimDir:   shimDir,
+		env:       w91ServerEnv(shimDir),
 	}
 	s.wg.Add(1)
 	go s.accept(cfg)
 	return s, nil
 }
 
+// w91WriteShims creates a directory holding a minimal `flock` shim (Git-for-
+// Windows lacks it). The shim consumes flock's option/FD arguments and returns
+// success without blocking; the engine's `.lock` compare-and-swap still provides
+// real mutual exclusion, so LCK contention behaves correctly.
+func w91WriteShims() (string, error) {
+	dir, err := os.MkdirTemp("", "w91-shims-")
+	if err != nil {
+		return "", err
+	}
+	flock := "#!/bin/sh\n" +
+		"# minimal flock shim for the Windows gate (Git-bash has no flock).\n" +
+		"while [ $# -gt 0 ]; do\n" +
+		"  case \"$1\" in\n" +
+		"    -w|--wait|-t|--timeout) shift 2 ;;\n" +
+		"    -c) shift; sh -c \"$1\"; exit $? ;;\n" +
+		"    -*) shift ;;\n" +
+		"    *) shift ;;\n" +
+		"  esac\n" +
+		"done\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "flock"), []byte(flock), 0o755); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
+}
+
 // w91ServerEnv ensures the Git-for-Windows POSIX toolchain (sh, unzip,
-// sha256sum, curl) is discoverable by the exec handler regardless of the gate's
-// ambient PATH.
-func w91ServerEnv() []string {
+// sha256sum, curl) plus the flock shim are discoverable by the exec handler
+// regardless of the gate's ambient PATH, and asks MSYS to create native
+// symlinks so the engine's `ln -sfn` repoint of `current` is a real symlink.
+func w91ServerEnv(shimDir string) []string {
 	env := os.Environ()
 	extra := []string{
+		shimDir,
 		`C:\Program Files\Git\usr\bin`,
 		`C:\Program Files\Git\mingw64\bin`,
 		`C:\Program Files\Git\bin`,
 	}
+	env = append(env, "MSYS=winsymlinks:sys")
 	for i, e := range env {
 		if strings.HasPrefix(strings.ToUpper(e), "PATH=") {
-			env[i] = e + string(os.PathListSeparator) + strings.Join(extra, string(os.PathListSeparator))
+			env[i] = "PATH=" + strings.Join(extra, string(os.PathListSeparator)) + string(os.PathListSeparator) + e[len("PATH="):]
 			return env
 		}
 	}
@@ -203,6 +244,9 @@ func (s *w91SSHServer) Close() error {
 	atomic.StoreInt32(&s.closed, 1)
 	err := s.ln.Close()
 	s.wg.Wait()
+	if s.shimDir != "" {
+		os.RemoveAll(s.shimDir)
+	}
 	return err
 }
 

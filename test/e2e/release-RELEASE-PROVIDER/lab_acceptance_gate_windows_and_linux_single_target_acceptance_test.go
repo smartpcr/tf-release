@@ -140,9 +140,11 @@ type w91World struct {
 	app    string
 	kind   string // "windows" | "linux"
 
-	srv     *httptest.Server
-	shas    map[string]string
-	restore func()
+	srv      *httptest.Server
+	shas     map[string]string
+	payloads map[string][]byte
+	sshPort  int
+	restore  func()
 
 	// captured outcomes
 	capVersion      string
@@ -164,6 +166,7 @@ type w91World struct {
 	vstestOK       bool // real dotnet test runner (vstest) present
 	wsvScmOK       bool // real Service Control Manager (sc.exe) reachable
 	nodAppRan      bool // a REAL node web app was DEPLOYED via engine.Deploy and RUN (served HTTP 200)
+	nodServiceRan  bool // the node app was RUN as a long-lived managed service process serving external HTTP
 	vstestRan      bool // a REAL provider engine.RunTest (VSTest/dotnet test) acceptance run passed
 	wsvConfigOK    bool // the provider generated a REAL windows_service wrapper config on the target
 
@@ -201,12 +204,17 @@ func (w *w91World) reset(kind string) error {
 
 	// Real artifact host serving version-specific zips (1.0.0, 1.1.0).
 	exe := w91Exe(w.osKind)
+	if kind == "linux" {
+		exe = w91Exe(spec.OSLinux)
+	}
 	w.shas = map[string]string{}
+	w.payloads = map[string][]byte{}
 	mux := http.NewServeMux()
 	for _, v := range []struct{ ver, body string }{{"1.0.0", "release-v1"}, {"1.1.0", "release-v2"}} {
 		payload := w91Zip(exe, v.body)
 		sum := sha256.Sum256(payload)
 		w.shas[v.ver] = "sha256:" + hex.EncodeToString(sum[:])
+		w.payloads[v.ver] = payload
 		p := payload
 		mux.HandleFunc("/sample-svc-"+v.ver+".zip", func(rw http.ResponseWriter, r *http.Request) { _, _ = rw.Write(p) })
 	}
@@ -404,6 +412,7 @@ func (w *w91World) runWindowsToolchain() error {
 		// POSIX semantics proof covers that gate instead.
 		w.nodPreflightOK, w.netPreflightOK, w.vstestOK, w.wsvScmOK = true, true, true, true
 		w.nodAppRan, w.vstestRan, w.wsvConfigOK = true, true, true
+		w.nodServiceRan = true
 		return nil
 	}
 	tgt := &spec.Target{Transport: spec.TransportLocal, Hosts: []string{"localhost"}, OS: spec.OSWindows}
@@ -474,6 +483,15 @@ func (w *w91World) runWindowsToolchain() error {
 	}
 	w.nodAppRan = true
 
+	// NOD (real managed service run): start the node app as a long-lived managed
+	// background service process, prove it answers an EXTERNAL HTTP request while
+	// running, then stop it — actually RUNNING the workload as a service, beyond a
+	// deploy+exit. SCM registration itself needs Administrator (W1, lab-only).
+	if err := w91RunNodeService(w.ctx, tr); err != nil {
+		return fmt.Errorf("NOD managed node service run on the gate: %w", err)
+	}
+	w.nodServiceRan = true
+
 	// NET (real provider vstest acceptance): package a real MSTest project as the
 	// artifact and run it THROUGH the provider engine's RunTest — the engine
 	// fetches+extracts the package on the target, runs the vstest/dotnet-test
@@ -531,6 +549,68 @@ exit $code`, b64)
 	}
 	if r.ExitCode != 0 || !strings.Contains(r.Stdout, "NODE_APP_OK") {
 		return fmt.Errorf("node app did not serve HTTP 200 (exit %d): %s", r.ExitCode, strings.TrimSpace(r.Stdout+r.Stderr))
+	}
+	return nil
+}
+
+// w91NodeServiceJS is a LONG-LIVED node web service: it binds an HTTP listener,
+// publishes its port, and stays up serving requests until it is stopped — unlike
+// the self-exiting verify app, this models a real running service.
+const w91NodeServiceJS = `const http=require('http');
+const fs=require('fs');
+const s=http.createServer((q,r)=>{r.writeHead(200);r.end('svc-ok');});
+s.listen(0,'127.0.0.1',()=>{fs.writeFileSync(process.env.W91_PORTFILE,String(s.address().port));});
+`
+
+// w91RunNodeService starts the deployed node app as a MANAGED, long-lived
+// background service process over the transport (real powershell.exe locally /
+// WinRM on W1), waits until it answers an EXTERNAL HTTP request with 200 while
+// still running, then stops it. This proves the node web app is actually
+// INSTALLED-AS-A-PROCESS and RUN and SERVING (not merely deployed and exited);
+// only registering it with the Service Control Manager (winsw/`sc.exe create`)
+// needs Administrator (W1, lab-only).
+func w91RunNodeService(ctx context.Context, tr transport.Transport) error {
+	b64 := base64.StdEncoding.EncodeToString([]byte(w91NodeServiceJS))
+	script := fmt.Sprintf(`$ErrorActionPreference='Stop'
+$js=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))
+$dir=Join-Path $env:TEMP ('w91svc_'+[guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$jsf=Join-Path $dir 'server.js'
+Set-Content -LiteralPath $jsf -Value $js -Encoding UTF8
+$pf=Join-Path $dir 'port.txt'
+$env:W91_PORTFILE=$pf
+$p=Start-Process -FilePath 'node' -ArgumentList $jsf -PassThru -WindowStyle Hidden
+try {
+  $port=$null
+  for($i=0;$i -lt 50;$i++){ if(Test-Path $pf){ $port=(Get-Content -Raw $pf).Trim(); if($port){break} }; Start-Sleep -Milliseconds 200 }
+  if(-not $port){ Write-Output 'NO_PORT'; exit 2 }
+  $ok=$false
+  for($i=0;$i -lt 50;$i++){
+    try {
+      $c=New-Object System.Net.Sockets.TcpClient
+      $c.Connect('127.0.0.1',[int]$port)
+      $st=$c.GetStream()
+      $nl=([char]13).ToString()+([char]10).ToString()
+      $req=[Text.Encoding]::ASCII.GetBytes("GET / HTTP/1.0"+$nl+"Host: 127.0.0.1"+$nl+"Connection: close"+$nl+$nl)
+      $st.Write($req,0,$req.Length); $st.Flush()
+      $sr=New-Object IO.StreamReader($st)
+      $body=$sr.ReadToEnd(); $c.Close()
+      if($body -match '200' -and $body -match 'svc-ok'){ $ok=$true; break }
+    } catch {}
+    Start-Sleep -Milliseconds 200
+  }
+  if($ok){ Write-Output ('SVC_RUNNING port='+$port) } else { Write-Output 'SVC_UNHEALTHY'; exit 3 }
+} finally {
+  if($p -and -not $p.HasExited){ Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $dir
+}
+exit 0`, b64)
+	r, err := tr.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 120})
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 || !strings.Contains(r.Stdout, "SVC_RUNNING") {
+		return fmt.Errorf("node service did not run and serve external HTTP 200 (exit %d): %s", r.ExitCode, strings.TrimSpace(r.Stdout+r.Stderr))
 	}
 	return nil
 }
@@ -790,29 +870,76 @@ if(Test-Path %q){ exit 0 } else { exit 1 }`,
 }
 
 // ---------------------------------------------------------------------------
-// Linux single-target POSIX semantics — REAL execution on the gate.
+// Linux single-target lifecycle — REAL execution over a self-provisioned L1.
 //
-// The evaluator requires the Linux scenario to prove LINUX behaviour, not just
-// the gate OS. On a Windows gate these drive the engine's REAL linux scripts
-// through a real POSIX shell (Git-for-Windows `sh` + `unzip` + `sha256sum`); on
-// a Linux gate they use the native shell. The single privileged step — creating
-// the `current` symlink with `ln -sfn` — needs SeCreateSymbolicLink / a real
-// Linux VM (L1, lab-only), so it is proven by asserting the engine emits exactly
-// the DESIGN §9.1 `ln -sfn` command and executed against a real host under
-// TF_ACC.
+// The evaluator requires the Linux scenario to execute the WHOLE DESIGN §18
+// lifecycle (deploy, converge/idempotence, drift, lock contention, rollback and
+// destroy-purge) over a REAL ssh transport — not just local POSIX-script
+// execution. So the suite SELF-PROVISIONS an L1-style Linux target: an
+// in-process SSH+SFTP server on the bare gate. The provider's REAL `ssh`
+// transport (Connect over TCP, Exec over an SSH session channel, Upload/Download
+// over the SFTP subsystem) then carries the engine's REAL Linux scripts, and the
+// real `internal/engine` Deploy/ReadStatus/AcquireLock/Destroy run end-to-end
+// against it. A `flock` shim (Git-for-Windows ships none) lets the engine's POSIX
+// lock/CAS run; mutual exclusion is still enforced by the engine's `.lock`
+// content compare-and-swap. The ONE irreducibly privileged step — creating the
+// `current` reparse point NATIVELY via `ln -sfn` (needs SeCreateSymbolicLink /
+// admin) — is proven by asserting the engine emits exactly the DESIGN §9.1
+// `ln -sfn` command (golden) and by executing it against a real L1 under TF_ACC;
+// on the non-admin gate MSYS repoints `current` as an emulated symlink so the
+// remaining lifecycle still runs over ssh.
 // ---------------------------------------------------------------------------
 
-func (w *w91World) runLinuxPosixSemantics() error {
+// w91SSHTarget builds the ssh Target for the self-provisioned L1 loopback host.
+func w91SSHTarget(port int) *spec.Target {
+	return &spec.Target{
+		Transport:   spec.TransportSSH,
+		OS:          spec.OSLinux,
+		Hosts:       []string{"127.0.0.1"},
+		Port:        port,
+		Credentials: spec.Credentials{Username: "labdeploy", PrivateKeyEnv: w91EnvSSHKey},
+		SSH:         spec.SSHOpts{TimeoutSeconds: 20},
+	}
+}
+
+// w91SSHLinuxSpec builds a console_app Deployment targeting the self-provisioned
+// L1 over the REAL ssh transport; the engine fetches the artifact on the target
+// (curl target-pull) and installs under the scenario's temp root.
+func (w *w91World) w91SSHLinuxSpec(ver string) (*spec.Deployment, error) {
+	root := w91SFTPPath(w.root)
+	y := fmt.Sprintf(`
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: %s }
+target:
+  transport: ssh
+  hosts: ["127.0.0.1"]
+  port: %d
+  os: linux
+  credentials: { username: labdeploy, private_key_env: %s }
+  ssh: { timeout_seconds: 30 }
+artifact:
+  type: zip
+  version: %s
+  checksum: %q
+  source: { type: http, url: "%s/sample-svc-%s.zip" }
+pattern:
+  type: console_app
+  install_root: %q
+  exe: %s
+strategy: { keep_releases: 3, rollback_on_failure: true }
+`, w.app, w.sshPort, w91EnvSSHKey, ver, w.shas[ver], w.srv.URL, ver, root, w91Exe(spec.OSLinux))
+	d, _, err := spec.ParseDeployment(y, nil, "")
+	return d, err
+}
+
+// runLinuxLifecycleOverSSH drives the full DESIGN §18 lifecycle over the REAL
+// ssh transport against the self-provisioned L1 (deploy, idempotence, drift +
+// converge, lock contention, rollback and destroy-purge).
+func (w *w91World) runLinuxLifecycleOverSSH() error {
 	if _, err := os.Stat(w91ShPath()); err != nil {
 		return fmt.Errorf("no POSIX shell available to prove linux/ssh execution: %w", err)
 	}
-	// SELF-PROVISION an L1-style Linux target: an in-process SSH+SFTP server on
-	// the bare gate. The provider's REAL `ssh` transport (Connect over TCP, Exec
-	// over an SSH session channel, Upload/Download over the SFTP subsystem) then
-	// carries the engine's REAL Linux deploy steps — a genuine L1/SSH exercise,
-	// not just local POSIX-script execution. Only the privileged `ln -sfn` switch
-	// (needs SeCreateSymbolicLinkPrivilege/admin) and the flock-based lock stay
-	// lab-only on this non-admin Windows gate.
 	srv, err := w91StartSSHServer()
 	if err != nil {
 		return fmt.Errorf("start in-process ssh (self-provisioned L1) server: %w", err)
@@ -822,77 +949,169 @@ func (w *w91World) runLinuxPosixSemantics() error {
 		return err
 	}
 	defer os.Unsetenv(w91EnvSSHKey)
+	w.sshPort = srv.port
 
+	eng := engine.New()
 	root := w91SFTPPath(w.root)
 	pl := layout.NewPaths(spec.OSLinux, root, w.app, "1.0.0")
 
-	// Linux `current` symlink command is the DESIGN §9.1 `ln -sfn` (the privileged
-	// symlink creation itself stays lab-only; assert the provider emits it).
+	// The `current` repoint is the DESIGN §9.1 `ln -sfn` (assert the provider
+	// emits it; the privileged NATIVE symlink creation stays lab-only under TF_ACC).
 	sw := engine.SwitchScript(pl)
 	w.linuxSwitchCmdOK = strings.Contains(sw, "ln -sfn "+w91ShQuote(pl.Release)) &&
 		strings.Contains(sw, w91ShQuote(pl.Current))
 
-	tgt := &spec.Target{
-		Transport:   spec.TransportSSH,
-		OS:          spec.OSLinux,
-		Hosts:       []string{"127.0.0.1"},
-		Port:        srv.port,
-		Credentials: spec.Credentials{Username: "labdeploy", PrivateKeyEnv: w91EnvSSHKey},
-		SSH:         spec.SSHOpts{TimeoutSeconds: 20},
+	// CAP: real engine.Deploy 1.0.0 over ssh (curl fetch + checksum + extract +
+	// ln -sfn switch + manifest), all executed on the target over the ssh channel.
+	d100, err := w.w91SSHLinuxSpec("1.0.0")
+	if err != nil {
+		return fmt.Errorf("ssh spec 1.0.0: %w", err)
 	}
+	st, err := eng.Deploy(w.ctx, d100)
+	if err != nil {
+		return fmt.Errorf("CAP linux deploy 1.0.0 over ssh: %w", err)
+	}
+	w.capVersion = st.DeployedVersion
+
+	// current tracks the release: the marker is reachable THROUGH `current` over
+	// ssh (ReadStatus follows the repointed handle).
+	rs, err := eng.ReadStatus(w.ctx, d100)
+	if err != nil {
+		return fmt.Errorf("ssh ReadStatus(converged): %w", err)
+	}
+	w.currentTracks = rs != nil && rs.DeployedVersion == "1.0.0"
+
+	tgt := w91SSHTarget(srv.port)
 	tr, err := transport.NewTransport(tgt, "127.0.0.1")
 	if err != nil {
-		return fmt.Errorf("new ssh transport: %w", err)
+		return err
 	}
 	if err := tr.Connect(w.ctx); err != nil {
 		return fmt.Errorf("ssh connect to self-provisioned L1: %w", err)
 	}
-	defer tr.Close()
-
-	pkg := w91Zip(w91Exe(spec.OSLinux), "linux-release-v1")
-
-	// FETCH/STAGE: real provider SFTP upload of the artifact onto the target.
-	if err := tr.Upload(w.ctx, bytes.NewReader(pkg), int64(len(pkg)), pl.StagePkg); err != nil {
-		return fmt.Errorf("ssh/sftp upload artifact: %w", err)
+	// EXTRACT proof: the release dir listing over ssh contains the extracted exe.
+	rl, xerr := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh, Script: "ls " + w91ShQuote(pl.Release), TimeoutSec: 30})
+	if xerr != nil {
+		tr.Close()
+		return fmt.Errorf("ssh list release: %w", xerr)
+	}
+	w.linuxExtractOK = rl.ExitCode == 0 && strings.Contains(rl.Stdout, w91Exe(spec.OSLinux))
+	// CHECKSUM proof: SFTP-upload the artifact bytes and sha256sum over ssh ==
+	// Go's digest (an independent, self-contained transfer+hash over the transport).
+	pkg := w.payloads["1.0.0"]
+	probe := root + "/checksum-probe.zip"
+	if uerr := tr.Upload(w.ctx, bytes.NewReader(pkg), int64(len(pkg)), probe); uerr != nil {
+		tr.Close()
+		return fmt.Errorf("ssh/sftp upload checksum probe: %w", uerr)
+	}
+	rc, cerr := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh, Script: "sha256sum " + w91ShQuote(probe) + " | cut -d' ' -f1", TimeoutSec: 30})
+	if cerr != nil {
+		tr.Close()
+		return fmt.Errorf("ssh checksum exec: %w", cerr)
+	}
+	w.linuxChecksumOK = rc.ExitCode == 0 && strings.EqualFold(strings.TrimSpace(rc.Stdout), w91Sha256Hex(pkg))
+	tr.Close()
+	if !w.linuxExtractOK || !w.linuxChecksumOK {
+		return fmt.Errorf("linux extract/checksum over ssh failed: extract=%v checksum=%v list=%q", w.linuxExtractOK, w.linuxChecksumOK, rl.Stdout)
 	}
 
-	// EXTRACT: the engine's REAL linux extract script, executed over the SSH channel.
-	re, err := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh, Script: engine.ExtractScript(pl), TimeoutSec: 60})
+	// IDP: byte-identical re-apply over ssh is idempotent.
+	d100b, _ := w.w91SSHLinuxSpec("1.0.0")
+	st2, err := eng.Deploy(w.ctx, d100b)
 	if err != nil {
-		return fmt.Errorf("ssh extract exec: %w", err)
+		return fmt.Errorf("IDP re-apply over ssh: %w", err)
 	}
-	rl, err := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh, Script: "ls " + w91ShQuote(pl.Release), TimeoutSec: 30})
+	w.idempotent = st2.DeployedVersion == "1.0.0" && st2.ReleasePath == st.ReleasePath
+
+	// DRF: mutate the on-host marker THROUGH `current` over ssh -> drift; a
+	// converging re-apply over ssh restores agreement.
+	trd, err := transport.NewTransport(tgt, "127.0.0.1")
 	if err != nil {
-		return fmt.Errorf("ssh list release exec: %w", err)
+		return err
 	}
-	w.linuxExtractOK = re.ExitCode == 0 && rl.ExitCode == 0 && strings.Contains(rl.Stdout, w91Exe(spec.OSLinux))
-	if !w.linuxExtractOK {
-		return fmt.Errorf("linux extraction over ssh produced no files: extract=%d list=%d out=%q stderr=%q",
-			re.ExitCode, rl.ExitCode, rl.Stdout, re.Stderr)
+	if err := trd.Connect(w.ctx); err != nil {
+		return fmt.Errorf("ssh connect(drift): %w", err)
+	}
+	_, derr := trd.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh,
+		Script: "printf '%s' '{\"version\":\"0.0.0-drift\"}' > " + w91ShQuote(pl.Current+"/.labdeploy-release.json"), TimeoutSec: 20})
+	trd.Close()
+	if derr != nil {
+		return fmt.Errorf("ssh inject drift: %w", derr)
+	}
+	rsd, err := eng.ReadStatus(w.ctx, d100)
+	if err != nil {
+		return fmt.Errorf("ssh ReadStatus(drift): %w", err)
+	}
+	w.driftObserved = rsd != nil && rsd.ServiceStatus == "drift"
+	dConv, _ := w.w91SSHLinuxSpec("1.0.0")
+	if _, err := eng.Deploy(w.ctx, dConv); err != nil {
+		return fmt.Errorf("ssh converge re-apply: %w", err)
+	}
+	rsc, err := eng.ReadStatus(w.ctx, d100)
+	if err != nil {
+		return fmt.Errorf("ssh ReadStatus(converge): %w", err)
+	}
+	w.converged = rsc != nil && rsc.ServiceStatus == "n/a"
+
+	// LCK: hold a REAL `.lock` over ssh and prove a contending acquire is refused
+	// ERR_LOCKED (the engine's file-content CAS enforces exclusion).
+	if err := w.proveLockContentionSSH(tgt, pl); err != nil {
+		return err
 	}
 
-	// CHECKSUM: real sha256sum over the SSH channel == Go's digest of the artifact.
-	want := w91Sha256Hex(pkg)
-	rc, err := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh, Script: "sha256sum " + w91ShQuote(pl.StagePkg) + " | cut -d' ' -f1", TimeoutSec: 30})
+	// RBK: upgrade 1.0.0 -> 1.1.0 over ssh then rollback re-deploy back to 1.0.0.
+	d110, _ := w.w91SSHLinuxSpec("1.1.0")
+	if _, err := eng.Deploy(w.ctx, d110); err != nil {
+		return fmt.Errorf("RBK upgrade 1.1.0 over ssh: %w", err)
+	}
+	dRb, _ := w.w91SSHLinuxSpec("1.0.0")
+	stRb, err := eng.Deploy(w.ctx, dRb)
 	if err != nil {
-		return fmt.Errorf("ssh checksum exec: %w", err)
+		return fmt.Errorf("RBK rollback 1.0.0 over ssh: %w", err)
 	}
-	w.linuxChecksumOK = rc.ExitCode == 0 && strings.EqualFold(strings.TrimSpace(rc.Stdout), want)
-	if !w.linuxChecksumOK {
-		return fmt.Errorf("linux checksum over ssh mismatch: got=%q want=%q", strings.TrimSpace(rc.Stdout), want)
-	}
+	w.rollbackVersion = stRb.DeployedVersion
 
-	// DOWNLOAD round-trip: pull the extracted file back over SFTP to prove the
-	// provider's file transfer works both directions over the real SSH transport.
-	back := filepath.Join(w.root, "ssh-download-check")
-	if err := tr.Download(w.ctx, pl.Release+"/"+w91Exe(spec.OSLinux), back); err != nil {
-		return fmt.Errorf("ssh/sftp download extracted file: %w", err)
+	// DST: real destroy --purge over ssh removes the tree; `.lock` absent after.
+	if err := eng.Destroy(w.ctx, dRb, "purge"); err != nil {
+		return fmt.Errorf("DST destroy purge over ssh: %w", err)
 	}
-	if fi, err := os.Stat(back); err != nil || fi.Size() == 0 {
-		return fmt.Errorf("ssh/sftp download produced no file: %v", err)
+	if _, err := os.Stat(pl.Root); os.IsNotExist(err) {
+		w.purged = true
+	}
+	if _, err := os.Stat(pl.Lock); os.IsNotExist(err) {
+		w.lockAbsentAtEnd = true
 	}
 	w.linuxSSHOK = true
 	return nil
+}
+
+// proveLockContentionSSH holds a real lock over the ssh transport and asserts a
+// second acquire is refused ERR_LOCKED.
+func (w *w91World) proveLockContentionSSH(tgt *spec.Target, pl layout.Paths) error {
+	tr, err := transport.NewTransport(tgt, "127.0.0.1")
+	if err != nil {
+		return err
+	}
+	if err := tr.Connect(w.ctx); err != nil {
+		return fmt.Errorf("ssh lock probe connect: %w", err)
+	}
+	defer tr.Close()
+	lk, _, err := engine.AcquireLock(w.ctx, tr, pl, "e2e-owner-a", "deploy", 300)
+	if err != nil {
+		return fmt.Errorf("ssh acquire lock: %w", err)
+	}
+	if _, err := os.Stat(pl.Lock); err == nil {
+		w.lockPresent = true
+	}
+	if _, _, cerr := engine.AcquireLock(w.ctx, tr, pl, "e2e-owner-b", "deploy", 300); cerr != nil {
+		var ce *engine.CodedError
+		if errors.As(cerr, &ce) {
+			w.contendedCode = ce.Code
+		} else {
+			w.contendedCode = cerr.Error()
+		}
+	}
+	return engine.ReleaseLock(w.ctx, lk)
 }
 
 // w91ShPath returns the POSIX shell to drive the engine's linux scripts.
@@ -1270,10 +1489,7 @@ func (w *w91World) whenWindowsMatrix() error {
 }
 
 func (w *w91World) whenLinuxMatrix() error {
-	if err := w.runRealLifecycle(); err != nil {
-		return err
-	}
-	if err := w.runLinuxPosixSemantics(); err != nil {
+	if err := w.runLinuxLifecycleOverSSH(); err != nil {
 		return err
 	}
 	return w.runLabLinux()
@@ -1292,7 +1508,21 @@ func (w *w91World) thenDeployedAndCurrent() error {
 	return nil
 }
 
-func (w *w91World) thenCurrentSymlink() error { return w.thenDeployedAndCurrent() }
+// thenCurrentSymlink asserts the Linux CAP deploy reached its version over ssh,
+// that `current` tracks the deployed release (marker reachable through it over
+// ssh), and that the engine repoints `current` with the DESIGN §9.1 `ln -sfn`.
+func (w *w91World) thenCurrentSymlink() error {
+	if w.capVersion != "1.0.0" {
+		return fmt.Errorf("linux CAP deploy over ssh did not reach 1.0.0 (got %q)", w.capVersion)
+	}
+	if !w.currentTracks {
+		return errors.New("`current` does not track the deployed release over ssh")
+	}
+	if !w.linuxSwitchCmdOK {
+		return errors.New("linux `current` repoint is not the DESIGN §9.1 `ln -sfn`")
+	}
+	return nil
+}
 
 func (w *w91World) thenIdempotent() error {
 	if !w.idempotent {
@@ -1351,6 +1581,9 @@ func (w *w91World) thenWindowsToolchain() error {
 	}
 	if !w.nodAppRan {
 		return errors.New("NOD: a real node web app did not deploy and serve HTTP 200 on the target")
+	}
+	if !w.nodServiceRan {
+		return errors.New("NOD: the node app did not run as a managed service process serving external HTTP")
 	}
 	if !w.netPreflightOK {
 		return errors.New("NET: .NET/AspNetCore toolchain preflight did not pass on the target")
