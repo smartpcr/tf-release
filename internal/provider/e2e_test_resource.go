@@ -37,6 +37,7 @@ type e2eModel struct {
 	Spec              types.String `tfsdk:"spec"`
 	SpecFile          types.String `tfsdk:"spec_file"`
 	Variables         types.Map    `tfsdk:"variables"`
+	DeploymentID      types.String `tfsdk:"deployment_id"`
 	Triggers          types.Map    `tfsdk:"triggers"`
 	FailOnTestFailure types.Bool   `tfsdk:"fail_on_test_failure"`
 	Passed            types.Bool   `tfsdk:"passed"`
@@ -61,6 +62,8 @@ func (r *E2ETestResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			"spec":      schema.StringAttribute{Optional: true, MarkdownDescription: "Inline YAML/JSON TestRun spec."},
 			"spec_file": schema.StringAttribute{Optional: true},
 			"variables": schema.MapAttribute{Optional: true, ElementType: types.StringType},
+			"deployment_id": schema.StringAttribute{Optional: true,
+				MarkdownDescription: "Set to `labdeploy_deployment.x.id` purely to create the dependency edge so Terraform Core orders this test after the deployment (DESIGN §5.3). No RequiresReplace: changing it never forces a re-run — `triggers` owns re-execution."},
 			"triggers": schema.MapAttribute{Required: true, ElementType: types.StringType,
 				MarkdownDescription: "Any change forces re-run (RequiresReplace).",
 				PlanModifiers:       []planmodifier.Map{mapRequiresReplace{}}},

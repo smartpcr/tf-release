@@ -390,7 +390,7 @@ storyId: "release:RELEASE-PROVIDER"
 
 ### Implementation Steps
 - [x] `labdeploy_e2e_test` schema with `spec`/`spec_file`, `triggers` RequiresReplace, `fail_on_test_failure`, and computed outputs.
-- [ ] Add the `deployment_id` attribute + dependency edge to the e2e schema: `e2e_test_resource.go` has no `deployment_id` field, so pipelines cannot order the test after its deployment.
+- [x] Add the `deployment_id` attribute + dependency edge to the e2e schema: `e2e_test_resource.go` has no `deployment_id` field, so pipelines cannot order the test after its deployment.
 - [x] Implement `Create` running tests with process-tree kill on `runner.timeout_seconds` (`ERR_TIMEOUT`) and collection always before returning a test-failure error.
 - [x] Implement results download/unzip into `destination_dir`, log + `windows_event_logs` collection since test start, and best-effort `Delete`.
 
@@ -400,7 +400,7 @@ storyId: "release:RELEASE-PROVIDER"
 ### Test Scenarios
 - [ ] Scenario: Collection before failure -- Given `fail_on_test_failure=true` and a failing run, When `Create` runs against a fake transport serving the on-target results zip, Then the resulting local `results_dir` tree (results + logs + `summary.json`) is byte-identical to a committed golden snapshot AND is fully written before `ERR_TEST_FAILED` is returned [proof: golden; deps: none -- committed expected results_dir snapshot under internal/engine/testdata; equality of the persisted output tree is the preservation proof]
 - [ ] Scenario: Timeout kills tree -- Given `runner.timeout_seconds` exceeded, When `Create` runs via a fake transport, Then it returns `ERR_TIMEOUT` and issues the process-tree kill script [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
-- [ ] Scenario: deployment_id wires a reference without replacement -- Given an `labdeploy_e2e_test` schema, When inspected, Then `deployment_id` is a settable string attribute with NO RequiresReplace plan modifier (so a Terraform config referencing `labdeploy_deployment.x.id` creates a graph edge in Core without forcing the test's replacement) [proof: in-process; deps: none -- terraform-plugin-framework schema unit test asserting attribute presence and absence of RequiresReplace]
+- [x] Scenario: deployment_id wires a reference without replacement -- Given an `labdeploy_e2e_test` schema, When inspected, Then `deployment_id` is a settable string attribute with NO RequiresReplace plan modifier (so a Terraform config referencing `labdeploy_deployment.x.id` creates a graph edge in Core without forcing the test's replacement) [proof: in-process; deps: none -- terraform-plugin-framework schema unit test asserting attribute presence and absence of RequiresReplace]
 - [ ] Scenario: deployment_id ordering under apply -- Given a config where `labdeploy_e2e_test.deployment_id = labdeploy_deployment.x.id`, When `terraform apply` runs in a plan harness, Then Terraform Core orders the e2e_test create strictly after the deployment create [proof: service:tf-plugin-server; deps: terraform-plugin-testing harness runs the built provider under a real `terraform` binary and asserts apply ordering]
 
 # Phase 8: Docker Examples and Packaging
