@@ -44,15 +44,53 @@ func runnerCommand(t *spec.TestRun) string {
 	case "dotnet_test":
 		proj := r.Project
 		extra := strings.Join(r.ExtraArgs, " ")
-		return strings.TrimSpace(fmt.Sprintf(`dotnet test %s --logger trx --results-directory .\TestResults %s`, proj, extra))
+		return strings.TrimSpace(fmt.Sprintf(`dotnet test %s --logger trx --results-directory .\TestResults --no-build %s`, proj, extra))
 	case "npm":
-		script := r.Script
-		if script == "" {
-			script = "test"
+		// DESIGN §7.2: `npm <args or "test">`. Raw extra_args win; else a named
+		// script becomes `npm run <script>`; else the default `npm test`.
+		if len(r.ExtraArgs) > 0 {
+			return "npm " + strings.Join(r.ExtraArgs, " ")
 		}
-		return "npm run " + script
+		if r.Script != "" {
+			return "npm run " + r.Script
+		}
+		return "npm test"
 	}
 	return r.Command
+}
+
+// noResultCounters is the sentinel counter set emitted when results.format is
+// none|empty: nothing is parsed, so every counter is -1 (DESIGN §5.3 outputs
+// table "-1 when results.format: none"; E2E-07).
+func noResultCounters() logs.Counters {
+	return logs.Counters{Total: -1, Passed: -1, Failed: -1, Skipped: -1}
+}
+
+// evaluatePass applies pass_criteria (DESIGN §7.3) in-process: the runner exit
+// code must be in the allowed set AND — only when a result format was parsed and
+// total>0 — the pass rate passed/(total-skipped) must be >= min_pass_rate. When
+// results.format is none the rate gate is skipped entirely (rateOK=true) and the
+// verdict rides purely on exit_codes. Pure function so it is unit-testable
+// without a transport.
+func evaluatePass(exitCode int, format string, c logs.Counters, pc *spec.PassCriteria) (passed, exitOK, rateOK bool) {
+	for _, code := range pc.EffectiveExitCodes() {
+		if exitCode == code {
+			exitOK = true
+			break
+		}
+	}
+	rateOK = true
+	if format == "trx" || format == "junit" {
+		denom := c.Total - c.Skipped
+		rate := 1.0
+		if denom > 0 {
+			rate = float64(c.Passed) / float64(denom)
+		} else if c.Total == 0 {
+			rate = 0 // zero tests discovered ⇒ never passes rate gate (E2E-07)
+		}
+		rateOK = rate >= pc.EffectiveMinPassRate()
+	}
+	return exitOK && rateOK, exitOK, rateOK
 }
 
 // RunTest = fetch+extract test package on target, execute runner, collect
@@ -219,37 +257,23 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 
 	out := &TestOutcome{ExitCode: r.ExitCode, ResultsDir: dest, DurationSeconds: duration}
 
-	// PARSE results if a format is configured.
+	// PARSE results if a format is configured; otherwise emit -1 sentinels so
+	// consumers can distinguish "not measured" from a genuine zero (E2E-07).
+	c := noResultCounters()
 	if f := tr.Results.Format; f == "trx" || f == "junit" {
-		c, matched, perr := logs.SumResults(f, localResults, tr.Results.Paths)
+		parsed, matched, perr := logs.SumResults(f, localResults, tr.Results.Paths)
 		if perr != nil {
 			// Missing/corrupt results with format set ⇒ ERR_TEST_FAILED (E2E-06).
 			return out, coded("ERR_TEST_FAILED", host, "TEST",
 				fmt.Errorf("result parsing (%s, matched=%d): %v", f, len(matched), perr))
 		}
-		out.Total, out.PassedTests, out.FailedTests, out.SkippedTests = c.Total, c.Passed, c.Failed, c.Skipped
+		c = parsed
 	}
+	out.Total, out.PassedTests, out.FailedTests, out.SkippedTests = c.Total, c.Passed, c.Failed, c.Skipped
 
 	// PASS CRITERIA (DESIGN §7.3): exit code ∈ allowed AND pass-rate ≥ min.
-	exitOK := false
-	for _, c := range tr.PassCriteria.EffectiveExitCodes() {
-		if r.ExitCode == c {
-			exitOK = true
-			break
-		}
-	}
-	rateOK := true
-	if tr.Results.Format == "trx" || tr.Results.Format == "junit" {
-		denom := out.Total - out.SkippedTests
-		rate := 1.0
-		if denom > 0 {
-			rate = float64(out.PassedTests) / float64(denom)
-		} else if out.Total == 0 {
-			rate = 0 // zero tests discovered ⇒ never passes rate gate (E2E-07)
-		}
-		rateOK = rate >= tr.PassCriteria.EffectiveMinPassRate()
-	}
-	out.Passed = exitOK && rateOK
+	passed, exitOK, rateOK := evaluatePass(r.ExitCode, tr.Results.Format, c, &tr.PassCriteria)
+	out.Passed = passed
 	out.Summary = summarize(out, exitOK, rateOK)
 	writeSummaryJSON(dest, tr, out, startedAt)
 	return out, nil
@@ -270,17 +294,38 @@ func summarize(o *TestOutcome, exitOK, rateOK bool) string {
 		o.Passed, o.ExitCode, exitOK, o.Total, o.PassedTests, o.FailedTests, o.SkippedTests, rateOK, o.DurationSeconds)
 }
 
-// writeSummaryJSON emits the machine-readable summary.json (DESIGN §7.4).
+// writeSummaryJSON emits the machine-readable summary.json (DESIGN §7.4). Field
+// names mirror the design's example document. `pass_rate` is -1 when no result
+// format was parsed (counters are the -1 sentinels), matching the counters.
 func writeSummaryJSON(dest string, tr *spec.TestRun, o *TestOutcome, started time.Time) {
+	passRate := -1.0
+	if tr.Results.Format == "trx" || tr.Results.Format == "junit" {
+		denom := o.Total - o.SkippedTests
+		if denom > 0 {
+			passRate = float64(o.PassedTests) / float64(denom)
+		} else {
+			passRate = 0
+		}
+	}
 	doc := map[string]interface{}{
-		"schema": 1, "name": tr.Metadata.Name, "version": tr.Artifact.Version,
-		"host":   strings.ToLower(tr.Target.Hosts[0]),
-		"passed": o.Passed, "exit_code": o.ExitCode,
-		"total": o.Total, "passed_tests": o.PassedTests,
-		"failed_tests": o.FailedTests, "skipped_tests": o.SkippedTests,
+		"name":             tr.Metadata.Name,
+		"version":          tr.Artifact.Version,
+		"host":             strings.ToLower(tr.Target.Hosts[0]),
+		"passed":           o.Passed,
+		"exit_code":        o.ExitCode,
+		"total":            o.Total,
+		"passed_tests":     o.PassedTests,
+		"failed":           o.FailedTests,
+		"skipped":          o.SkippedTests,
+		"pass_rate":        passRate,
 		"duration_seconds": o.DurationSeconds,
-		"started_utc":      started.UTC().Format(time.RFC3339),
-		"finished_utc":     time.Now().UTC().Format(time.RFC3339),
+		"criteria": map[string]interface{}{
+			"exit_codes":    tr.PassCriteria.EffectiveExitCodes(),
+			"min_pass_rate": tr.PassCriteria.EffectiveMinPassRate(),
+		},
+		"error_code":   "",
+		"started_utc":  started.UTC().Format(time.RFC3339),
+		"finished_utc": time.Now().UTC().Format(time.RFC3339),
 	}
 	b, _ := json.MarshalIndent(doc, "", "  ")
 	_ = os.WriteFile(filepath.Join(dest, "summary.json"), b, 0o644)

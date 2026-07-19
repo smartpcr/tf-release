@@ -1,0 +1,1 @@
+bin\smoke.exe --fast --ci

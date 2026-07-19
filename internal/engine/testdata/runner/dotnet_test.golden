@@ -1,0 +1,1 @@
+dotnet test tests\Suite.csproj --logger trx --results-directory .\TestResults --no-build --filter Category=Smoke
