@@ -383,8 +383,8 @@ storyId: "release:RELEASE-PROVIDER"
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Runner expansion golden -- Given each `runner.type`, When the command is expanded, Then it matches the committed golden including results-dir flags [proof: golden; deps: none -- committed fixtures under internal/logs/testdata]
-- [ ] Scenario: Pass criteria evaluation -- Given parsed counters plus criteria, When evaluated, Then `passed` reflects `exit_codes` and `min_pass_rate`, and `format: none` yields -1 counters [proof: in-process; deps: none]
+- [x] Scenario: Runner expansion golden -- Given each `runner.type`, When the command is expanded, Then it matches the committed golden including results-dir flags [proof: golden; deps: none -- committed fixtures under internal/engine/testdata/runner]
+- [x] Scenario: Pass criteria evaluation -- Given parsed counters plus criteria, When evaluated, Then `passed` reflects `exit_codes` and `min_pass_rate`, and `format: none` yields -1 counters [proof: in-process; deps: none]
 
 ## Stage 7.2: E2E Test Resource and Collection
 
