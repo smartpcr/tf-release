@@ -22,7 +22,7 @@ import (
 func consoleSpecKeep(t *testing.T, at accTarget, version, ext string, keep int) string {
 	t.Helper()
 	url := artifactURL(t, version, ext)
-	sha := artifactSHA(t, version)
+	sha := artifactSHA(t, version, ext)
 	exe := "bin/sample-svc"
 	if at.tgt.OS == spec.OSWindows {
 		exe = `bin\sample-svc.exe`
@@ -104,25 +104,6 @@ func checkPathPresent(at accTarget, path, why string) func(*terraform.State) err
 // mustRe compiles an ExpectError regexp for the scenario helpers.
 func mustRe(pat string) *regexp.Regexp { return regexp.MustCompile(pat) }
 
-// checkReleaseMarker asserts releases/<version>/.labdeploy-release.json exists
-// on the target (ART-01: the runner-push marker records the verified sha).
-func checkReleaseMarker(at accTarget, version string) func(*terraform.State) error {
-	return func(*terraform.State) error {
-		p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", version)
-		marker := p.Release + string(sep(at.tgt.OS)) + ".labdeploy-release.json"
-		out, err := probeHost(at,
-			fmt.Sprintf("if (Test-Path -LiteralPath '%s') { 'FOUND' } else { 'MISSING' }", strings.ReplaceAll(marker, "'", "''")),
-			fmt.Sprintf("if [ -e '%s' ]; then echo FOUND; else echo MISSING; fi", strings.ReplaceAll(marker, "'", `'\''`)))
-		if err != nil {
-			return fmt.Errorf("probe release marker: %w", err)
-		}
-		if !strings.Contains(out, "FOUND") {
-			return fmt.Errorf("release marker %s not found on %s", marker, at.host)
-		}
-		return nil
-	}
-}
-
 // checkReleaseCount asserts exactly want directories exist under releases/
 // (CAP-02: keep_releases pruning leaves newest+previous).
 func checkReleaseCount(at accTarget, want int) func(*terraform.State) error {
@@ -176,18 +157,20 @@ func sep(os spec.OSKind) rune {
 	return '\\'
 }
 
-// probeHost connects to the (single-host) target and runs one shell script,
-// returning stdout. Used by scenario checks that must observe on-target state
-// (junction/symlink targets, marker files) beyond the Terraform attributes.
-func probeHost(at accTarget, winScript, shScript string) (string, error) {
+// runProbe connects to the (single-host) target and runs one shell script,
+// returning the raw transport result (including ExitCode). error is returned only
+// for transport-level failures; a nonzero remote exit is reported via Result so
+// callers that expect a specific code (e.g. `sc query`⇒1060 for an absent
+// service) can inspect it.
+func runProbe(at accTarget, winScript, shScript string) (transport.Result, error) {
 	tr, err := transport.NewTransport(&at.tgt, at.host)
 	if err != nil {
-		return "", err
+		return transport.Result{}, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := tr.Connect(ctx); err != nil {
-		return "", err
+		return transport.Result{}, err
 	}
 	defer tr.Close()
 	var cmd transport.Cmd
@@ -196,11 +179,35 @@ func probeHost(at accTarget, winScript, shScript string) (string, error) {
 	} else {
 		cmd = transport.Cmd{Shell: transport.ShellSh, Script: shScript}
 	}
-	res, err := tr.Exec(ctx, cmd)
+	return tr.Exec(ctx, cmd)
+}
+
+// probeHost runs one script and returns stdout, FAILING on a nonzero remote exit
+// code. A drift-setup or observation probe that silently swallows a nonzero exit
+// would let a failed setup masquerade as a valid scenario (evaluator item 2), so
+// every probe used by a positive check must go through here.
+func probeHost(at accTarget, winScript, shScript string) (string, error) {
+	res, err := runProbe(at, winScript, shScript)
 	if err != nil {
 		return "", err
 	}
+	if res.ExitCode != 0 {
+		return res.Stdout, fmt.Errorf("remote script exit=%d stderr=%q", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
 	return res.Stdout, nil
+}
+
+// preConfig wraps an out-of-band mutation (drift/lock induction) so a failure to
+// set up the scenario FAILS the test rather than being silently discarded — a
+// discarded PreConfig error would let the following plan/apply assert against an
+// un-perturbed host and pass for the wrong reason (evaluator item 2).
+func preConfig(t *testing.T, fn func() error) func() {
+	return func() {
+		t.Helper()
+		if err := fn(); err != nil {
+			t.Fatalf("scenario PreConfig setup failed (host untouched, assertions would be invalid): %v", err)
+		}
+	}
 }
 
 // checkCurrentTarget asserts `current` resolves to releases/<version> — a junction
@@ -227,15 +234,19 @@ func checkCurrentTarget(at accTarget, version string) func(*terraform.State) err
 // checksums are supplied by env so the same tests target any lab package host.
 
 // artifactSHA returns the sha256 checksum (as `sha256:<64hex>`) the lab publishes
-// for a given sample-svc version, read from LABDEPLOY_ACC_SHA_<VER-normalized>.
-// Under TF_ACC=1 a missing checksum is a FAILURE — a scenario cannot silently
-// pass with an unverifiable artifact.
-func artifactSHA(t *testing.T, version string) string {
+// for a given sample-svc version+FORMAT, read from
+// LABDEPLOY_ACC_SHA_<VER-normalized>_<EXT>. The checksum is format-specific: the
+// zip and nupkg of the same version have DIFFERENT bytes and therefore different
+// sha256, so the env key MUST carry the extension (evaluator item 1). Under
+// TF_ACC=1 a missing checksum is a FAILURE — a scenario cannot silently pass with
+// an unverifiable artifact.
+func artifactSHA(t *testing.T, version, ext string) string {
 	t.Helper()
-	name := "LABDEPLOY_ACC_SHA_" + strings.NewReplacer(".", "_", "-", "_").Replace(strings.ToUpper(version))
+	norm := strings.NewReplacer(".", "_", "-", "_")
+	name := "LABDEPLOY_ACC_SHA_" + norm.Replace(strings.ToUpper(version)) + "_" + strings.ToUpper(ext)
 	v := os.Getenv(name)
 	if v == "" {
-		t.Fatalf("TF_ACC=1 requires %s (the sha256 of sample-svc %s)", name, version)
+		t.Fatalf("TF_ACC=1 requires %s (the sha256 of the %s of sample-svc %s)", name, ext, version)
 	}
 	if !strings.HasPrefix(v, "sha256:") {
 		v = "sha256:" + v
@@ -248,7 +259,7 @@ func artifactSHA(t *testing.T, version string) string {
 func consoleSpec(t *testing.T, at accTarget, version, ext, verifyCmd string) string {
 	t.Helper()
 	url := artifactURL(t, version, ext)
-	sha := artifactSHA(t, version)
+	sha := artifactSHA(t, version, ext)
 	exe := "bin/sample-svc"
 	if at.tgt.OS == spec.OSWindows {
 		exe = `bin\sample-svc.exe`
@@ -280,7 +291,7 @@ strategy: { keep_releases: 2, rollback_on_failure: true }
 func winServiceSpec(t *testing.T, at accTarget, version, ext, healthURL, extra string) string {
 	t.Helper()
 	url := artifactURL(t, version, ext)
-	sha := artifactSHA(t, version)
+	sha := artifactSHA(t, version, ext)
 	health := ""
 	if healthURL != "" {
 		health = fmt.Sprintf(`
@@ -322,7 +333,7 @@ func artifactType(ext string) string {
 func winServiceSpecStrategy(t *testing.T, at accTarget, version, ext, healthURL, strategy string) string {
 	t.Helper()
 	url := artifactURL(t, version, ext)
-	sha := artifactSHA(t, version)
+	sha := artifactSHA(t, version, ext)
 	health := ""
 	if healthURL != "" {
 		health = fmt.Sprintf(`
@@ -353,7 +364,7 @@ pattern:
 func nodeSpec(t *testing.T, at accTarget, version string, port int, installDeps bool) string {
 	t.Helper()
 	url := artifactURL(t, version, "zip")
-	sha := artifactSHA(t, version)
+	sha := artifactSHA(t, version, "zip")
 	return fmt.Sprintf(`apiVersion: labdeploy/v1
 kind: Deployment
 metadata: { name: sample-svc }
@@ -383,7 +394,7 @@ strategy: { keep_releases: 2, rollback_on_failure: true }
 func dotnetSpec(t *testing.T, at accTarget, version, launcher, hosting string) string {
 	t.Helper()
 	url := artifactURL(t, version, "zip")
-	sha := artifactSHA(t, version)
+	sha := artifactSHA(t, version, "zip")
 	launchLine := "  exe: bin\\sample-svc.exe"
 	if launcher == "dotnet_dll" {
 		launchLine = "  dll: bin\\sample-svc.dll"
@@ -444,6 +455,25 @@ func errorStep(config, wantErr string) resource.TestStep {
 	}
 }
 
+// errorScenario drives a negative scenario expecting wantErr and runs post-state
+// probes (release-absent, service-absent, container-list-unchanged, ...) in
+// CheckDestroy. This is necessary because terraform-plugin-testing does NOT
+// invoke a TestStep.Check when ExpectError matches, so any on-host post-condition
+// (DESIGN §18 "POST-STATE:" clauses) must be asserted at destroy time. The
+// `.lock`-absent invariant is always included.
+func errorScenario(t *testing.T, at accTarget, cfg, wantErr string, post ...resource.TestCheckFunc) {
+	t.Helper()
+	host, namespace, _ := splitAddress(t, Address)
+	t.Setenv("TF_ACC_PROVIDER_HOST", host)
+	t.Setenv("TF_ACC_PROVIDER_NAMESPACE", namespace)
+	all := append([]resource.TestCheckFunc{checkLockAbsent(at.tgt, installRootFor(at), "sample-svc")}, post...)
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps:                    []resource.TestStep{{Config: cfg, ExpectError: mustRe(wantErr)}},
+		CheckDestroy:             resource.ComposeAggregateTestCheckFunc(all...),
+	})
+}
+
 // installRootFor returns the default install root for the target OS (no explicit
 // install_root is set in the harness specs, so the engine default applies).
 func installRootFor(at accTarget) string {
@@ -485,4 +515,301 @@ func runScenarioNoProbe(t *testing.T, steps ...resource.TestStep) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps:                    steps,
 	})
+}
+
+// ---------------------------------------------------------------------------
+// On-host observation helpers (evaluator items 5-18): the Terraform attributes
+// alone don't prove the DESIGN §18 post-state, so these connect to the touched
+// host and assert the actual filesystem / service / registry / health outcome.
+// ---------------------------------------------------------------------------
+
+// psq / shq single-quote a path for the two shells (mirrors layout's escaping).
+func psq(s string) string { return strings.ReplaceAll(s, "'", "''") }
+func shq(s string) string { return strings.ReplaceAll(s, "'", `'\''`) }
+
+// hostReadFile returns a file's contents on the target, failing if it is missing
+// (Get-Content / cat both exit nonzero on a missing file ⇒ probeHost errors).
+func hostReadFile(at accTarget, path string) (string, error) {
+	return probeHost(at,
+		fmt.Sprintf("Get-Content -LiteralPath '%s' -Raw", psq(path)),
+		fmt.Sprintf("cat '%s'", shq(path)))
+}
+
+// checkFileContains asserts a file on the target exists and contains want.
+func checkFileContains(at accTarget, path, want, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := hostReadFile(at, path)
+		if err != nil {
+			return fmt.Errorf("%s: read %s: %w", why, path, err)
+		}
+		if !strings.Contains(out, want) {
+			return fmt.Errorf("%s: %s does not contain %q", why, path, want)
+		}
+		return nil
+	}
+}
+
+// checkReleaseMarkerSHA asserts releases/<version>/.labdeploy-release.json exists
+// AND records the expected sha (ART-01: the marker proves the verified checksum,
+// not merely that a file was written) — evaluator item 5.
+func checkReleaseMarkerSHA(at accTarget, version, ext string, wantSHA string) func(*terraform.State) error {
+	hex := strings.TrimPrefix(wantSHA, "sha256:")
+	return func(*terraform.State) error {
+		p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", version)
+		marker := p.Release + string(sep(at.tgt.OS)) + ".labdeploy-release.json"
+		out, err := hostReadFile(at, marker)
+		if err != nil {
+			return fmt.Errorf("release marker %s: %w", marker, err)
+		}
+		if !strings.Contains(strings.ToLower(out), strings.ToLower(hex)) {
+			return fmt.Errorf("release marker %s does not record sha %s (got %q)", marker, hex, strings.TrimSpace(out))
+		}
+		return nil
+	}
+}
+
+// checkReleaseAbsent asserts releases/<version> does NOT exist (ART-02: a failed
+// checksum must leave no release dir) — evaluator item 6.
+func checkReleaseAbsent(at accTarget, version, why string) func(*terraform.State) error {
+	p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", version)
+	return checkPathAbsent(at, p.Release, why)
+}
+
+// checkStagingEmpty asserts the staging dir holds no files (ART-02: a failed
+// fetch must not leave a partial payload behind) — evaluator item 6.
+func checkStagingEmpty(at accTarget) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "")
+		out, err := probeHost(at,
+			fmt.Sprintf("if (Test-Path -LiteralPath '%s') { (Get-ChildItem -LiteralPath '%s' -Recurse -File | Measure-Object).Count } else { 0 }", psq(p.Staging), psq(p.Staging)),
+			fmt.Sprintf("if [ -d '%s' ]; then find '%s' -type f | wc -l; else echo 0; fi", shq(p.Staging), shq(p.Staging)))
+		if err != nil {
+			return fmt.Errorf("staging probe: %w", err)
+		}
+		if strings.TrimSpace(out) != "0" {
+			return fmt.Errorf("staging is not empty after failed fetch (%s files under %s)", strings.TrimSpace(out), p.Staging)
+		}
+		return nil
+	}
+}
+
+// checkManifestVersion asserts manifest.json still records the expected current
+// version (ART-02/WSV: a failed op must not mutate the recorded state) — item 6.
+func checkManifestVersion(at accTarget, version, why string) func(*terraform.State) error {
+	p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "")
+	return checkFileContains(at, p.Manifest, version, why)
+}
+
+// checkManifestContains asserts manifest.json contains an arbitrary token (e.g.
+// `"result":"failed"` or `"last_operation"`) — used by WSV-05 drift proof.
+func checkManifestContains(at accTarget, token, why string) func(*terraform.State) error {
+	p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "")
+	return checkFileContains(at, p.Manifest, token, why)
+}
+
+// checkWindowsEventLog asserts the System event log contains a recent Service
+// Control Manager error (id 7000/7009/7011/7031) — WSV-03's fail-start proof
+// (DESIGN §18 WSV-03 "an event-log 7000/7009 line") — evaluator item 12.
+func checkWindowsEventLog(at accTarget, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			"$e = Get-WinEvent -FilterHashtable @{LogName='System';Id=7000,7009,7011,7031} -MaxEvents 20 -ErrorAction SilentlyContinue; if ($e) { 'EVT_FOUND' } else { 'EVT_NONE' }",
+			"echo EVT_NONE")
+		if err != nil {
+			return fmt.Errorf("%s: event-log probe: %w", why, err)
+		}
+		if !strings.Contains(out, "EVT_FOUND") {
+			return fmt.Errorf("%s: no SCM 7000/7009/7011/7031 event found for the fail-start", why)
+		}
+		return nil
+	}
+}
+
+// checkWinswXMLVersion asserts the regenerated WinSW service XML under `current`
+// references the expected release version (WSV-06: xml regenerated on upgrade) —
+// evaluator item 13.
+func checkWinswXMLVersion(at accTarget, version, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		cur := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "").Current
+		xml := cur + string(sep(at.tgt.OS)) + "SampleSvc.xml"
+		out, err := hostReadFile(at, xml)
+		if err != nil {
+			return fmt.Errorf("%s: read winsw xml %s: %w", why, xml, err)
+		}
+		if !strings.Contains(out, version) {
+			return fmt.Errorf("%s: winsw xml %s does not reference %s (not regenerated?)", why, xml, version)
+		}
+		return nil
+	}
+}
+
+// checkServiceState asserts a Windows service is in wantState (RUNNING/STOPPED).
+// DESIGN §18 WSV asserts via `sc query` — evaluator items 6, 12, 13.
+func checkServiceState(at accTarget, svc, wantState string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			fmt.Sprintf("(Get-Service -Name '%s' -ErrorAction SilentlyContinue).Status; if(-not $?){'NOSVC'}", psq(svc)),
+			"echo NOSVC")
+		if err != nil {
+			return fmt.Errorf("service state probe: %w", err)
+		}
+		if !strings.Contains(strings.ToUpper(out), strings.ToUpper(wantState)) {
+			return fmt.Errorf("service %s state = %q, want %s", svc, strings.TrimSpace(out), wantState)
+		}
+		return nil
+	}
+}
+
+// checkServiceAbsent asserts a Windows service does NOT exist (DST-01: sc query on
+// a removed service returns 1060) — evaluator item 16.
+func checkServiceAbsent(at accTarget, svc string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			fmt.Sprintf("if (Get-Service -Name '%s' -ErrorAction SilentlyContinue) { 'SVC_PRESENT' } else { 'SVC_ABSENT(1060)' }", psq(svc)),
+			"echo SVC_ABSENT")
+		if err != nil {
+			return fmt.Errorf("service-absent probe: %w", err)
+		}
+		if !strings.Contains(out, "SVC_ABSENT") {
+			return fmt.Errorf("service %s still present after purge (want sc query⇒1060)", svc)
+		}
+		return nil
+	}
+}
+
+// checkServiceObjectName asserts the service runs under wantAccount (WSV-08:
+// ObjectName=.\svcuser) — evaluator item 13.
+func checkServiceObjectName(at accTarget, svc, wantAccount string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			fmt.Sprintf("(Get-CimInstance Win32_Service -Filter \"Name='%s'\").StartName", psq(svc)),
+			"echo n/a")
+		if err != nil {
+			return fmt.Errorf("service ObjectName probe: %w", err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(out), wantAccount) {
+			return fmt.Errorf("service %s ObjectName = %q, want %q", svc, strings.TrimSpace(out), wantAccount)
+		}
+		return nil
+	}
+}
+
+// checkHealthBody asserts an HTTP GET of url returns a body containing want
+// (DESIGN §18 WSV/NOD/NET: `/health` body `v=<ver>`) — evaluator items 12, 14.
+func checkHealthBody(at accTarget, url, want string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			fmt.Sprintf("(Invoke-WebRequest -UseBasicParsing -Uri '%s').Content", psq(url)),
+			fmt.Sprintf("curl -fsS '%s'", shq(url)))
+		if err != nil {
+			return fmt.Errorf("GET %s: %w", url, err)
+		}
+		if !strings.Contains(out, want) {
+			return fmt.Errorf("GET %s body = %q, want to contain %q", url, strings.TrimSpace(out), want)
+		}
+		return nil
+	}
+}
+
+// checkHKLMEnv asserts the machine environment (HKLM) exposes name=value — the
+// service env delivery DESIGN §18 WSV-01/NET-01 require (LD_VERSION,
+// ASPNETCORE_URLS) — evaluator items 12, 14.
+func checkHKLMEnv(at accTarget, name, value string) func(*terraform.State) error {
+	const key = `HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			fmt.Sprintf("(Get-ItemProperty -Path '%s' -Name '%s' -ErrorAction SilentlyContinue).'%s'", key, psq(name), psq(name)),
+			"echo n/a")
+		if err != nil {
+			return fmt.Errorf("HKLM env %s probe: %w", name, err)
+		}
+		if !strings.Contains(out, value) {
+			return fmt.Errorf("HKLM env %s = %q, want to contain %q", name, strings.TrimSpace(out), value)
+		}
+		return nil
+	}
+}
+
+// checkAppLogContains asserts shared/logs/app.log contains want (env dump /
+// heartbeat / FORCE_KILL step) — evaluator items 12, 13, 14.
+func checkAppLogContains(at accTarget, want, why string) func(*terraform.State) error {
+	p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "")
+	logPath := p.SharedLogs + string(sep(at.tgt.OS)) + "app.log"
+	return checkFileContains(at, logPath, want, why)
+}
+
+// checkReleaseSubdir asserts releases/<version>/<sub> exists (ART-04 nupkg
+// `lib/...`; NOD-03 `node_modules`) — evaluator items 8, 14.
+func checkReleaseSubdir(at accTarget, version, sub, why string) func(*terraform.State) error {
+	p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", version)
+	target := p.Release + string(sep(at.tgt.OS)) + sub
+	return checkPathPresent(at, target, why)
+}
+
+// snapshotContainers returns the current `docker ps -a` id list on the target
+// (ART-06: prove a failed docker login left the container list unchanged).
+func snapshotContainers(at accTarget) (string, error) {
+	return probeHost(at, "docker ps -a --format '{{.ID}}' | Sort-Object", "docker ps -a --format '{{.ID}}' | sort")
+}
+
+// checkContainersUnchanged asserts `docker ps -a` matches a pre-captured snapshot
+// (ART-06: a failed login must not create/remove containers) — evaluator item 9.
+func checkContainersUnchanged(at accTarget, before string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		after, err := snapshotContainers(at)
+		if err != nil {
+			return fmt.Errorf("container list probe: %w", err)
+		}
+		if strings.TrimSpace(before) != strings.TrimSpace(after) {
+			return fmt.Errorf("container list changed after failed docker login: before=%q after=%q", strings.TrimSpace(before), strings.TrimSpace(after))
+		}
+		return nil
+	}
+}
+
+// hostMtime returns the modification time (epoch seconds) of a path on the target.
+func hostMtime(at accTarget, path string) (string, error) {
+	return probeHost(at,
+		fmt.Sprintf("[int][double]::Parse((Get-Item -LiteralPath '%s').LastWriteTimeUtc.Subtract([datetime]'1970-01-01').TotalSeconds)", psq(path)),
+		fmt.Sprintf("stat -c %%Y '%s'", shq(path)))
+}
+
+// checkMtimeUnchanged asserts path's mtime equals a pre-captured value (IDP-01:
+// an idempotent re-apply must not rewrite target files) — evaluator item 17.
+func checkMtimeUnchanged(at accTarget, path, before, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		after, err := hostMtime(at, path)
+		if err != nil {
+			return fmt.Errorf("%s: mtime probe: %w", why, err)
+		}
+		if strings.TrimSpace(before) != strings.TrimSpace(after) {
+			return fmt.Errorf("%s: %s mtime changed (before=%s after=%s)", why, path, strings.TrimSpace(before), strings.TrimSpace(after))
+		}
+		return nil
+	}
+}
+
+// stopServiceOnHost stops a Windows service out-of-band (DRF-01 drift induction).
+func stopServiceOnHost(at accTarget, svc string) error {
+	_, err := probeHost(at,
+		fmt.Sprintf("Stop-Service -Name '%s' -Force; Start-Sleep -Seconds 1; exit 0", psq(svc)),
+		"exit 0")
+	return err
+}
+
+// wallBetween runs fn and fails unless min <= elapsed <= max. CON-02 asserts a
+// wrong password fails FAST (<15s, no retry); CON-03 asserts connect_retries=2
+// actually retries (elapsed proves 3 attempts happened, not one immediate fail).
+// LCK-01 asserts the contended lock fails in <5s. Pass min=0 to bound only above.
+func wallBetween(t *testing.T, min, max time.Duration, what string, fn func()) {
+	t.Helper()
+	start := time.Now()
+	fn()
+	elapsed := time.Since(start)
+	if elapsed > max {
+		t.Fatalf("%s took %s, want <= %s (DESIGN timing bound)", what, elapsed, max)
+	}
+	if min > 0 && elapsed < min {
+		t.Fatalf("%s took %s, want >= %s (retries/attempts did not occur)", what, elapsed, min)
+	}
 }
