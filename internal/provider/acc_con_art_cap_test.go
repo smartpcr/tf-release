@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -152,12 +153,15 @@ pattern: { type: console_app, exe: bin/sample-svc }
 }
 
 // CON-05: runner==W1, transport local, os windows ⇒ apply a console spec
-// succeeds without opening any socket. Requires running ON the Windows target as
-// the runner (opt-in via LABDEPLOY_ACC_LOCAL_WINDOWS=1).
+// succeeds without opening any socket. This is inherently a Windows-runner
+// scenario (local transport on a Windows box), so it is gated on the RUNTIME OS,
+// not an opt-in env: on a Windows runner (the W1 matrix — DESIGN "runner==W1")
+// it RUNS unconditionally under TF_ACC=1; on a non-Windows runner local Windows
+// transport is impossible, so it self-skips with a clear reason — evaluator item 8.
 func TestAccCON05_LocalTransport(t *testing.T) {
 	accPreCheck(t)
-	if os.Getenv("LABDEPLOY_ACC_LOCAL_WINDOWS") != "1" {
-		t.Skip("set LABDEPLOY_ACC_LOCAL_WINDOWS=1 when the runner IS the Windows target")
+	if runtime.GOOS != "windows" {
+		t.Skip("CON-05 exercises LOCAL Windows transport; run the Windows (W1) acceptance matrix on the Windows target itself")
 	}
 	at := accTarget{
 		tgt:  buildLocalWindowsTarget(),

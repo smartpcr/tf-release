@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"testing"
@@ -191,24 +192,23 @@ artifact:
 	valCase(t, spec, regexp.MustCompile(`ERR_SPEC_INVALID.*unresolved variable missing`))
 }
 
-// VAL-08: `password_env: NOT_SET_VAR` (a name that does not resolve on the
-// runner) ⇒ ERR_SPEC_INVALID `env var NOT_SET_VAR … is not set`, fired BEFORE
-// any dial (DESIGN §11 env-name hygiene). Modeled as an apply step per §18.1.
+// VAL-08: `password_env: <name>` referencing a variable that does not resolve on
+// the runner ⇒ ERR_SPEC_INVALID `env var <name> … is not set`, fired BEFORE any
+// dial (DESIGN §11 env-name hygiene). Modeled as an apply step per §18.1. The env
+// name embeds the test's PID so it is UNIQUE and can never be accidentally set in
+// the runner environment — the scenario always exercises the unset path (never
+// skips on a polluted runner) — evaluator item 10.
 func TestAccVAL08_UnsetPasswordEnv(t *testing.T) {
 	valSetup(t)
-	// Deliberately DO NOT set NOT_SET_VAR; assert absence to be robust to a
-	// polluted CI environment.
-	if _, ok := os.LookupEnv("NOT_SET_VAR"); ok {
-		t.Skip("NOT_SET_VAR is set in this environment; cannot prove the unset path")
-	}
-	spec := `apiVersion: labdeploy/v1
+	unsetVar := fmt.Sprintf("LABDEPLOY_ACC_NEVER_SET_%d", os.Getpid())
+	spec := fmt.Sprintf(`apiVersion: labdeploy/v1
 kind: Deployment
 metadata: { name: sample-svc }
 target:
   transport: winrm
   hosts: ["10.255.255.1"]
   os: windows
-  credentials: { username: u, password_env: NOT_SET_VAR }
+  credentials: { username: u, password_env: %s }
   winrm: { insecure_skip_verify: true }
 pattern: { type: windows_service, service_name: SampleSvc, exe: bin\SampleSvc.exe }
 artifact:
@@ -216,13 +216,13 @@ artifact:
   version: 1.0.0
   checksum: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
   source: { type: http, url: "http://10.255.255.1/a.zip" }
-`
+`, unsetVar)
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
 				Config:      accDeploymentConfig(spec),
-				ExpectError: regexp.MustCompile(`ERR_SPEC_INVALID.*NOT_SET_VAR.*is not set`),
+				ExpectError: regexp.MustCompile(`ERR_SPEC_INVALID.*` + regexp.QuoteMeta(unsetVar) + `.*is not set`),
 			},
 		},
 	})

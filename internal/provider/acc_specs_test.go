@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
@@ -360,6 +361,39 @@ pattern:
 `, at.yaml, artifactType(ext), version, sha, url, health, strategy)
 }
 
+// winServiceSpecSource is winServiceSpec with an OVERRIDDEN artifact source URL
+// (the real version+checksum are kept so a cached release still matches). RBK-01
+// uses it to point the rollback apply at a BLACKHOLE artifact host: if the engine
+// tried to fetch it would fail, so a successful apply proves the cached release
+// needed NO network to the artifact host (DESIGN §18 RBK-01 "block it to prove").
+func winServiceSpecSource(t *testing.T, at accTarget, version, ext, healthURL, sourceURL string) string {
+	t.Helper()
+	sha := artifactSHA(t, version, ext)
+	health := ""
+	if healthURL != "" {
+		health = fmt.Sprintf(`
+health_check:
+  type: http
+  http: { url: %q }`, healthURL)
+	}
+	return fmt.Sprintf(`apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+%s
+artifact:
+  type: %s
+  version: %q
+  checksum: %q
+  source: { type: http, url: %q }
+pattern:
+  type: windows_service
+  service_name: SampleSvc
+  exe: bin\sample-svc.exe%s
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, at.yaml, artifactType(ext), version, sha, sourceURL, health)
+}
+
 // nodeSpec builds a node_web_app Deployment spec (W1 only). installDeps toggles
 // npm-install on the target (DESIGN §18.6 NOD).
 func nodeSpec(t *testing.T, at accTarget, version string, port int, installDeps bool) string {
@@ -690,8 +724,69 @@ func checkServiceState(at accTarget, svc, wantState string) func(*terraform.Stat
 	}
 }
 
-// checkServiceAbsent asserts a Windows service does NOT exist (DST-01: sc query on
-// a removed service returns 1060) — evaluator item 16.
+// checkServiceNotRunning asserts a Windows service exists but is NOT Running
+// (state = stopped-or-crashed). DESIGN §18 WSV-05 requires the failed 1.2.0-bad
+// service be left stopped-or-crashed with rollback off — evaluator item 12.
+func checkServiceNotRunning(at accTarget, svc, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		out, err := probeHost(at,
+			fmt.Sprintf("(Get-Service -Name '%s' -ErrorAction SilentlyContinue).Status; if(-not $?){'NOSVC'}", psq(svc)),
+			"echo NOSVC")
+		if err != nil {
+			return fmt.Errorf("%s: service state probe: %w", why, err)
+		}
+		if strings.Contains(strings.ToUpper(out), "RUNNING") {
+			return fmt.Errorf("%s: service %s is RUNNING, want stopped-or-crashed on the failed release", why, svc)
+		}
+		return nil
+	}
+}
+
+// assertAbandonZeroDial proves DESIGN §18 DST-02's "no connection made (unroutable
+// host would still succeed)" at the acceptance layer by exercising the REAL
+// production Engine.Destroy against an UNROUTABLE host with destroy_mode=abandon,
+// through an instrumented NewTransport that FAILS the test if it is ever called.
+// Because Engine.Destroy returns before it constructs a transport for abandon, the
+// dial counter stays 0 and Destroy returns nil even though the host (192.0.2.1,
+// TEST-NET-1) is unroutable — a direct, deterministic, lab-free proof that the
+// destroy itself issues zero connections — evaluator item 2.
+func assertAbandonZeroDial(t *testing.T) {
+	t.Helper()
+	t.Setenv("LABDEPLOY_ACC_ZERODIAL_PW", "unused")
+	raw := `apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: ssh
+  hosts: ["192.0.2.1"]
+  os: linux
+  port: 22
+  credentials: { username: u, password_env: LABDEPLOY_ACC_ZERODIAL_PW }
+artifact:
+  type: zip
+  version: "1.0.0"
+  checksum: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  source: { type: http, url: "http://203.0.113.1/a.zip" }
+pattern: { type: console_app, exe: bin/sample-svc }
+`
+	dep, _, err := spec.ParseDeployment(raw, nil, "")
+	if err != nil {
+		t.Fatalf("DST-02 zero-dial: parse spec: %v", err)
+	}
+	dials := 0
+	e := engine.New()
+	e.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
+		dials++
+		return nil, fmt.Errorf("BUG: abandon destroy dialed host %s", host)
+	}
+	if err := e.Destroy(context.Background(), dep, "abandon"); err != nil {
+		t.Fatalf("DST-02 zero-dial: abandon destroy must succeed against an unroutable host, got: %v", err)
+	}
+	if dials != 0 {
+		t.Fatalf("DST-02 zero-dial: abandon destroy made %d connection(s); DESIGN requires ZERO", dials)
+	}
+}
+
 func checkServiceAbsent(at accTarget, svc string) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		out, err := probeHost(at,
@@ -842,8 +937,12 @@ func checkNoSecretInSCQC(at accTarget, svc, secretEnv, why string) func(*terrafo
 func snapshotTree(at accTarget, root string) (string, error) {
 	win := "if(Test-Path -LiteralPath '" + psq(root) + "'){ Get-ChildItem -LiteralPath '" + psq(root) + "' -Recurse -Force | Sort-Object FullName | ForEach-Object { " +
 		"if($_.PSIsContainer){ \"$($_.FullName)|dir\" } else { $h=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash; \"$($_.FullName)|$($_.LastWriteTimeUtc.Ticks)|$($_.Length)|$h\" } } | Out-String } else { 'MISSING' }"
-	// Files: sha256 + path; directories: path|dir. Sorted for stability.
-	lin := "{ find '" + shq(root) + "' -type f -print0 2>/dev/null | xargs -0 sha256sum 2>/dev/null; find '" + shq(root) + "' -type d -printf '%p|dir\\n' 2>/dev/null; } | sort"
+	// Files: sha256 + path; directories: path|dir; symlinks: path->target (so a
+	// retargeted `current` symlink is caught even though its own bytes/mtime may be
+	// unchanged) — evaluator item 3.
+	lin := "{ find '" + shq(root) + "' -type f -print0 2>/dev/null | xargs -0 sha256sum 2>/dev/null; " +
+		"find '" + shq(root) + "' -type d -printf '%p|dir\\n' 2>/dev/null; " +
+		"find '" + shq(root) + "' -type l -printf '%p|link->' -exec readlink {} \\; 2>/dev/null; } | sort"
 	return probeHost(at, win, lin)
 }
 

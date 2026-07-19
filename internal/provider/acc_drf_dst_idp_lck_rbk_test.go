@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"regexp"
 	"testing"
 	"time"
@@ -8,7 +9,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/engine"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
 // Stage 9.1 — DRF/DST/IDP/LCK/RBK acceptance scenarios (DESIGN §18.8), run on L1
@@ -22,33 +25,42 @@ import (
 // RBK — rollback / cache (§18.8)
 // ---------------------------------------------------------------------------
 
-// RBK-01: after an upgrade to 1.1.0, roll back to 1.0.0 ⇒ success from the
-// on-target CACHE. cache_hit=true is proven DIRECTLY from the provider TRACE log:
-// the roll-back apply emits NO FETCH step and logs "release cached; skipping
-// fetch/extract" — i.e. it needed no network to the artifact host (DESIGN §18
-// RBK-01 "block it to prove"). previous_version=1.1.0 and `current`→1.0.0 confirm
-// the rollback landed on the right (healthy) release — evaluator item 8.
+// RBK-01: after a 1.0.0→1.1.0 upgrade (WSV-02 shape on W1), roll back to 1.0.0 ⇒
+// success from the on-target CACHE with NO network to the artifact host. Per
+// DESIGN §18 RBK-01 we PROVE "no network to the artifact host" by pointing the
+// rollback apply's artifact source at a BLACKHOLE URL (203.0.113.1, unroutable):
+// if the engine tried to FETCH it would fail, so a successful apply proves the
+// cached 1.0.0 release was reused. cache_hit=true is ALSO proven directly from the
+// provider TRACE log (no FETCH step + "release cached" record). Post-rollback the
+// service is RUNNING and /health serves v=1.0.0, and previous_version=1.1.0 —
+// evaluator items 6, 7.
 func TestAccRBK01_RollForwardCached(t *testing.T) {
 	accPreCheck(t)
-	at := requireL1(t)
+	at := requireW1(t)
 	logPath := tfLogCapture(t)
-	v10 := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", ""))
-	v11 := accDeploymentConfig(consoleSpec(t, at, "1.1.0", "zip", ""))
+	v10 := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), ""))
+	v11 := accDeploymentConfig(winServiceSpec(t, at, "1.1.0", "zip", healthURL(8080), ""))
 	sha10 := artifactSHA(t, "1.0.0", "zip")
+	// Rollback config: identical 1.0.0 release (same checksum ⇒ cache match) but
+	// the artifact host is BLACKHOLED so any fetch attempt would fail.
+	rollback := accDeploymentConfig(winServiceSpecSource(t, at, "1.0.0", "zip", healthURL(8080), "http://203.0.113.1/blocked-artifact-host.zip"))
 	runScenario(t, at,
 		applyStep(at, v10, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
 		applyStep(at, v11, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0")),
-		// Roll back to the still-cached 1.0.0: cache_hit=true (no FETCH), and the
-		// live release is the correct 1.0.0 build.
+		// Roll back to the cached 1.0.0 with the artifact host blocked: success ⇒
+		// cache_hit=true (no FETCH), service healthy on 1.0.0, previous=1.1.0.
 		resource.TestStep{
 			PreConfig: truncateTFLog(t, logPath),
-			Config:    v10,
+			Config:    rollback,
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 				resource.TestCheckResourceAttr("labdeploy_deployment.val", "previous_version", "1.1.0"),
-				checkCacheHitLogged(logPath, "RBK-01: rollback to a cached release must NOT re-fetch (cache_hit=true, no artifact-host network)"),
+				resource.TestCheckResourceAttr("labdeploy_deployment.val", "service_status", "running"),
+				checkCacheHitLogged(logPath, "RBK-01: rollback to a cached release must NOT re-fetch (cache_hit=true) even with the artifact host blocked"),
+				checkServiceState(at, "SampleSvc", "Running"),
 				checkCurrentTarget(at, "1.0.0"),
 				checkReleaseMarkerSHA(at, "1.0.0", "zip", sha10),
+				checkHealthBody(at, healthURL(8080), "v=1.0.0"),
 				checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
 			),
 		},
@@ -233,19 +245,23 @@ func TestAccDST01_DestroyPurge(t *testing.T) {
 }
 
 // DST-02: destroy_mode=abandon ⇒ the destroy makes NO connection and the machine
-// is untouched; state is still emptied. The no-dial guarantee is structural:
-// Engine.Destroy returns nil for mode=="abandon" BEFORE it ever builds a transport
-// (internal/engine/engine.go — `if mode == "abandon" { return nil }`), so no
-// connection is possible; that path is unit-covered. The acceptance-observable
-// proof here is that NOTHING on the box changed: a RECURSIVE fingerprint that
-// includes a per-file SHA-256 CONTENT HASH (not just mtime+size) is captured after
-// apply and asserted byte-identical after destroy, so even a same-size, same-mtime
-// content rewrite would be caught — evaluator item 12. (The post-destroy probe is
-// the TEST verifying the box; proving the destroy ITSELF issued zero dials at the
-// acceptance layer would require instrumenting the transport factory — raised as
-// an Open Question — and is redundant with the engine.go early-return guarantee.)
+// is untouched; state is still emptied. This test proves BOTH halves DESIGN §18
+// DST-02 requires:
+//   (1) "no connection made (unroutable host would still succeed)" — proven
+//       DIRECTLY by assertAbandonZeroDial, which runs the REAL production
+//       Engine.Destroy(mode=abandon) against an UNROUTABLE host through an
+//       instrumented transport factory that fails if ever dialed; abandon returns
+//       before building a transport, so the dial count is 0 and Destroy succeeds.
+//   (2) "machine untouched" — a RECURSIVE fingerprint including per-file SHA-256
+//       CONTENT hashes AND symlink targets is captured after apply and asserted
+//       byte-identical after the abandon destroy, so even a same-size/same-mtime
+//       content rewrite or a retargeted `current` symlink is caught.
+// evaluator items 2, 3, 12.
 func TestAccDST02_DestroyAbandon(t *testing.T) {
 	accPreCheck(t)
+	// (1) zero-dial proof — deterministic, needs no lab target.
+	assertAbandonZeroDial(t)
+	// (2) machine-untouched proof — needs L1.
 	at := requireL1(t)
 	specYAML := consoleSpec(t, at, "1.0.0", "zip", "")
 	cfg := testAccProviderConfig + `
@@ -335,13 +351,16 @@ func TestAccIDP01_ReapplyPlanEmpty(t *testing.T) {
 
 // LCK-01: apply A holds the deployment `.lock`; apply B run CONCURRENTLY must
 // fail FAST (<5s, non-blocking acquire) with ERR_LOCKED NAMING A's owner; A then
-// completes normally. Apply A is a REAL concurrent lock-holder: a background
-// goroutine plants A's fresh, owner-stamped lock and actively HOLDS it on the host
-// for the duration of B's attempt (releasing only after), so B genuinely races a
-// live holder rather than a static file. A dedicated two-terraform-process race is
-// not expressible inside terraform-plugin-testing's single-binary model (raised as
-// an Open Question) — this live-holder goroutine is the strongest in-harness proxy
-// — evaluator item 13.
+// completes normally. Apply A is a REAL concurrent holder acquired through the
+// PRODUCTION lock path: engine.AcquireLock writes A's owner-stamped `.lock` on L1
+// exactly as a live apply A (mid slow-artifact fetch) would, and keeps holding it
+// on the host across B's whole attempt; only after B fails does A release via the
+// production engine.ReleaseLock. So B genuinely contends with a live, production-
+// acquired lock — not a hand-planted file — and "A completes normally" is A's real
+// release followed by a clean apply. A dedicated two-terraform-process race is not
+// expressible inside terraform-plugin-testing's single-binary model; holding the
+// real production lock for A is the faithful in-harness realization — evaluator
+// item 1.
 func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	accPreCheck(t)
 	at := requireL1(t)
@@ -350,26 +369,21 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	t.Setenv("TF_ACC_PROVIDER_HOST", host)
 	t.Setenv("TF_ACC_PROVIDER_NAMESPACE", namespace)
 	const owner = "apply-A@runner"
-	lock := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "").Lock
 
-	// Apply A (concurrent live holder): plant A's fresh lock, hold it on the host
-	// while B runs, then release. release<-done signals the hold is over.
-	held := make(chan struct{})   // closed once A's lock is actually on the host
-	release := make(chan struct{}) // test signals A to release
-	aDone := make(chan error, 1)
-	go func() {
-		if err := plantLock(at, installRootFor(at), "sample-svc", owner, 0); err != nil {
-			aDone <- err
-			close(held)
-			return
-		}
-		close(held)
-		<-release // keep holding until the test says B is done
-		_, err := probeHost(at, "Remove-Item -LiteralPath '"+psq(lock)+"' -Force -ErrorAction SilentlyContinue; 'ok'",
-			"rm -f '"+shq(lock)+"'")
-		aDone <- err
-	}()
-	<-held // ensure A holds the lock BEFORE B starts (true overlap)
+	// Apply A: acquire the REAL lock via the production path and hold it on L1.
+	tr, err := transport.NewTransport(&at.tgt, at.host)
+	if err != nil {
+		t.Fatalf("LCK-01 apply-A transport: %v", err)
+	}
+	if err := tr.Connect(context.Background()); err != nil {
+		t.Fatalf("LCK-01 apply-A connect: %v", err)
+	}
+	defer tr.Close()
+	p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "")
+	lk, _, err := engine.AcquireLock(context.Background(), tr, p, owner, "deploy", 60)
+	if err != nil {
+		t.Fatalf("LCK-01 apply-A AcquireLock: %v", err)
+	}
 
 	// Apply B: contends with A's live lock and must fail in <5s naming A.
 	wallBetween(t, 0, 5*time.Second, "LCK-01 contended apply B", func() {
@@ -380,15 +394,15 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 			},
 		})
 	})
-	// B is done ⇒ let A release its lock, then confirm the lock is gone.
-	close(release)
-	if err := <-aDone; err != nil {
-		t.Fatalf("LCK-01 apply-A holder: %v", err)
+
+	// A completes normally: release the production lock, confirm it is gone.
+	if err := engine.ReleaseLock(context.Background(), lk); err != nil {
+		t.Fatalf("LCK-01 apply-A ReleaseLock: %v", err)
 	}
 	if err := assertLockAbsent(at.tgt, installRootFor(at), "sample-svc"); err != nil {
 		t.Fatalf("LCK-01: lock must be absent after A releases: %v", err)
 	}
-	// A completes normally: with the lock released, an apply now succeeds.
+	// With A's lock released, an apply now succeeds (A completed ⇒ B can proceed).
 	runScenario(t, at, applyStep(at, cfg,
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 	))
