@@ -716,8 +716,9 @@ func TestDockerFreshHealthFailureRollbackDisabledKeepsContainer(t *testing.T) {
 // item 1: when the fresh-install cleanup `docker rm -f` itself GENUINELY fails
 // (daemon rejects removal), the machine is NOT clean — a rejected container may
 // still be running — so the engine must surface ERR_ROLLBACK_FAILED / MACHINE IN
-// UNKNOWN STATE rather than quietly returning the health error and trusting the
-// recorded failed state.
+// UNKNOWN STATE. Per DESIGN §10.6, that unknown state must ALSO persist a failed
+// manifest (last_operation={type:deploy,result:failed}) at the attempted version
+// so Read reports drift and a re-apply attempts a repairing deploy (iter17 items 1/2).
 func TestDockerFreshHealthFailureCleanupFailureAborts(t *testing.T) {
 	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:freshimg", removeErr: true}
 	eng := New()
@@ -735,6 +736,12 @@ func TestDockerFreshHealthFailureCleanupFailureAborts(t *testing.T) {
 	}
 	if len(n.removeScripts) == 0 {
 		t.Fatalf("cleanup must have ATTEMPTED a `docker rm -f`; none issued (log=%v)", n.fakeHost.log)
+	}
+	// §10.6: ERR_ROLLBACK_FAILED MUST persist a failed manifest at the attempted
+	// version so the unknown state surfaces as drift on the next Read.
+	m := string(n.fakeHost.files[dockerManifestPath])
+	if !strings.Contains(m, `"current_version": "2.0.0"`) || !strings.Contains(m, `"result": "failed"`) {
+		t.Fatalf("§10.6: cleanup-failure unknown state must persist a failed manifest at attempted version 2.0.0: %s", m)
 	}
 }
 

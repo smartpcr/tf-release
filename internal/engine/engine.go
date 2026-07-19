@@ -563,11 +563,23 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 			if cleanupErr := sl.timed(ctx, "STOP", func() error {
 				return dc.Remove(ctx, t, rc.Spec.Pattern.ContainerName)
 			}); cleanupErr != nil {
-				// The fresh container could not be removed — the machine is NOT clean.
-				// Surface UNKNOWN STATE so the operator intervenes (§10.6).
-				return nil, coded("ERR_ROLLBACK_FAILED", host, "STOP",
-					fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — fresh container %q could not be removed after a failed install: %v; deploy error: %v",
-						host, rc.Spec.Pattern.ContainerName, cleanupErr, runErr))
+				// The fresh container could not be removed — the machine is NOT
+				// clean. §10.6 requires that ERR_ROLLBACK_FAILED still persist
+				// manifest.last_operation={type:deploy,result:failed} before the
+				// error is surfaced, so a subsequent Read reports the unknown state
+				// as drift and a re-apply attempts a repairing deploy. Record at the
+				// attempted version (fresh ⇒ prev==""; evaluator iter17 items 1/2).
+				failVer := prev
+				if failVer == "" {
+					failVer = s.Artifact.Version
+				}
+				fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started, manifestExtra(m))
+				detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — fresh container %q could not be removed after a failed install: %v; deploy error: %v",
+					host, rc.Spec.Pattern.ContainerName, cleanupErr, runErr)
+				if fmErr != nil {
+					detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
+				}
+				return nil, coded("ERR_ROLLBACK_FAILED", host, "STOP", detail)
 			}
 			// Machine is clean ⇒ manifest MUST be ABSENT (§10.2: "manifest absent",
 			// "no TF state"). removePath is idempotent — on a first install there is
