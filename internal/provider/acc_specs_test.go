@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -832,13 +833,202 @@ func checkNoSecretInSCQC(at accTarget, svc, secretEnv, why string) func(*terrafo
 	}
 }
 
-// snapshotTree returns a stable, sorted recursive listing of every entry under
-// root with its mtime and size — a byte-identical fingerprint used to prove an
-// abandon destroy changed NOTHING on the box (DST-02) — evaluator item 15.
+// snapshotTree returns a stable, sorted recursive fingerprint of every entry
+// under root. For files it includes a SHA-256 CONTENT HASH (plus mtime + size);
+// for directories it records the path. The content hash is what makes this a
+// faithful "nothing changed" proof for an abandon destroy (DST-02): a same-size,
+// same-mtime content rewrite still flips the hash, so it cannot slip through —
+// evaluator item 12(b).
 func snapshotTree(at accTarget, root string) (string, error) {
-	return probeHost(at,
-		fmt.Sprintf("if(Test-Path -LiteralPath '%s'){ Get-ChildItem -LiteralPath '%s' -Recurse -Force | Sort-Object FullName | ForEach-Object { \"$($_.FullName)|$($_.LastWriteTimeUtc.Ticks)|$($_.Length)\" } | Out-String } else { 'MISSING' }", psq(root), psq(root)),
-		fmt.Sprintf("find '%s' -printf '%%p|%%T@|%%s\\n' 2>/dev/null | sort", shq(root)))
+	win := "if(Test-Path -LiteralPath '" + psq(root) + "'){ Get-ChildItem -LiteralPath '" + psq(root) + "' -Recurse -Force | Sort-Object FullName | ForEach-Object { " +
+		"if($_.PSIsContainer){ \"$($_.FullName)|dir\" } else { $h=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash; \"$($_.FullName)|$($_.LastWriteTimeUtc.Ticks)|$($_.Length)|$h\" } } | Out-String } else { 'MISSING' }"
+	// Files: sha256 + path; directories: path|dir. Sorted for stability.
+	lin := "{ find '" + shq(root) + "' -type f -print0 2>/dev/null | xargs -0 sha256sum 2>/dev/null; find '" + shq(root) + "' -type d -printf '%p|dir\\n' 2>/dev/null; } | sort"
+	return probeHost(at, win, lin)
+}
+
+// tfLogCapture routes the provider's tflog output (the DESIGN §8.5 structured
+// "deploy step" records, cache decisions, etc.) into a per-test TRACE log file so
+// Check functions can assert which steps the engine actually emitted — the only
+// faithful way to prove "no FETCH/SWITCH" (DRF), FORCE_KILL escalation (WSV-07),
+// cache_hit (RBK), and secret redaction (WSV-08). Terraform forwards provider
+// logs to TF_LOG_PATH when TF_LOG(_PROVIDER)=TRACE. Returns the log path.
+func tfLogCapture(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "tf-trace.log")
+	t.Setenv("TF_LOG", "TRACE")
+	t.Setenv("TF_LOG_PROVIDER", "TRACE")
+	t.Setenv("TF_LOG_PATH", p)
+	return p
+}
+
+// truncateTFLog empties the capture file so the NEXT apply's records are the only
+// ones present — used in a step PreConfig to scope a step-log assertion to a
+// single apply.
+func truncateTFLog(t *testing.T, path string) func() {
+	return func() { _ = os.WriteFile(path, nil, 0o600) }
+}
+
+// readTFLogLines returns the non-empty lines of the capture file.
+func readTFLogLines(path string) ([]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, ln := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(ln) != "" {
+			out = append(out, ln)
+		}
+	}
+	return out, nil
+}
+
+// stepLineRe matches a provider "deploy step" TRACE record carrying step=<NAME>
+// (tflog renders fields as key=value on the message line).
+func stepLineRe(step string) *regexp.Regexp {
+	return regexp.MustCompile(`(?i)deploy step.*\bstep=` + regexp.QuoteMeta(step) + `\b`)
+}
+
+// haveAnyStepLog proves the TRACE capture actually worked: at least one "deploy
+// step" record must be present. Without this guard an EMPTY/uncaptured log would
+// make every "step absent" assertion pass vacuously (the WSV-02 failure mode the
+// evaluator flagged) — so absence checks call this first.
+func haveAnyStepLog(lines []string) bool {
+	for _, ln := range lines {
+		if strings.Contains(strings.ToLower(ln), "deploy step") {
+			return true
+		}
+	}
+	return false
+}
+
+// checkTFLogMatches asserts the provider TRACE log matches re (used for WARN
+// diagnostics that Terraform surfaces into its logs but that terraform-plugin-
+// testing exposes no Check hook for, e.g. the LCK-02 stale-lock override notice).
+func checkTFLogMatches(path string, re *regexp.Regexp, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		if len(b) == 0 {
+			return fmt.Errorf("%s: TRACE log empty; expected a match for %s", why, re.String())
+		}
+		if !re.Match(b) {
+			return fmt.Errorf("%s: TRACE log has no match for %s", why, re.String())
+		}
+		return nil
+	}
+}
+func checkStepLogged(path, step, why string) func(*terraform.State) error {
+	re := stepLineRe(step)
+	return func(*terraform.State) error {
+		lines, err := readTFLogLines(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		for _, ln := range lines {
+			if re.MatchString(ln) {
+				return nil
+			}
+		}
+		return fmt.Errorf("%s: no structured step=%s record in the provider TRACE log", why, step)
+	}
+}
+
+// checkStepNotLogged asserts the engine did NOT emit step=<step>, but only after
+// proving the capture worked (≥1 deploy-step record exists) so an empty log can't
+// pass vacuously.
+func checkStepNotLogged(path, step, why string) func(*terraform.State) error {
+	re := stepLineRe(step)
+	return func(*terraform.State) error {
+		lines, err := readTFLogLines(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		if !haveAnyStepLog(lines) {
+			return fmt.Errorf("%s: no deploy-step records captured; cannot prove step=%s absence (log empty/uncaptured)", why, step)
+		}
+		for _, ln := range lines {
+			if re.MatchString(ln) {
+				return fmt.Errorf("%s: engine emitted a forbidden step=%s record", why, step)
+			}
+		}
+		return nil
+	}
+}
+
+// checkCacheHitLogged proves cache_hit=true the way the provider actually
+// expresses it (engine.go: no FETCH step + the "release cached; skipping
+// fetch/extract" record) — evaluator item 8. DESIGN's `cache_hit=true` field is
+// realized as this step-skip signal.
+func checkCacheHitLogged(path, why string) func(*terraform.State) error {
+	fetch := stepLineRe("FETCH")
+	return func(*terraform.State) error {
+		lines, err := readTFLogLines(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		if !haveAnyStepLog(lines) {
+			return fmt.Errorf("%s: no deploy-step records captured; cannot prove cache hit", why)
+		}
+		cached := false
+		for _, ln := range lines {
+			if fetch.MatchString(ln) {
+				return fmt.Errorf("%s: a FETCH step was emitted — the release was NOT served from cache", why)
+			}
+			if strings.Contains(strings.ToLower(ln), "release cached") {
+				cached = true
+			}
+		}
+		if !cached {
+			return fmt.Errorf("%s: expected the 'release cached; skipping fetch/extract' record (cache_hit=true)", why)
+		}
+		return nil
+	}
+}
+
+// checkRefetchLogged proves cache_hit=false: a FETCH step WAS emitted (the pruned
+// release had to be re-downloaded) and the cache-hit record is absent — item 9.
+func checkRefetchLogged(path, why string) func(*terraform.State) error {
+	fetch := stepLineRe("FETCH")
+	return func(*terraform.State) error {
+		lines, err := readTFLogLines(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		for _, ln := range lines {
+			if fetch.MatchString(ln) {
+				return nil
+			}
+		}
+		return fmt.Errorf("%s: expected a FETCH step (re-fetch / cache_hit=false) but none was logged", why)
+	}
+}
+
+// checkSecretAbsentInLog asserts the account password VALUE never appears in the
+// provider's TRACE log — the realizable proof of DESIGN §18 WSV-08 "secret absent
+// from the sc qc capture in TF logs at TRACE": secrets are only ever carried in
+// the base64 env blob, never in any logged command text — evaluator item 7.
+func checkSecretAbsentInLog(path, secretEnv, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		secret := os.Getenv(secretEnv)
+		if secret == "" {
+			return fmt.Errorf("%s: %s not set (needed to prove secret absence in logs)", why, secretEnv)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		if len(b) == 0 {
+			return fmt.Errorf("%s: TRACE log empty; cannot prove redaction", why)
+		}
+		if strings.Contains(string(b), secret) {
+			return fmt.Errorf("%s: the account password leaked into the provider TRACE log", why)
+		}
+		return nil
+	}
 }
 
 // checkTreeUnchanged asserts the recursive fingerprint of root equals `before`.
@@ -875,24 +1065,55 @@ func startDowntimeProbe(at accTarget, url string, durSec int) error {
 	return err
 }
 
-// checkDowntimeBounded reads the poller log and asserts the longest run of
-// consecutive FAIL samples (≈ seconds of outage) does not exceed maxSec — the
-// DESIGN §18 WSV-02 downtime bound (≤ stop_timeout+15s) — evaluator item 9.
+// checkDowntimeBounded reads the poller log and asserts (1) enough samples were
+// captured to be meaningful, (2) the service was HEALTHY before the outage and
+// RECOVERED after it — so a truncated/empty capture with maxRun=0 can never pass
+// vacuously — and (3) the longest run of consecutive FAIL samples (≈ seconds of
+// outage) does not exceed maxSec (DESIGN §18 WSV-02 ≤ stop_timeout+15s) —
+// evaluator item 3.
 func checkDowntimeBounded(at accTarget, maxSec int, why string) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		out, err := hostReadFile(at, ldDowntimeLog)
 		if err != nil {
 			return fmt.Errorf("%s: read downtime log: %w", why, err)
 		}
+		samples := strings.Fields(out)
+		if len(samples) < 5 {
+			return fmt.Errorf("%s: only %d downtime samples captured; the 1 Hz probe did not run across the upgrade", why, len(samples))
+		}
+		isFail := func(s string) bool { return strings.EqualFold(strings.TrimSpace(s), "FAIL") }
 		maxRun, cur := 0, 0
-		for _, ln := range strings.Fields(out) {
-			if strings.EqualFold(strings.TrimSpace(ln), "FAIL") {
+		firstFail, lastFail, okBefore := -1, -1, false
+		for i, s := range samples {
+			if isFail(s) {
+				if firstFail < 0 {
+					firstFail = i
+				}
+				lastFail = i
 				cur++
 				if cur > maxRun {
 					maxRun = cur
 				}
 			} else {
 				cur = 0
+				if firstFail < 0 {
+					okBefore = true
+				}
+			}
+		}
+		if firstFail >= 0 {
+			// There WAS an outage: require a healthy sample before it and recovery after.
+			if !okBefore {
+				return fmt.Errorf("%s: no successful health sample BEFORE the outage — capture is partial, cannot bound downtime", why)
+			}
+			okAfter := false
+			for i := lastFail + 1; i < len(samples); i++ {
+				if !isFail(samples[i]) {
+					okAfter = true
+				}
+			}
+			if !okAfter {
+				return fmt.Errorf("%s: service never returned healthy after the outage (last %d samples still FAIL)", why, len(samples)-lastFail-1)
 			}
 		}
 		if maxRun > maxSec {
@@ -986,6 +1207,23 @@ func wallBetween(t *testing.T, min, max time.Duration, what string, fn func()) {
 	}
 }
 
+// wallSinceBetween returns a check asserting the wall time since *t0 is within
+// [min,max]. Used by WSV-06 to prove a winsw <stopwait> was HONORED: against a
+// slow-stop build the upgrade's STOP phase must take AT LEAST most of stopwait
+// (it actually waited, not stopped instantly) and at most stopwait+margin (winsw
+// force-killed at the deadline rather than hanging).
+func wallSinceBetween(t0 *time.Time, min, max time.Duration, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		d := time.Since(*t0)
+		if d > max {
+			return fmt.Errorf("%s: took %s, want <= %s", why, d, max)
+		}
+		if d < min {
+			return fmt.Errorf("%s: took %s, want >= %s (stopwait was not honored — stop returned too early)", why, d, min)
+		}
+		return nil
+	}
+}
 // wallSince returns a check asserting the wall time elapsed since *t0 is ≤ max.
 // The caller sets *t0 in the step's PreConfig (which runs immediately before the
 // apply) so the Check (which runs immediately after) bounds that single apply's

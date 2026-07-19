@@ -70,11 +70,12 @@ func valWinService(t *testing.T) {
 	t.Setenv("LABDEPLOY_ACC_VAL_PW", "pw")
 }
 
-// VAL-01: tab-broken YAML ⇒ ERR_SPEC_INVALID; no connection attempted (host is
-// unroutable, but plan-time parse fails first so it is never dialed).
+// VAL-01: tab-broken YAML ⇒ ERR_SPEC_INVALID naming the offending SOURCE LINE
+// (yaml.v3 reports `line N`); no connection attempted (host is unroutable, but
+// plan-time parse fails first so it is never dialed) — evaluator item 1.
 func TestAccVAL01_TabBrokenYAML(t *testing.T) {
 	spec := "apiVersion: labdeploy/v1\nkind: Deployment\nmetadata:\n\tname: bad\n"
-	valCase(t, spec, regexp.MustCompile(`ERR_SPEC_INVALID`))
+	valCase(t, spec, regexp.MustCompile(`ERR_SPEC_INVALID(?s).*line \d`))
 }
 
 // VAL-02: missing artifact.version ⇒ ERR_SPEC_INVALID naming artifact.version.

@@ -297,16 +297,17 @@ strategy: { keep_releases: 2 }
 }
 
 // ART-05: W1 fetch_mode target_pull with an auth header env ⇒ success proven to
-// be a TARGET-side pull. Runs only when LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED=1
-// (the runner's egress to the package host is firewalled), so a successful deploy
-// is possible ONLY if the target fetched the payload itself — the DESIGN §18
-// ART-05 discriminator. Without that isolation the test SKIPS rather than passing
-// on an unproven path — evaluator item 5.
+// be a TARGET-side pull. Under TF_ACC=1 the runner's egress to the package host
+// MUST be firewalled (LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED=1) so a successful
+// deploy is possible ONLY if the target fetched the payload itself — the DESIGN
+// §18 ART-05 discriminator. The proof environment is REQUIRED (hard-fail), not
+// skipped, so the acceptance gate can never pass on the unproven path —
+// evaluator item 2.
 func TestAccART05_TargetPull(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
 	if os.Getenv("LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED") != "1" {
-		t.Skip("set LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED=1 (runner egress to the package host blocked) so a successful deploy PROVES the target pulled the artifact")
+		t.Fatalf("ART-05 under TF_ACC=1 requires LABDEPLOY_ACC_ART_RUNNER_EGRESS_BLOCKED=1 (runner egress to the package host firewalled) so a successful deploy PROVES the target pulled the artifact; refusing to pass on an unproven path")
 	}
 	sha := artifactSHA(t, "1.0.0", "zip")
 	if os.Getenv("LABDEPLOY_ACC_ART_TOKEN") == "" {

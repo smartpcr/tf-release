@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
 // Stage 9.1 — WSV (§18.5) and NOD/NET (§18.6) acceptance scenarios on W1
@@ -94,12 +95,17 @@ func TestAccWSV03_FailStartRollsBack(t *testing.T) {
 	at := requireW1(t)
 	v11 := accDeploymentConfig(winServiceSpec(t, at, "1.1.0", "zip", healthURL(8080), ""))
 	bad := accDeploymentConfig(winServiceSpec(t, at, "1.2.0-bad", "zip", healthURL(8080), ""))
-	// Capture the moment the failing apply begins so the event-log assertion only
-	// accepts an SCM failure raised AFTER this point (not a stale historical one).
-	since := time.Now()
+	// Captured in the FAILING step's PreConfig (immediately before the bad apply)
+	// so the event-log assertion only accepts an SCM failure raised by THIS apply,
+	// never a stale event from the preceding good 1.1.0 apply — evaluator item 4.
+	var since time.Time
 	runScenario(t, at,
 		applyStep(at, v11, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0")),
-		errorStep(bad, `ERR_SERVICE_START`),
+		resource.TestStep{
+			PreConfig:   func() { since = time.Now() },
+			Config:      bad,
+			ExpectError: mustRe(`ERR_SERVICE_START`),
+		},
 		// Post-rollback: re-applying 1.1.0 is a no-op that lets Check assert the
 		// rolled-back live state (service running on 1.1.0, junction & health on
 		// 1.1.0, an SCM event was logged for the failed 1.2.0-bad start).
@@ -109,7 +115,9 @@ func TestAccWSV03_FailStartRollsBack(t *testing.T) {
 			checkServiceState(at, "SampleSvc", "Running"),
 			checkCurrentTarget(at, "1.1.0"),
 			checkHealthBody(at, healthURL(8080), "v=1.1.0"),
-			checkWindowsEventLog(at, "SampleSvc", since, "WSV-03: fail-start must log an SCM 7000/7009 event for SampleSvc"),
+			func(s *terraform.State) error {
+				return checkWindowsEventLog(at, "SampleSvc", since, "WSV-03: fail-start must log an SCM 7000/7009 event for SampleSvc")(s)
+			},
 		),
 		// Convergence: with the good version live, the next plan is empty.
 		resource.TestStep{
@@ -176,56 +184,68 @@ func TestAccWSV05_NoRollbackLeavesDrift(t *testing.T) {
 
 // WSV-06: wrapper=winsw wrapping a console build with stop_timeout_seconds=10 ⇒
 // fresh + upgrade both ok; the WinSW service XML under `current` is REGENERATED
-// on upgrade (references the new version) AND carries <stopwait>10sec</stopwait>
-// (the configured stop budget is honored) — evaluator items 11, 12.
+// on upgrade (references the new version) AND carries <stopwait>10sec</stopwait>.
+// The upgrade deploys a SLOW-STOP build (ignores graceful stop) so the stopwait
+// is exercised, not just declared: the STOP phase must take AT LEAST ~8s (winsw
+// actually waited near the 10s budget) and at most ~25s (winsw force-killed at
+// the deadline rather than hanging) — evaluator item 5.
 func TestAccWSV06_WinswWrapper(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
 	extra := "  wrapper: winsw\n  winsw_exe: tools\\winsw.exe\n  stop_timeout_seconds: 10"
 	v10 := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), extra))
-	v11 := accDeploymentConfig(winServiceSpec(t, at, "1.1.0", "zip", healthURL(8080), extra))
+	slow := accDeploymentConfig(winServiceSpec(t, at, "1.1.0-slowstop", "zip", healthURL(8080), extra))
+	var t0 time.Time
 	runScenario(t, at,
 		applyStep(at, v10,
 			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 			checkWinswXMLVersion(at, "1.0.0", "WSV-06: fresh winsw xml references 1.0.0"),
 			checkWinswStopwait(at, 10, "WSV-06: winsw xml must honor stop_timeout_seconds"),
 		),
-		applyStep(at, v11,
-			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0"),
-			checkWinswXMLVersion(at, "1.1.0", "WSV-06: winsw xml regenerated to 1.1.0 on upgrade"),
-			checkWinswStopwait(at, 10, "WSV-06: regenerated winsw xml must still carry stopwait"),
-		),
+		// Upgrade to the slow-stop build: winsw must wait the full stopwait before
+		// force-killing, so the apply wall proves the stopwait was HONORED.
+		resource.TestStep{
+			PreConfig: func() { t0 = time.Now() },
+			Config:    slow,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0-slowstop"),
+				checkWinswXMLVersion(at, "1.1.0-slowstop", "WSV-06: winsw xml regenerated on upgrade"),
+				checkWinswStopwait(at, 10, "WSV-06: regenerated winsw xml must still carry stopwait"),
+				wallSinceBetween(&t0, 8*time.Second, 25*time.Second, "WSV-06: winsw must honor <stopwait> (wait ~10s then kill) on a slow-stop build"),
+				checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
+			),
+		},
 	)
 }
 
 // WSV-07: an app that IGNORES stop (slow-stop build) with stop_timeout_seconds=10.
-// We deploy it, then roll FORWARD to the already-cached 1.0.0 release — a
-// no-fetch, no-health-wait apply whose wall is dominated by the STOP phase. Because
-// the running service ignores graceful stop, the only way that apply can finish is
-// the S2 FORCE_KILL escalation firing at ~stop_timeout; bounding the cached
-// roll-forward under 25s proves the STOP phase (force-kill) completes within the
-// DESIGN §18 WSV-07 budget without a hang. The structured FORCE_KILL step itself is
-// unit-covered (TestWindowsServiceStopForceKill / TestStepLogForceKillEscalation)
-// — evaluator item 13.
+// We deploy it, then roll FORWARD to the already-cached 1.0.0 release. Because the
+// running service ignores graceful stop, the engine MUST escalate to the S2
+// FORCE_KILL step; we prove that DIRECTLY by asserting the structured
+// `step=FORCE_KILL` record appears in the provider TRACE log for THIS apply, and
+// that the STOP phase completes under the DESIGN §18 WSV-07 25s budget — evaluator
+// item 6. The TRACE log is scoped to the roll-forward apply via truncateTFLog.
 func TestAccWSV07_ForceKillOnSlowStop(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
+	logPath := tfLogCapture(t)
 	v10 := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), "  stop_timeout_seconds: 10"))
 	slow := accDeploymentConfig(winServiceSpec(t, at, "1.1.0-slowstop", "zip", healthURL(8080), "  stop_timeout_seconds: 10"))
 	var t0 time.Time
 	runScenario(t, at,
 		applyStep(at, v10, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
 		applyStep(at, slow, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0-slowstop")),
-		// Roll forward to the CACHED 1.0.0 (no artifact fetch): the wall is the
-		// STOP phase of the stop-ignoring service ⇒ must force-kill within <25s.
-		// PreConfig marks the start; the Check bounds the apply's wall.
+		// Roll forward to the CACHED 1.0.0: the running slow-stop service ignores
+		// graceful stop ⇒ the engine escalates to FORCE_KILL. Truncate the TRACE
+		// log first so the step assertion is scoped to THIS apply only.
 		resource.TestStep{
-			PreConfig: func() { t0 = time.Now() },
+			PreConfig: func() { truncateTFLog(t, logPath)(); t0 = time.Now() },
 			Config:    v10,
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 				checkServiceState(at, "SampleSvc", "Running"),
 				checkHealthBody(at, healthURL(8080), "v=1.0.0"),
+				checkStepLogged(logPath, "FORCE_KILL", "WSV-07: a stop-ignoring service must emit the structured FORCE_KILL step"),
 				wallSince(&t0, 25*time.Second, "WSV-07: STOP phase (force-kill) must finish <25s"),
 				checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
 			),
@@ -234,20 +254,25 @@ func TestAccWSV07_ForceKillOnSlowStop(t *testing.T) {
 }
 
 // WSV-08: non-builtin account `.\svcuser` with password_env ⇒ service
-// ObjectName=.\svcuser AND the account password never appears in the `sc qc`
-// capture the provider logs — evaluator item 14. Requires LABDEPLOY_ACC_SVCUSER_PW.
+// ObjectName=.\svcuser AND the account password never appears in the provider
+// TRACE log (DESIGN §18 WSV-08 "secret absent from the sc qc capture in TF logs
+// at TRACE"). Secrets ride only in the base64 env blob, never in any logged
+// command text, so the redaction proof is: capture TRACE, assert the password
+// value is absent — evaluator item 7. Requires LABDEPLOY_ACC_SVCUSER_PW.
 func TestAccWSV08_NonBuiltinAccount(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
 	if os.Getenv("LABDEPLOY_ACC_SVCUSER_PW") == "" {
 		t.Fatalf("TF_ACC=1 requires LABDEPLOY_ACC_SVCUSER_PW (the .\\svcuser password) for WSV-08")
 	}
+	logPath := tfLogCapture(t)
 	extra := "  account: { username: '.\\\\svcuser', password_env: LABDEPLOY_ACC_SVCUSER_PW }"
 	cfg := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), extra))
 	runScenario(t, at, applyStep(at, cfg,
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "service_status", "running"),
 		checkServiceObjectName(at, "SampleSvc", `.\svcuser`),
+		checkSecretAbsentInLog(logPath, "LABDEPLOY_ACC_SVCUSER_PW", "WSV-08: the account password must never appear in the provider TRACE log"),
 		checkNoSecretInSCQC(at, "SampleSvc", "LABDEPLOY_ACC_SVCUSER_PW", "WSV-08: sc qc capture must not leak the password"),
 	))
 }
