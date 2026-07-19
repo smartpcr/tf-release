@@ -1282,9 +1282,9 @@ func checkStepDurationBetween(path, step string, minMS, maxMS int64, why string)
 	}
 }
 
-
-// fetch/extract" record) — evaluator item 8. DESIGN's `cache_hit=true` field is
-// realized as this step-skip signal.
+// checkCacheHitLogged proves cache_hit=true: no FETCH step was emitted and the
+// engine logged the "release cached; skipping fetch/extract" record — evaluator
+// item 8. DESIGN's `cache_hit=true` field is realized as this step-skip signal.
 func checkCacheHitLogged(path, why string) func(*terraform.State) error {
 	fetch := stepLineRe("FETCH")
 	return func(*terraform.State) error {
