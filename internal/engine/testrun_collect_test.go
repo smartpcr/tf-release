@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -443,4 +445,122 @@ func findFile(t *testing.T, root, name string) string {
 		t.Fatalf("file %q not found under %s", name, root)
 	}
 	return found
+}
+
+// --- Real end-to-end execution of the generated runner watchdog scripts ------
+//
+// Every OTHER runner test in this file drives a fakeRunnerTransport that RETURNS
+// a scripted transport.Result, so the on-target behavior of the generated
+// watchdog scripts (runnerScriptWindows / runnerScriptLinux) is never actually
+// run: TestRunTestTimeoutKillsTree "proves" a timeout by hard-coding
+// Stdout: timeoutMarker, and TestRunnerScriptWindowsKillsTree only string-matches
+// the generated text. That leaves both REAL-target hazards uncovered — exit-code
+// loss on Windows PowerShell 5.1 and the racy/missed ERR_TIMEOUT on linux — so a
+// regression in either would pass CI green. The two tests below (evaluator
+// review) close the gap by executing the REAL generated script for the running OS
+// through the PRODUCTION local transport (DESIGN §8.1), exercising the
+// timeout/exit-code contract end-to-end instead of simulating it. The
+// complementary OS is covered on that OS's CI leg; a host that is neither windows
+// nor linux (or that lacks the shell / setsid the script needs) skips rather than
+// false-fails.
+
+// execRunnerScriptLocally runs the generated runner watchdog for the running OS
+// through the real local transport and returns its Result. TimeoutSec is 0 so the
+// IN-SCRIPT watchdog — not a transport backstop — owns the deadline: that is the
+// exact behavior under test, and a backstop would otherwise mask a broken
+// watchdog by killing via context deadline (which runnerTimedOut would still
+// accept through isTimeoutErr). workDir is a real temp dir so the script's leading
+// `cd` / `Set-Location` succeeds.
+func execRunnerScriptLocally(t *testing.T, cmdline string, timeout int) transport.Result {
+	t.Helper()
+	var osKind spec.OSKind
+	var shell transport.Shell
+	var script string
+	switch runtime.GOOS {
+	case "windows":
+		if _, err := exec.LookPath("powershell.exe"); err != nil {
+			t.Skip("powershell.exe not on PATH; windows watchdog execution proof runs on Windows/CI")
+		}
+		osKind, shell, script = spec.OSWindows, transport.ShellPowerShell, runnerScriptWindows(t.TempDir(), cmdline, timeout)
+	case "linux":
+		if _, err := exec.LookPath("sh"); err != nil {
+			t.Skip("no POSIX sh on PATH; linux watchdog execution proof runs on Linux/CI")
+		}
+		if _, err := exec.LookPath("setsid"); err != nil {
+			t.Skip("setsid not on PATH; linux watchdog needs it for the process-group kill")
+		}
+		osKind, shell, script = spec.OSLinux, transport.ShellSh, runnerScriptLinux(t.TempDir(), cmdline, timeout)
+	default:
+		t.Skipf("runner watchdog scripts target windows/linux only; GOOS=%s", runtime.GOOS)
+	}
+
+	tr, err := transport.NewTransport(&spec.Target{OS: osKind, Transport: spec.TransportLocal}, "localhost")
+	if err != nil {
+		t.Fatalf("build local transport: %v", err)
+	}
+	res, xerr := tr.Exec(context.Background(), transport.Cmd{Shell: shell, Script: script, TimeoutSec: 0})
+	if xerr != nil {
+		// The watchdog always exits with a code; a non-zero app exit is reported
+		// via Result.ExitCode, never as a transport error (transport contract).
+		t.Fatalf("local Exec returned a transport error (exit code must surface in Result, not err): %v", xerr)
+	}
+	return res
+}
+
+// longRunningTargetCommand is a command that runs well past the short watchdog
+// timeout on the running OS so the watchdog MUST force-kill it. It is bounded so a
+// regressed (never-firing) watchdog cannot hang the suite: on linux `wait` returns
+// when `sleep` ends; on windows WaitForExit(ms) always returns, so the command
+// length only bounds a linux regression.
+func longRunningTargetCommand() string {
+	if runtime.GOOS == "windows" {
+		// cmd.exe has no portable sleep; `ping -n N` loops ~N-1s. `>nul` keeps
+		// ping's chatter out of the captured runner stdout.
+		return "ping -n 15 127.0.0.1 >nul"
+	}
+	return "sleep 15"
+}
+
+// TestRunnerScriptExitCodePropagatesLocally executes the REAL generated watchdog
+// (not a fake transport) and asserts a fast non-zero runner exit survives the
+// wrapper (DESIGN §7.3 pass_criteria.exit_codes; E2E-07). On Windows PowerShell
+// 5.1 this is the exact path the `$null = $__pi.Handle` cache protects: without it
+// a within-timeout run reads $__pi.ExitCode back as $null and reports exit 0
+// regardless of the real code (DESIGN D10) — the loss the string-matching
+// TestRunnerScriptWindowsKillsTree cannot see. On linux it proves the watchdog is
+// cancelled on normal completion and `exit $__rc` preserves the real code.
+func TestRunnerScriptExitCodePropagatesLocally(t *testing.T) {
+	res := execRunnerScriptLocally(t, "exit 7", 2)
+	if res.ExitCode != 7 {
+		t.Fatalf("runner exit code lost through the watchdog: ExitCode=%d want 7 (stdout=%q stderr=%q)",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	// A clean non-zero exit must not look like a timeout (no marker emitted).
+	if runnerTimedOut(res, nil) {
+		t.Fatalf("clean non-zero exit misread as a timeout: stdout=%q stderr=%q", res.Stdout, res.Stderr)
+	}
+}
+
+// TestRunnerScriptTimeoutProducesMarkerAndSentinelLocally executes the REAL
+// generated watchdog against a command that outlives a 1s timeout and asserts the
+// target-side timeout contract is genuinely produced — the 124 SENTINEL exit AND
+// the timeout MARKER (DESIGN §5.3 line 367; E2E-04) — rather than hard-coded into
+// a fake Result as every other test does. On linux this runs the setsid
+// process-GROUP kill and guards the zombie race (a killed watchdog previously
+// exited 137 with NO marker, so runnerTimedOut missed it); on windows it runs the
+// WaitForExit(ms) → `taskkill /T /F` → marker → exit 124 path.
+func TestRunnerScriptTimeoutProducesMarkerAndSentinelLocally(t *testing.T) {
+	res := execRunnerScriptLocally(t, longRunningTargetCommand(), 1)
+	if res.ExitCode != timeoutSentinel {
+		t.Fatalf("watchdog did not surface the timeout sentinel: ExitCode=%d want %d (stdout=%q stderr=%q)",
+			res.ExitCode, timeoutSentinel, res.Stdout, res.Stderr)
+	}
+	if !strings.Contains(res.Stdout, timeoutMarker) && !strings.Contains(res.Stderr, timeoutMarker) {
+		t.Fatalf("real watchdog did not emit the timeout marker %q: stdout=%q stderr=%q",
+			timeoutMarker, res.Stdout, res.Stderr)
+	}
+	// The engine's own timeout classifier must accept what the real watchdog produced.
+	if !runnerTimedOut(res, nil) {
+		t.Fatalf("runnerTimedOut did not recognize the real watchdog timeout: stdout=%q stderr=%q", res.Stdout, res.Stderr)
+	}
 }
