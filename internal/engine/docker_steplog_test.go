@@ -634,13 +634,15 @@ func TestDockerFailedManifestPreservesRollbackMetadata(t *testing.T) {
 	}
 }
 
-// TestDockerFreshHealthFailureRemovesContainer covers evaluator iter12 item 1 /
-// DESIGN §10.2: a FRESH install (no prior image to roll back to) whose D5 `docker
-// run` succeeds but whose HEALTH check then fails must NOT leave the rejected
-// container running. The engine must tear it down (`docker rm -f`) so the machine
-// is left clean before returning the apply error, and still persist a failed
-// manifest at the attempted version so Read reports drift. This test would FAIL
-// if the rejected container remained running (n.image stays set).
+// TestDockerFreshHealthFailureRemovesContainer covers DESIGN §10.2's
+// fresh-install row (rollback ENABLED, the default): a FRESH install (no prior
+// image to roll back to) whose D5 `docker run` succeeds but whose HEALTH check
+// then fails must NOT leave the rejected container running. The engine must tear
+// it down (`docker rm -f`) so the machine is left clean AND leave the manifest
+// ABSENT ("machine clean, apply error, no TF state") so Read yields
+// RemoveResource and the next plan re-creates. This test would FAIL if the
+// rejected container remained running (n.image stays set) OR if a failed manifest
+// were persisted (evaluator iter15 items 1/2).
 func TestDockerFreshHealthFailureRemovesContainer(t *testing.T) {
 	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:freshimg"}
 	eng := New()
@@ -666,10 +668,47 @@ func TestDockerFreshHealthFailureRemovesContainer(t *testing.T) {
 	if n.image != "" {
 		t.Fatalf("rejected fresh container must not remain running after cleanup; image=%q", n.image)
 	}
-	// A failed manifest is still persisted at the attempted version for drift.
+	// §10.2: with rollback enabled the machine is left CLEAN with NO TF state —
+	// the manifest MUST be absent (not a persisted failed manifest).
+	if m := string(n.fakeHost.files[dockerManifestPath]); m != "" {
+		t.Fatalf("fresh failure with rollback enabled must leave NO manifest (machine clean, no TF state); found: %s", m)
+	}
+}
+
+// TestDockerFreshHealthFailureRollbackDisabledKeepsContainer covers DESIGN
+// §10.2's "any, rollback_on_failure=false" row for a FRESH install: the engine
+// must take NO compensating action — the rejected container is LEFT running for
+// operator inspection — and a failed manifest is persisted at the attempted
+// version so Read reports drift. This is the opposite of the rollback-enabled
+// fresh case above and would FAIL if the engine force-removed the container or
+// skipped the failed manifest (evaluator iter15 items 3/4).
+func TestDockerFreshHealthFailureRollbackDisabledKeepsContainer(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:freshimg"}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	n.fakeHost.healthGate = func() bool { return true }
+	s := dockerSpec(t, "2.0.0")
+	no := false
+	s.Strategy.RollbackOnFailure = &no
+
+	_, err := eng.Deploy(context.Background(), s)
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_HEALTH_CHECK" {
+		t.Fatalf("fresh health failure must surface ERR_HEALTH_CHECK, got %v", err)
+	}
+	// rollback_on_failure=false ⇒ NO compensating action: the rejected container
+	// must be LEFT running (still holding the fresh image) for inspection.
+	if len(n.removeScripts) != 0 {
+		t.Fatalf("rollback-disabled fresh failure must NOT `docker rm -f` the rejected container; removals issued: %v", n.removeScripts)
+	}
+	if n.image != "sha256:freshimg" {
+		t.Fatalf("rejected fresh container must REMAIN running (image intact) when rollback disabled; image=%q", n.image)
+	}
+	// A failed manifest at the attempted version must be persisted so Read drifts.
 	m := string(n.fakeHost.files[dockerManifestPath])
 	if !strings.Contains(m, `"current_version": "2.0.0"`) || !strings.Contains(m, `"result": "failed"`) {
-		t.Fatalf("fresh failure must persist a failed manifest at attempted version 2.0.0: %s", m)
+		t.Fatalf("rollback-disabled fresh failure must persist a failed manifest at attempted version 2.0.0: %s", m)
 	}
 }
 

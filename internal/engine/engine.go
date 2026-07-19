@@ -532,25 +532,13 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		})
 	}
 	if runErr != nil {
-		if !s.Strategy.EffectiveRollback() || oldImage == "" {
-			// §10.2: a FRESH install failure (no prior image to roll back TO) must
-			// leave the machine CLEAN. The container that D5 started — or a partial
-			// container left behind by a failed D5 — must be torn down before we
-			// return the apply error, otherwise a rejected container keeps running
-			// under the desired name and Read would report it as deployed. Cleanup is
-			// scoped to oldImage=="" (no rollback target); a rollback-DISABLED upgrade
-			// intentionally keeps its failed container so the operator can inspect it
-			// (evaluator iter12 item 1, DESIGN §10.2). `docker rm -f` treats an
-			// already-absent container as success, so this is safe after either a
-			// START or a HEALTH failure.
-			var cleanupErr error
-			if oldImage == "" {
-				cleanupErr = sl.timed(ctx, "STOP", func() error {
-					return dc.Remove(ctx, t, rc.Spec.Pattern.ContainerName)
-				})
-			}
-			// §10.2: record last_operation=failed so Read reports drift even when no
-			// rollback is performed (rollback disabled or previous image unknown).
+		if !s.Strategy.EffectiveRollback() {
+			// §10.2 "any, rollback_on_failure=false": the engine takes NO
+			// compensating action. The rejected container is deliberately LEFT
+			// as-is — for a FRESH install as well as an update — so the operator
+			// can inspect it, and a failed manifest is persisted so Read reports
+			// drift (§10.4). Recording no compensating cleanup here is required by
+			// the matrix's rollback-disabled row (evaluator iter15 item 3).
 			// Record at the previous version if known, else the attempted version so
 			// a fresh docker failure still persists failed state (evaluator iter5 item 2).
 			failVer := prev
@@ -558,20 +546,41 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 				failVer = s.Artifact.Version
 			}
 			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started, manifestExtra(m))
-			out := fmt.Errorf("%w; no docker rollback performed (prev image unknown or rollback disabled)", runErr)
-			if cleanupErr != nil {
-				// The fresh container could not be removed — the machine is NOT clean.
-				// Surface UNKNOWN STATE so the operator intervenes rather than trusting
-				// the recorded failed state (evaluator iter12 item 1).
-				out = coded("ERR_ROLLBACK_FAILED", host, "STOP",
-					fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — fresh container %q could not be removed after a failed install: %v; deploy error: %v",
-						host, rc.Spec.Pattern.ContainerName, cleanupErr, runErr))
-			}
+			out := fmt.Errorf("%w; no docker rollback performed (rollback disabled)", runErr)
 			if fmErr != nil {
 				return nil, coded("ERR_CONNECT", host, "FINALIZE",
 					fmt.Errorf("%v; failed-manifest write error: %v", out, fmErr))
 			}
 			return nil, out
+		}
+		if oldImage == "" {
+			// §10.2 fresh-install row (rollback ENABLED): there is no prior image
+			// to restore, so the outcome is "machine clean, apply error, no TF
+			// state" — Stop the rejected container AND leave NO manifest behind.
+			// The container that D5 started — or a partial container from a failed
+			// D5 — must be torn down (`docker rm -f`, already-absent = success),
+			// otherwise a rejected container keeps running under the desired name.
+			if cleanupErr := sl.timed(ctx, "STOP", func() error {
+				return dc.Remove(ctx, t, rc.Spec.Pattern.ContainerName)
+			}); cleanupErr != nil {
+				// The fresh container could not be removed — the machine is NOT clean.
+				// Surface UNKNOWN STATE so the operator intervenes (§10.6).
+				return nil, coded("ERR_ROLLBACK_FAILED", host, "STOP",
+					fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — fresh container %q could not be removed after a failed install: %v; deploy error: %v",
+						host, rc.Spec.Pattern.ContainerName, cleanupErr, runErr))
+			}
+			// Machine is clean ⇒ manifest MUST be ABSENT (§10.2: "manifest absent",
+			// "no TF state"). removePath is idempotent — on a first install there is
+			// usually no manifest yet — but it also clears any stale/partial manifest
+			// so Read yields RemoveResource and the next plan re-creates from scratch
+			// (evaluator iter15 items 1/2). A genuine delete failure is surfaced.
+			if delErr := sl.timed(ctx, "FINALIZE", func() error {
+				return e.removePath(ctx, t, p.Manifest)
+			}); delErr != nil {
+				return nil, coded("ERR_CONNECT", host, "FINALIZE",
+					fmt.Errorf("%w; fresh-install manifest removal failed: %v", runErr, delErr))
+			}
+			return nil, fmt.Errorf("%w; fresh install failed — machine left clean, no manifest written (§10.2)", runErr)
 		}
 		rbStart := time.Now()
 		// §9.6 D6 / §10.4: restore the PREVIOUS release. The restored container must
