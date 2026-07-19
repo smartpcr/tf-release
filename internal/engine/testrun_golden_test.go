@@ -24,16 +24,23 @@ func TestRunnerCommandGolden(t *testing.T) {
 			Type: "exec", Command: `bin\smoke.exe`, Args: []string{"--fast", "--ci"}}}},
 		{"exec_no_args", &spec.TestRun{Runner: spec.Runner{
 			Type: "exec", Command: "./run-tests.sh"}}},
-		{"vstest", &spec.TestRun{Runner: spec.Runner{
-			Type: "vstest", Assemblies: []string{`tests\Unit.dll`, `tests\Integration.dll`},
-			ExtraArgs: []string{"/Parallel"}}}},
-		{"dotnet_test", &spec.TestRun{Runner: spec.Runner{
-			Type: "dotnet_test", Project: `tests\Suite.csproj`,
-			ExtraArgs: []string{"--filter", "Category=Smoke"}}}},
+		// vstest driven purely by the normative runner.args (DESIGN §7 table).
+		{"vstest_args", &spec.TestRun{Runner: spec.Runner{
+			Type: "vstest", Args: []string{`tests\Unit.dll`, `tests\Integration.dll`, "/Parallel"}}}},
+		// vstest with the typed assemblies field folded in ahead of runner.args.
+		{"vstest_assemblies", &spec.TestRun{Runner: spec.Runner{
+			Type: "vstest", Assemblies: []string{`tests\Unit.dll`}, Args: []string{"/InIsolation"}}}},
+		// dotnet_test driven by runner.args only (no typed project field).
+		{"dotnet_test_args", &spec.TestRun{Runner: spec.Runner{
+			Type: "dotnet_test", Args: []string{`tests\Suite.csproj`, "--filter", "Category=Smoke"}}}},
+		// dotnet_test with the typed project field ahead of runner.args.
+		{"dotnet_test_project", &spec.TestRun{Runner: spec.Runner{
+			Type: "dotnet_test", Project: `tests\Suite.csproj`, Args: []string{"--filter", "Category=Smoke"}}}},
 		{"npm_default", &spec.TestRun{Runner: spec.Runner{Type: "npm"}}},
 		{"npm_script", &spec.TestRun{Runner: spec.Runner{Type: "npm", Script: "e2e"}}},
+		// npm driven by runner.args (DESIGN `npm <args or "test">`).
 		{"npm_args", &spec.TestRun{Runner: spec.Runner{
-			Type: "npm", ExtraArgs: []string{"run", "test:ci", "--", "--reporter=junit"}}}},
+			Type: "npm", Args: []string{"run", "test:ci", "--", "--reporter=junit"}}}},
 	}
 	for _, c := range cases {
 		got := runnerCommand(c.tr)

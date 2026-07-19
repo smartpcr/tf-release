@@ -1,0 +1,1 @@
+vstest.console.exe tests\Unit.dll /InIsolation /Logger:trx /ResultsDirectory:.\TestResults

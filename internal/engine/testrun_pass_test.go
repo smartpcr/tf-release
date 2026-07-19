@@ -1,7 +1,11 @@
 package engine
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/logs"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
@@ -66,6 +70,14 @@ func TestEvaluatePass(t *testing.T) {
 			pc:       spec.PassCriteria{}, passed: false, exitOK: true, rateOK: false,
 		},
 		{
+			// All tests skipped (total>0, total==skipped): no failures ⇒ pass_rate
+			// is vacuously 1.0 and the rate gate is satisfied (consistent with the
+			// value written to summary.json).
+			name: "trx all skipped", exit: 0, format: "trx",
+			counters: logs.Counters{Total: 5, Passed: 0, Failed: 0, Skipped: 5},
+			pc:       spec.PassCriteria{}, passed: true, exitOK: true, rateOK: true,
+		},
+		{
 			// format none: rate gate skipped, verdict is exit-code-only, passing.
 			name: "none exit ok", exit: 0, format: "none",
 			counters: noResultCounters(), pc: spec.PassCriteria{}, passed: true, exitOK: true, rateOK: true,
@@ -102,3 +114,74 @@ func TestNoResultCountersAreMinusOne(t *testing.T) {
 		t.Fatalf("noResultCounters = %+v, want all -1", c)
 	}
 }
+
+// TestComputePassRateConsistency locks the single-source-of-truth rate helper
+// shared by evaluatePass and writeSummaryJSON (evaluator item 2: the all-skipped
+// edge must not disagree between verdict and persisted summary).
+func TestComputePassRateConsistency(t *testing.T) {
+	cases := []struct {
+		name   string
+		format string
+		c      logs.Counters
+		want   float64
+	}{
+		{"none sentinel", "none", noResultCounters(), -1},
+		{"empty sentinel", "", noResultCounters(), -1},
+		{"all pass", "trx", logs.Counters{Total: 3, Passed: 3}, 1},
+		{"one fail", "junit", logs.Counters{Total: 4, Passed: 3, Failed: 1}, 0.75},
+		{"skipped excluded", "trx", logs.Counters{Total: 4, Passed: 3, Skipped: 1}, 1},
+		{"zero tests", "trx", logs.Counters{}, 0},
+		{"all skipped", "trx", logs.Counters{Total: 5, Skipped: 5}, 1},
+	}
+	for _, c := range cases {
+		if got := computePassRate(c.format, c.c); got != c.want {
+			t.Errorf("%s: computePassRate = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestWriteSummaryJSON verifies the writer persists the DESIGN §7.4 fields with
+// a pass_rate that matches computePassRate, AND that a write failure is returned
+// (evaluator item 3: summary.json is a required artifact — no silent success).
+func TestWriteSummaryJSON(t *testing.T) {
+	tr := &spec.TestRun{
+		Metadata:     spec.Metadata{Name: "smoke"},
+		Artifact:     spec.Artifact{Version: "1.1.0"},
+		Target:       spec.Target{Hosts: []string{"LAB-01"}},
+		Results:      spec.Results{Format: "trx"},
+		PassCriteria: spec.PassCriteria{ExitCodes: []int{0}, MinPassRate: ptrF(0.95)},
+	}
+	out := &TestOutcome{Passed: true, ExitCode: 0, Total: 4, PassedTests: 3, FailedTests: 0, SkippedTests: 1, DurationSeconds: 12}
+
+	dir := t.TempDir()
+	if err := writeSummaryJSON(dir, tr, out, time.Unix(0, 0)); err != nil {
+		t.Fatalf("writeSummaryJSON: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "summary.json"))
+	if err != nil {
+		t.Fatalf("read summary.json: %v", err)
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal summary.json: %v", err)
+	}
+	if doc["host"] != "lab-01" { // lower-cased
+		t.Errorf("host = %v, want lab-01", doc["host"])
+	}
+	// pass_rate must equal computePassRate for the same counters (3/(4-1)=1.0).
+	if got := doc["pass_rate"].(float64); got != 1.0 {
+		t.Errorf("pass_rate = %v, want 1.0", got)
+	}
+	for _, k := range []string{"name", "passed", "exit_code", "total", "passed_tests", "failed", "skipped", "criteria", "error_code"} {
+		if _, ok := doc[k]; !ok {
+			t.Errorf("summary.json missing required key %q", k)
+		}
+	}
+
+	// A non-existent destination dir must surface a write error, not be swallowed.
+	missing := filepath.Join(dir, "no", "such", "dir")
+	if err := writeSummaryJSON(missing, tr, out, time.Unix(0, 0)); err == nil {
+		t.Fatal("writeSummaryJSON to a non-existent dir should return an error")
+	}
+}
+
