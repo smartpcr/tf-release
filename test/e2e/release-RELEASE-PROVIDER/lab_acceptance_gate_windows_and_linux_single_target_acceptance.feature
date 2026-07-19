@@ -36,7 +36,13 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
   + LABDEPLOY_ACC_SHA_*), each scenario ADDITIONALLY drives the full toolchain
   matrix against the REAL host over REAL WinRM/SSH; a missing var under TF_ACC=1
   FAILS the scenario so a mis-configured lab run cannot masquerade as green. The
-  suite never sets TF_ACC itself.
+  suite never sets TF_ACC itself. Because W1/L1 are `[proof: lab]` hosts that
+  Forge's non-admin bare gate cannot provision, the committed lab pipelines
+  (.github/workflows/e2e-lab-acceptance-gate.yml and
+  test/e2e/lab-acceptance-gate/azure-pipeline.yml) run THIS SAME suite under
+  TF_ACC=1 on a self-hosted W1+L1 runner pool, so the authoritative privileged
+  paths (admin `sc.exe`/winsw registration, native `ln -sfn`) execute on real
+  hardware when the operator provisions the lab.
 
   Scenario: Windows single-target matrix deploys WSV NOD NET CAP and releases the lock
     Given a labdeploy Windows single-target driven over the real local transport
