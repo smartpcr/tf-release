@@ -24,6 +24,7 @@ type dockerNode struct {
 	inspectErr    bool     // ALL `docker inspect {{.Image}}` probes fail with a transport error
 	inspectErrAfterRun bool // `docker inspect {{.Image}}` fails only AFTER a docker run has executed
 	didRun        bool     // set once any docker run script has been dispatched
+	removeScripts []string // standalone `docker rm -f` scripts (rollback name teardown), in order
 }
 
 func (n *dockerNode) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
@@ -64,6 +65,12 @@ func (n *dockerNode) Exec(ctx context.Context, c transport.Cmd) (transport.Resul
 		}
 		return ok(""), nil
 	case strings.Contains(s, "docker stop"):
+		return ok(""), nil
+	case strings.Contains(s, "docker rm -f"):
+		// Standalone `docker rm -f` (rollback name teardown) — RunNew's combined
+		// rm+run script matched the `docker run` case above, so this only fires for
+		// dc.Remove of a renamed failed container.
+		n.removeScripts = append(n.removeScripts, s)
 		return ok(""), nil
 	}
 	return n.fakeHost.Exec(ctx, c)
@@ -416,4 +423,153 @@ func TestDockerRollbackRestoresPriorConfig(t *testing.T) {
 		t.Fatalf("rolled_back manifest snapshot must record the restored prior port 8080, not 9090: %s", m)
 	}
 }
+
+// TestDockerRollbackReplaysPriorHealthCheck covers evaluator iter7 item 1 /
+// DESIGN §10.2: when a failed update also CHANGES the health probe, the rollback
+// must re-check HEALTH(prev) — the probe the restored release was validated with
+// — not the rejected desired probe. Here the NEW health URL always fails; a
+// rollback that (incorrectly) re-probed the desired URL would report
+// ERR_ROLLBACK_FAILED even though the old container came back healthy. The prior
+// URL passes, so the correct behavior is ERR_HEALTH_CHECK + a rolled_back manifest.
+func TestDockerRollbackReplaysPriorHealthCheck(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:v1img"}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	// Phase 1: land 1.0.0 with the ORIGINAL health URL (/health).
+	if _, err := eng.Deploy(context.Background(), dockerSpec(t, "1.0.0")); err != nil {
+		t.Fatalf("phase-1 deploy 1.0.0 should succeed: %v", err)
+	}
+
+	// Phase 2: 2.0.0 changes the health URL to /newhealth, which ALWAYS fails.
+	// The new-version probe fails (forcing rollback); the rollback must re-probe
+	// the PRIOR /health (which passes), not /newhealth.
+	n.runImage = "sha256:v2img"
+	n.rollbackImage = "sha256:v1img"
+	n.runScripts = nil
+	n.fakeHost.healthScriptGate = func(script string) bool { return strings.Contains(script, "/newhealth") }
+
+	s2 := dockerSpec(t, "2.0.0")
+	s2.HealthCheck.HTTP.URL = "http://localhost:8080/newhealth"
+	_, err := eng.Deploy(context.Background(), s2)
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_HEALTH_CHECK" {
+		t.Fatalf("a changed health URL must not break rollback: want ERR_HEALTH_CHECK (rollback probes prior /health), got %v", err)
+	}
+	m := string(n.fakeHost.files[dockerManifestPath])
+	if !strings.Contains(m, `"current_version": "1.0.0"`) || !strings.Contains(m, `"result": "rolled_back"`) {
+		t.Fatalf("rollback re-checking HEALTH(prev) must succeed and persist a rolled_back manifest at 1.0.0: %s", m)
+	}
+}
+
+// TestDockerRollbackRenamedContainerRemovesFailed covers evaluator iter7 item 2:
+// when a failed update also RENAMES the container, the failed container (started
+// under the NEW name) must be torn down before the old container is restored
+// under the PRIOR name — otherwise both run — and the rolled_back manifest must
+// record the restored PRIOR container name, not the rejected new one.
+func TestDockerRollbackRenamedContainerRemovesFailed(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:v1img"}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	// Phase 1: land 1.0.0 under container name sample-old.
+	s1 := dockerSpec(t, "1.0.0")
+	s1.Pattern.ContainerName = "sample-old"
+	if _, err := eng.Deploy(context.Background(), s1); err != nil {
+		t.Fatalf("phase-1 deploy 1.0.0 should succeed: %v", err)
+	}
+
+	// Phase 2: 2.0.0 renames the container to sample-new; health fails on the new
+	// image, forcing a rollback to sample-old.
+	n.runImage = "sha256:v2img"
+	n.rollbackImage = "sha256:v1img"
+	n.runScripts = nil
+	n.removeScripts = nil
+	n.fakeHost.healthGate = func() bool { return n.image == "sha256:v2img" }
+
+	s2 := dockerSpec(t, "2.0.0")
+	s2.Pattern.ContainerName = "sample-new"
+	_, err := eng.Deploy(context.Background(), s2)
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_HEALTH_CHECK" {
+		t.Fatalf("health failure must surface ERR_HEALTH_CHECK, got %v", err)
+	}
+
+	// The failed container started under the NEW name must be explicitly removed.
+	var removedNew bool
+	for _, s := range n.removeScripts {
+		if strings.Contains(s, "sample-new") {
+			removedNew = true
+		}
+	}
+	if !removedNew {
+		t.Fatalf("rollback must remove the failed container under the renamed name sample-new: %v", n.removeScripts)
+	}
+
+	// The restore must run the OLD image under the PRIOR name sample-old.
+	var rollbackRun string
+	for _, s := range n.runScripts {
+		if strings.Contains(s, "sha256:v1img") {
+			rollbackRun = s
+		}
+	}
+	if rollbackRun == "" || !strings.Contains(rollbackRun, "--name 'sample-old'") {
+		t.Fatalf("rollback must restore the container under the PRIOR name sample-old:\n%s", rollbackRun)
+	}
+
+	// The rolled_back manifest must record the restored PRIOR name, not sample-new.
+	m := string(n.fakeHost.files[dockerManifestPath])
+	if !strings.Contains(m, `"docker://sample-old"`) || strings.Contains(m, `"docker://sample-new"`) {
+		t.Fatalf("rolled_back manifest CurrentRelease must be the prior name docker://sample-old, not the desired name: %s", m)
+	}
+}
+
+// TestDockerFailedManifestPreservesRollbackMetadata covers evaluator iter7 item
+// 3: a failed-operation manifest must PRESERVE the prior docker_config snapshot
+// and config_hash so a later repair attempt can still restore the complete prior
+// configuration. Here rollback is disabled and health fails, so the engine writes
+// a failed manifest at the previous version — it must carry the prior config
+// (port 8080), not strip it down to only image_id.
+func TestDockerFailedManifestPreservesRollbackMetadata(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:v1img"}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	// Phase 1: land 1.0.0 with port 8080 so the manifest carries a docker_config.
+	s1 := dockerSpec(t, "1.0.0")
+	s1.Pattern.Ports = []string{"8080:8080"}
+	if _, err := eng.Deploy(context.Background(), s1); err != nil {
+		t.Fatalf("phase-1 deploy 1.0.0 should succeed: %v", err)
+	}
+
+	// Phase 2: 2.0.0 changes the port to 9090 with rollback DISABLED; health
+	// always fails, so the engine records a failed manifest at 1.0.0.
+	n.runImage = "sha256:v2img"
+	n.runScripts = nil
+	n.fakeHost.healthGate = func() bool { return true }
+	s2 := dockerSpec(t, "2.0.0")
+	s2.Pattern.Ports = []string{"9090:9090"}
+	no := false
+	s2.Strategy.RollbackOnFailure = &no
+	if _, err := eng.Deploy(context.Background(), s2); err == nil {
+		t.Fatal("health failure with rollback disabled must return an error")
+	}
+
+	m := string(n.fakeHost.files[dockerManifestPath])
+	if !strings.Contains(m, `"current_version": "1.0.0"`) || !strings.Contains(m, `"result": "failed"`) {
+		t.Fatalf("failed manifest must be recorded at the prior version 1.0.0: %s", m)
+	}
+	// The prior docker_config (port 8080) and config_hash must survive so a repair
+	// can still restore the complete prior configuration.
+	if !strings.Contains(m, `8080:8080`) {
+		t.Fatalf("failed manifest must PRESERVE the prior docker_config (port 8080): %s", m)
+	}
+	if strings.Contains(m, `9090:9090`) {
+		t.Fatalf("failed manifest must not overwrite the prior config with the rejected port 9090: %s", m)
+	}
+	if !strings.Contains(m, `"config_hash"`) {
+		t.Fatalf("failed manifest must preserve the prior config_hash: %s", m)
+	}
+}
+
 
