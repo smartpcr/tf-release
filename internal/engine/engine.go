@@ -537,9 +537,18 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 			return nil, out
 		}
 		rbStart := time.Now()
-		rerr := dc.RunNew(ctx, t, rc, oldImage)
+		// §9.6 D6 / §10.4: restore the PREVIOUS release. The restored container must
+		// advertise the previous version, so rebuild the pattern context at `prev`
+		// (LD_VERSION and the -e env baked into `docker run` reflect the running
+		// release) rather than reusing the failed new-version rc. Health is rechecked
+		// with the same previous-version env.
+		rbRC := rc
+		if prev != "" {
+			rbRC = releaseCtxVersion(s, p, prev)
+		}
+		rerr := dc.RunNew(ctx, t, rbRC, oldImage)
 		if rerr == nil {
-			rerr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rc.Env)
+			rerr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rbRC.Env)
 		}
 		sl.emit(ctx, "ROLLBACK", rbStart)
 		if rerr != nil {
@@ -588,7 +597,15 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		}
 		return nil, fmt.Errorf("%w; rolled back to previous image %s", runErr, short(oldImage))
 	}
-	newImage, _ := dc.CurrentImageID(ctx, t, rc)
+	// D3-equivalent post-run inspect: the recorded image id backs a FUTURE
+	// rollback, so a missing/failed inspect means the deploy is NOT durably
+	// recorded — fail closed instead of persisting a success manifest with an
+	// empty image_id (evaluator iter2 item 1).
+	newImage, ierr := dc.CurrentImageID(ctx, t, rc)
+	if ierr != nil || strings.TrimSpace(newImage) == "" {
+		return nil, coded("ERR_CONNECT", host, "FINALIZE",
+			fmt.Errorf("container started but its image id could not be recorded (inspect err=%v, image_id=%q); deploy not durably recorded", ierr, newImage))
+	}
 	nm := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
 		CurrentVersion: s.Artifact.Version, PreviousVersion: prev,
 		CurrentRelease:  "docker://" + rc.Spec.Pattern.ContainerName,

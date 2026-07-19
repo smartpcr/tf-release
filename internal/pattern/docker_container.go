@@ -119,16 +119,16 @@ exit 0`, name)
 	return strings.TrimSpace(r.Stdout), nil
 }
 
-func (d *DockerContainer) runArgs(rc ReleaseCtx) string {
+func (d *DockerContainer) runArgs(t transport.Transport, rc ReleaseCtx) string {
 	p := rc.Spec.Pattern
 	restart := p.RestartPolicy
 	if restart == "" {
 		restart = "unless-stopped"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "-d --name %s --restart %s", p.ContainerName, restart)
+	fmt.Fprintf(&b, "-d --name %s --restart %s", d.q(t, p.ContainerName), restart)
 	for _, pt := range p.Ports {
-		fmt.Fprintf(&b, " -p %s", pt)
+		fmt.Fprintf(&b, " -p %s", d.q(t, pt))
 	}
 	keys := make([]string, 0, len(rc.Env))
 	for k := range rc.Env {
@@ -136,18 +136,30 @@ func (d *DockerContainer) runArgs(rc ReleaseCtx) string {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		fmt.Fprintf(&b, " -e %s", shellKV(k, rc.Env[k]))
+		fmt.Fprintf(&b, " -e %s", d.q(t, k+"="+rc.Env[k]))
 	}
 	for _, v := range p.Volumes {
-		fmt.Fprintf(&b, " -v %s", v)
+		fmt.Fprintf(&b, " -v %s", d.q(t, v))
 	}
+	// run_args are operator-authored raw docker flags (e.g. --pull=never); passed
+	// through verbatim, NOT container-controlled data, so they are not re-quoted.
 	for _, a := range p.RunArgs {
 		fmt.Fprintf(&b, " %s", a)
 	}
 	return b.String()
 }
 
-func shellKV(k, v string) string { return "\"" + k + "=" + strings.ReplaceAll(v, `"`, `\"`) + "\"" }
+// q single-quotes one docker run argument for the target shell so container-
+// controlled data (env values, ports, volumes, image ref) cannot be interpreted
+// by sh or PowerShell — closing the `$(...)`/backtick/`$VAR`/quote command-
+// injection hole a bare double-quoted `-e "K=V"` left open (DESIGN §9.6 D5). sh
+// escapes an embedded `'` as `'\''`; PowerShell doubles it as `''` (both literal).
+func (d *DockerContainer) q(t transport.Transport, s string) string {
+	if t.OS() == spec.OSWindows {
+		return psq(s)
+	}
+	return shq(s)
+}
 
 // RunNew = D4+D5 with a given image ref (new ref, or old image id on rollback).
 func (d *DockerContainer) RunNew(ctx context.Context, t transport.Transport, rc ReleaseCtx, ref string) error {
@@ -157,11 +169,11 @@ func (d *DockerContainer) RunNew(ctx context.Context, t transport.Transport, rc 
 		script = fmt.Sprintf(`docker rm -f %s 2>$null | Out-Null
 docker run %s %s
 if($LASTEXITCODE -ne 0){ exit %d }
-exit 0`, name, d.runArgs(rc), ref, ExitServiceStart)
+exit 0`, d.q(t, name), d.runArgs(t, rc), d.q(t, ref), ExitServiceStart)
 	} else {
-		script = fmt.Sprintf(`docker rm -f '%s' >/dev/null 2>&1 || true
-docker run %s '%s' || exit %d
-exit 0`, name, d.runArgs(rc), ref, ExitServiceStart)
+		script = fmt.Sprintf(`docker rm -f %s >/dev/null 2>&1 || true
+docker run %s %s || exit %d
+exit 0`, d.q(t, name), d.runArgs(t, rc), d.q(t, ref), ExitServiceStart)
 	}
 	r, err := d.run(ctx, t, "START", script, nil, 300)
 	if err != nil {

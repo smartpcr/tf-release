@@ -93,11 +93,11 @@ func TestDockerRunScriptGoldenLinux(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--restart always",
-		"-p 8080:8080", "-p 9090:9090",
-		"-v /srv/data:/data",
-		`-e "ASPNETCORE_ENVIRONMENT=Production"`,
+		"-p '8080:8080'", "-p '9090:9090'",
+		"-v '/srv/data:/data'",
+		`-e 'ASPNETCORE_ENVIRONMENT=Production'`,
 		"--pull=never",
-		"registry.example.com/app:2.0.0",
+		"'registry.example.com/app:2.0.0'",
 	} {
 		if !strings.Contains(fr.scripts[0], want) {
 			t.Errorf("START (D5) missing %q:\n%s", want, fr.scripts[0])
@@ -184,8 +184,79 @@ func TestDockerRunScriptGoldenWindows(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	checkGolden(t, "docker_run_windows.golden", fr.scripts[0])
-	if !strings.Contains(fr.scripts[0], "docker rm -f sample") {
+	if !strings.Contains(fr.scripts[0], "docker rm -f 'sample'") {
 		t.Errorf("windows START must perform D4 rm -f:\n%s", fr.scripts[0])
+	}
+}
+
+// Scenario: D3 image-id inspect. CurrentImageID runs `docker inspect -f
+// '{{.Image}}'` and returns the trimmed id; an absent container yields "" with
+// no error. This is the recorded rollback anchor (DESIGN §9.6 D3) the engine
+// persists into manifest.extra.image_id.
+func TestDockerCurrentImageID(t *testing.T) {
+	var d DockerContainer
+	rc := dockerRC(spec.OSLinux, dockerPattern(), spec.Source{
+		Type: "docker_registry", Image: "registry.example.com/app", Tag: "2.0.0",
+	}, nil)
+
+	present := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{
+		{ExitCode: 0, Stdout: "sha256:abc123\n"},
+	}}
+	got, err := d.CurrentImageID(context.Background(), present, rc)
+	if err != nil {
+		t.Fatalf("CurrentImageID: %v", err)
+	}
+	if got != "sha256:abc123" {
+		t.Errorf("D3 must return the trimmed image id, got %q", got)
+	}
+	if len(present.scripts) != 1 || !strings.Contains(present.scripts[0], "docker inspect -f '{{.Image}}'") {
+		t.Errorf("D3 must probe `docker inspect -f '{{.Image}}'`, scripts=%v", present.scripts)
+	}
+
+	absent := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{{ExitCode: 0, Stdout: ""}}}
+	got2, err2 := d.CurrentImageID(context.Background(), absent, rc)
+	if err2 != nil || got2 != "" {
+		t.Errorf("absent container ⇒ empty id, no error; got id=%q err=%v", got2, err2)
+	}
+}
+
+// Scenario: unsafe environment/argument rendering (evaluator iter2 item 3). A
+// container env value carrying shell metacharacters ($(), backtick, $VAR, a
+// single quote) must be rendered as a single-quoted literal so neither sh nor
+// PowerShell can interpret it — no command substitution, no variable expansion.
+func TestDockerRunArgMetacharSafe(t *testing.T) {
+	inj := "$(touch pwned)`id`$HOME he'llo"
+	pat := dockerPattern()
+	src := spec.Source{Type: "docker_registry", Image: "registry.example.com/app", Tag: "2.0.0"}
+
+	// Linux: single-quote with '\'' escaping for the embedded apostrophe.
+	rcL := dockerRC(spec.OSLinux, pat, src, map[string]string{"INJ": inj})
+	fL := &scriptTransport{osKind: spec.OSLinux}
+	if err := (&DockerContainer{}).Start(context.Background(), fL, rcL); err != nil {
+		t.Fatalf("Start(linux): %v", err)
+	}
+	wantL := `-e 'INJ=$(touch pwned)` + "`id`" + `$HOME he'\''llo'`
+	if !strings.Contains(fL.scripts[0], wantL) {
+		t.Errorf("linux env value must be single-quoted literal (no command substitution):\nwant substring %q\n got %s", wantL, fL.scripts[0])
+	}
+	// The metacharacters must never appear OUTSIDE a single-quoted context.
+	if strings.Contains(fL.scripts[0], `-e "INJ=`) || strings.Contains(fL.scripts[0], "-e INJ=$(") {
+		t.Errorf("linux env must not be double-quoted or bare (injection risk):\n%s", fL.scripts[0])
+	}
+
+	// Windows/PowerShell: single-quote with '' escaping for the apostrophe.
+	rcW := dockerRC(spec.OSWindows, pat, src, map[string]string{"INJ": inj})
+	fW := &scriptTransport{osKind: spec.OSWindows}
+	if err := (&DockerContainer{}).Start(context.Background(), fW, rcW); err != nil {
+		t.Fatalf("Start(windows): %v", err)
+	}
+	wantW := `-e 'INJ=$(touch pwned)` + "`id`" + `$HOME he''llo'`
+	if !strings.Contains(fW.scripts[0], wantW) {
+		t.Errorf("windows env value must be single-quoted literal (PowerShell no-expansion):\nwant substring %q\n got %s", wantW, fW.scripts[0])
+	}
+	// PowerShell backslash-quote escaping (the old, broken form) must be gone.
+	if strings.Contains(fW.scripts[0], `\"`) {
+		t.Errorf("windows env must not use invalid backslash-quote escaping:\n%s", fW.scripts[0])
 	}
 }
 
