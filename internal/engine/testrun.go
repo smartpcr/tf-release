@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,16 @@ import (
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/logs"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
+)
+
+const (
+	// timeoutSentinel is the exit code the runner watchdog exits with after it
+	// force-kills a timed-out process tree; it lets the engine surface
+	// ERR_TIMEOUT deterministically even when the transport reports no error.
+	timeoutSentinel = 124
+	// timeoutMarker is echoed by the watchdog on timeout so the engine can
+	// recognize a timeout from captured output regardless of transport.
+	timeoutMarker = "__LABDEPLOY_TIMEOUT__"
 )
 
 // TestOutcome mirrors labdeploy_e2e_test computed attrs (DESIGN §5.3).
@@ -230,11 +241,11 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 		}
 	}
 	if t.OS() == spec.OSWindows {
-		script := fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(workDir), cmdline)
-		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, Env: env, TimeoutSec: timeout})
+		script := runnerScriptWindows(workDir, cmdline, timeout)
+		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, Env: env, TimeoutSec: backstopTimeout(timeout)})
 	} else {
-		script := fmt.Sprintf("cd %s && %s", shq(workDir), cmdline)
-		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, Env: env, TimeoutSec: timeout})
+		script := runnerScriptLinux(workDir, cmdline, timeout)
+		r, xerr = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, Env: env, TimeoutSec: backstopTimeout(timeout)})
 	}
 	duration := int(time.Since(startedAt).Seconds())
 
@@ -296,7 +307,14 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 	// Best-effort collection has run; NOW surface a runner timeout / transport
 	// failure so an always() publish step still sees the partial results_dir
 	// (DESIGN §5.3; E2E-04). Result parsing and pass evaluation are skipped.
-	if xerr != nil {
+	// A timeout is recognized DETERMINISTICALLY (watchdog sentinel/marker OR a
+	// transport-level timeout error) so ERR_TIMEOUT is reliable across the
+	// ssh/winrm/local transports (E2E-04).
+	if timedOut := runnerTimedOut(r, xerr); timedOut || xerr != nil {
+		if timedOut {
+			return nil, coded("ERR_TIMEOUT", host, "TEST",
+				fmt.Errorf("runner exceeded %ds; process tree killed", timeout))
+		}
 		return nil, testRunErr(xerr, host)
 	}
 
@@ -329,13 +347,125 @@ func (e *Engine) RunTest(ctx context.Context, tr *spec.TestRun) (outcome *TestOu
 }
 
 // testRunErr classifies a runner transport failure so it can be surfaced AFTER
-// best-effort collection (DESIGN §5.3; E2E-04): a "timed out" transport error
+// best-effort collection (DESIGN §5.3; E2E-04): a timeout-shaped transport error
 // maps to ERR_TIMEOUT, anything else to the standard transport-mapped error.
 func testRunErr(xerr error, host string) error {
-	if strings.Contains(xerr.Error(), "timed out") {
+	if isTimeoutErr(xerr) {
 		return coded("ERR_TIMEOUT", host, "TEST", xerr)
 	}
 	return wrapTransportErr(xerr, host, "TEST")
+}
+
+// backstopTimeout is the transport-level timeout for the runner exec. The
+// in-script watchdog owns the primary kill at exactly `timeout`s (and emits the
+// process-tree kill), so the transport backstop is set slightly longer to let
+// the watchdog fire first and yield a deterministic sentinel exit; the backstop
+// only matters if the watchdog itself is wedged. timeout<=0 ⇒ 0 (no limit).
+func backstopTimeout(timeout int) int {
+	if timeout <= 0 {
+		return 0
+	}
+	return timeout + 30
+}
+
+// runnerScriptWindows wraps cmdline in a PowerShell watchdog that force-kills the
+// WHOLE child process TREE (`taskkill /PID <id> /T /F`) when timeout is exceeded,
+// prints the timeout marker, and exits with the timeout sentinel (DESIGN §5.3;
+// E2E-04 "process-tree kill on runner.timeout_seconds"). timeout<=0 runs the
+// command unwrapped.
+func runnerScriptWindows(workDir, cmdline string, timeout int) string {
+	if timeout <= 0 {
+		return fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(workDir), cmdline)
+	}
+	return fmt.Sprintf(`Set-Location %s
+$__pi = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c',%s -PassThru -NoNewWindow
+if ($__pi.WaitForExit(%d)) { exit $__pi.ExitCode }
+taskkill /PID $__pi.Id /T /F | Out-Null
+Write-Output '%s'
+exit %d`, psq(workDir), psq(cmdline), timeout*1000, timeoutMarker, timeoutSentinel)
+}
+
+// runnerScriptLinux wraps cmdline in an sh watchdog that runs the command in a
+// NEW SESSION (`setsid` ⇒ its pid is the process-GROUP id) and force-kills the
+// whole group (`kill -9 -<pgid>`) when timeout is exceeded, prints the timeout
+// marker, and exits with the timeout sentinel (DESIGN §5.3; E2E-04). timeout<=0
+// runs the command unwrapped.
+func runnerScriptLinux(workDir, cmdline string, timeout int) string {
+	if timeout <= 0 {
+		return fmt.Sprintf("cd %s && %s", shq(workDir), cmdline)
+	}
+	return fmt.Sprintf(`cd %s || exit 1
+setsid sh -c %s &
+__pgid=$!
+( sleep %d; kill -9 -$__pgid 2>/dev/null ) &
+__watch=$!
+wait $__pgid
+__rc=$?
+if kill -0 $__watch 2>/dev/null; then
+  kill $__watch 2>/dev/null
+else
+  echo '%s' >&2
+  __rc=%d
+fi
+exit $__rc`, shq(workDir), shq(cmdline), timeout, timeoutMarker, timeoutSentinel)
+}
+
+// runnerTimedOut reports whether the runner exec hit its timeout, recognized
+// deterministically across transports: the watchdog's sentinel exit code, the
+// watchdog marker on either stream, OR a transport-level timeout error. This is
+// what makes ERR_TIMEOUT reliable regardless of which transport served the exec
+// (the prior substring-only check missed winrm/local context-deadline timeouts).
+func runnerTimedOut(r transport.Result, xerr error) bool {
+	if r.ExitCode == timeoutSentinel ||
+		strings.Contains(r.Stdout, timeoutMarker) ||
+		strings.Contains(r.Stderr, timeoutMarker) {
+		return true
+	}
+	return isTimeoutErr(xerr)
+}
+
+// isTimeoutErr recognizes the several shapes a runner timeout takes across
+// transports: ssh's "exec timed out after Ns", winrm/local context deadline
+// (context.DeadlineExceeded / "deadline exceeded"), and a process killed by the
+// context cancellation ("signal: killed").
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	s := err.Error()
+	for _, m := range []string{"timed out", "deadline exceeded", "signal: killed"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// DeleteTestDir best-effort removes the remote test workspace
+// (`<install_root>/<name>-tests`) created by RunTest. It is called from the
+// resource Delete and MUST NOT fail a Terraform destroy: a missing dir is a
+// no-op (removePath is idempotent) and any transport/connect error is returned
+// for the caller to surface as a WARNING only (DESIGN §5.3 "Delete removes the
+// remote test dir best effort, never fails destroy").
+func (e *Engine) DeleteTestDir(ctx context.Context, tr *spec.TestRun) error {
+	host := strings.ToLower(tr.Target.Hosts[0])
+	t, err := e.NewTransport(&tr.Target, host)
+	if err != nil {
+		return err
+	}
+	if err := t.Connect(ctx); err != nil {
+		return wrapTransportErr(err, host, "DELETE")
+	}
+	defer t.Close()
+	root := tr.EffectiveWorkRoot(tr.Target.OS)
+	p := layout.NewPaths(tr.Target.OS, root, tr.Metadata.Name+"-tests", tr.Artifact.Version)
+	if err := e.removePath(ctx, t, p.Root); err != nil {
+		return coded("ERR_CONNECT", host, "DELETE", err)
+	}
+	return nil
 }
 
 func summarize(o *TestOutcome, exitOK, rateOK bool) string {

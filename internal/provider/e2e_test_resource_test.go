@@ -111,3 +111,120 @@ func TestE2ETriggersRequiresReplace(t *testing.T) {
 		t.Fatal("triggers: a value change must force RequiresReplace (re-run)")
 	}
 }
+
+// TestE2EArgumentsAreRequiresReplace proves the immutable-run lifecycle (DESIGN
+// §5.3 "Update is never in-place"): every real argument — spec, spec_file,
+// variables, fail_on_test_failure — carries a RequiresReplace plan modifier, so
+// editing any of them replaces the resource (re-runs the tests) rather than
+// silently keeping stale outcomes. deployment_id is deliberately excluded (edge
+// only) and is asserted separately above.
+func TestE2EArgumentsAreRequiresReplace(t *testing.T) {
+	sc := e2eSchema(t)
+	ctx := context.Background()
+
+	for _, name := range []string{"spec", "spec_file"} {
+		attrib, ok := sc.Attributes[name].(schema.StringAttribute)
+		if !ok {
+			t.Fatalf("%s: want schema.StringAttribute, got %T", name, sc.Attributes[name])
+		}
+		req := planmodifier.StringRequest{
+			State:      tfsdk.State{Raw: tftypes.NewValue(tftypes.String, "non-null")},
+			Plan:       tfsdk.Plan{Raw: tftypes.NewValue(tftypes.String, "non-null")},
+			StateValue: types.StringValue("a"), PlanValue: types.StringValue("b"), ConfigValue: types.StringValue("b"),
+		}
+		if !stringReplaces(ctx, attrib.PlanModifiers, req) {
+			t.Fatalf("%s: a change must force RequiresReplace", name)
+		}
+	}
+
+	// variables (map)
+	vAttr, ok := sc.Attributes["variables"].(schema.MapAttribute)
+	if !ok {
+		t.Fatalf("variables: want schema.MapAttribute, got %T", sc.Attributes["variables"])
+	}
+	oldV, _ := types.MapValue(types.StringType, map[string]attr.Value{"k": types.StringValue("1")})
+	newV, _ := types.MapValue(types.StringType, map[string]attr.Value{"k": types.StringValue("2")})
+	mReq := planmodifier.MapRequest{
+		State:      tfsdk.State{Raw: tftypes.NewValue(tftypes.String, "non-null")},
+		Plan:       tfsdk.Plan{Raw: tftypes.NewValue(tftypes.String, "non-null")},
+		StateValue: oldV, PlanValue: newV, ConfigValue: newV,
+	}
+	var mReplaced bool
+	for _, pm := range vAttr.PlanModifiers {
+		resp := &planmodifier.MapResponse{PlanValue: mReq.PlanValue}
+		pm.PlanModifyMap(ctx, mReq, resp)
+		if resp.RequiresReplace {
+			mReplaced = true
+		}
+	}
+	if !mReplaced {
+		t.Fatal("variables: a change must force RequiresReplace")
+	}
+
+	// fail_on_test_failure (bool)
+	bAttr, ok := sc.Attributes["fail_on_test_failure"].(schema.BoolAttribute)
+	if !ok {
+		t.Fatalf("fail_on_test_failure: want schema.BoolAttribute, got %T", sc.Attributes["fail_on_test_failure"])
+	}
+	bReq := planmodifier.BoolRequest{
+		State:      tfsdk.State{Raw: tftypes.NewValue(tftypes.String, "non-null")},
+		Plan:       tfsdk.Plan{Raw: tftypes.NewValue(tftypes.String, "non-null")},
+		StateValue: types.BoolValue(true), PlanValue: types.BoolValue(false), ConfigValue: types.BoolValue(false),
+	}
+	var bReplaced bool
+	for _, pm := range bAttr.PlanModifiers {
+		resp := &planmodifier.BoolResponse{PlanValue: bReq.PlanValue}
+		pm.PlanModifyBool(ctx, bReq, resp)
+		if resp.RequiresReplace {
+			bReplaced = true
+		}
+	}
+	if !bReplaced {
+		t.Fatal("fail_on_test_failure: a change must force RequiresReplace")
+	}
+}
+
+func stringReplaces(ctx context.Context, mods []planmodifier.String, req planmodifier.StringRequest) bool {
+	for _, pm := range mods {
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		pm.PlanModifyString(ctx, req, resp)
+		if resp.RequiresReplace {
+			return true
+		}
+	}
+	return false
+}
+
+// TestE2EDeleteNeverFailsDestroy proves the best-effort Delete contract (DESIGN
+// §5.3 "Delete removes the remote test dir best effort, never fails destroy"):
+// when the persisted state's spec cannot be resolved to a target (so the remote
+// dir cannot be located), Delete emits a WARNING and NO error, letting Terraform
+// drop the resource from state.
+func TestE2EDeleteNeverFailsDestroy(t *testing.T) {
+	ctx := context.Background()
+	r := &E2ETestResource{}
+	sr := resource.SchemaResponse{}
+	r.Schema(ctx, resource.SchemaRequest{}, &sr)
+
+	st := tfsdk.State{Schema: sr.Schema}
+	// State with neither spec nor spec_file ⇒ resolveSpec fails ⇒ cleanup skipped.
+	m := &e2eModel{
+		ID:        types.StringValue("smoke@lab-01"),
+		Spec:      types.StringNull(),
+		SpecFile:  types.StringNull(),
+		Variables: types.MapNull(types.StringType),
+		Triggers:  types.MapNull(types.StringType),
+	}
+	if d := st.Set(ctx, m); d.HasError() {
+		t.Fatalf("build state: %v", d)
+	}
+	resp := &resource.DeleteResponse{State: st}
+	r.Delete(ctx, resource.DeleteRequest{State: st}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Delete must NEVER fail destroy; got error diagnostics: %v", resp.Diagnostics.Errors())
+	}
+	if len(resp.Diagnostics.Warnings()) == 0 {
+		t.Fatal("Delete should warn when it cannot locate the remote test dir to clean")
+	}
+}

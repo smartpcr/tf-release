@@ -227,6 +227,12 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		return ok(""), nil
 
+	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
+		// Checked before the taskkill/PID case because the runner watchdog
+		// wrapper legitimately embeds `taskkill /PID ... /T /F` (process-tree
+		// kill); the runner command token must win the dispatch.
+		return transport.Result{}, fmt.Errorf("runner transport blew up")
+
 	case strings.Contains(s, "taskkill /PID"): // S2 FORCE_KILL escalation
 		f.mark("FORCE_KILL")
 		if f.fail["forcekill"] {
@@ -269,9 +275,6 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		}
 		f.mark("HEALTH")
 		return ok(""), nil
-
-	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
-		return transport.Result{}, fmt.Errorf("runner transport blew up")
 
 	case strings.Contains(s, "Rename-Item -ErrorAction Stop 'node_modules' 'node_modules.bak'"): // NodeWebApp.BackupDeps
 		if f.fail["depbackup"] {
