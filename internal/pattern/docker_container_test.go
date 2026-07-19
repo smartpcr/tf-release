@@ -129,6 +129,58 @@ func TestDockerPullDigestGolden(t *testing.T) {
 	}
 }
 
+// Scenario: localhost registry recognition (evaluator iter5 item 3). Docker
+// treats the dotless host `localhost` as a REGISTRY (not a Hub namespace), so an
+// authenticated `localhost/repo` pull must `docker login 'localhost'` on BOTH
+// Linux and Windows — logging into Docker Hub instead would send the local
+// credential to the wrong endpoint and the pull would fail.
+func TestDockerPullLocalhostRegistry(t *testing.T) {
+	t.Setenv("LD_REG_PW_ENV", "s3cr3t")
+	var d DockerContainer
+
+	for _, os := range []spec.OSKind{spec.OSLinux, spec.OSWindows} {
+		// localhost WITHOUT a port must still be recognized as the registry host.
+		rc := dockerRC(os, dockerPattern(), spec.Source{
+			Type:  "docker_registry",
+			Image: "localhost/app",
+			Tag:   "2.0.0",
+			Auth:  spec.SourceAuth{Username: "svc", PasswordEnv: "LD_REG_PW_ENV"},
+		}, nil)
+		fp := &scriptTransport{osKind: os}
+		if err := d.Pull(context.Background(), fp, rc); err != nil {
+			t.Fatalf("Pull(%s): %v", os, err)
+		}
+		if !strings.Contains(fp.scripts[0], "docker login 'localhost' -u 'svc' --password-stdin") {
+			t.Errorf("%s: localhost must be recognized as the registry host in D1 login:\n%s", os, fp.scripts[0])
+		}
+		if !strings.Contains(fp.scripts[0], "docker logout 'localhost'") {
+			t.Errorf("%s: D7 logout must target the localhost registry:\n%s", os, fp.scripts[0])
+		}
+		if strings.Contains(fp.scripts[0], "docker login -u") {
+			t.Errorf("%s: login must not fall back to Docker Hub (empty registry):\n%s", os, fp.scripts[0])
+		}
+	}
+
+	// A dotless, non-localhost first component is a Hub namespace, NOT a registry:
+	// no registry host is passed to login/logout.
+	rcHub := dockerRC(spec.OSLinux, dockerPattern(), spec.Source{
+		Type:  "docker_registry",
+		Image: "library/nginx",
+		Tag:   "2.0.0",
+		Auth:  spec.SourceAuth{Username: "svc", PasswordEnv: "LD_REG_PW_ENV"},
+	}, nil)
+	fh := &scriptTransport{osKind: spec.OSLinux}
+	if err := d.Pull(context.Background(), fh, rcHub); err != nil {
+		t.Fatalf("Pull(hub): %v", err)
+	}
+	if !strings.Contains(fh.scripts[0], "docker login -u 'svc' --password-stdin") {
+		t.Errorf("a Hub namespace must log in with no registry host:\n%s", fh.scripts[0])
+	}
+	if strings.Contains(fh.scripts[0], "'library'") {
+		t.Errorf("the Hub namespace `library` must not be treated as a registry host:\n%s", fh.scripts[0])
+	}
+}
+
 // Scenario: Docker rollback run golden (DESIGN §9.6 D6). Rollback re-runs D4+D5
 // against the RECORDED old image id (not the new ref), restoring the previous
 // container.
@@ -213,10 +265,25 @@ func TestDockerCurrentImageID(t *testing.T) {
 		t.Errorf("D3 must probe `docker inspect -f '{{.Image}}'`, scripts=%v", present.scripts)
 	}
 
-	absent := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{{ExitCode: 0, Stdout: ""}}}
+	absent := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{{ExitCode: 20}}}
 	got2, err2 := d.CurrentImageID(context.Background(), absent, rc)
 	if err2 != nil || got2 != "" {
-		t.Errorf("absent container ⇒ empty id, no error; got id=%q err=%v", got2, err2)
+		t.Errorf("absent container (exit 20) ⇒ empty id, no error; got id=%q err=%v", got2, err2)
+	}
+
+	// A GENUINE failure (daemon down / permission / CLI error, exit 21) must NOT be
+	// masked as absence — it surfaces a coded ERR_CONNECT so the engine aborts
+	// before D4 rm -f (evaluator iter5 item 1).
+	broken := &scriptTransport{osKind: spec.OSLinux, queue: []transport.Result{
+		{ExitCode: 21, Stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"},
+	}}
+	got3, err3 := d.CurrentImageID(context.Background(), broken, rc)
+	if got3 != "" {
+		t.Errorf("a failed inspect must not return an image id, got %q", got3)
+	}
+	var se *StepError
+	if !errors.As(err3, &se) || se.Code != "ERR_CONNECT" {
+		t.Fatalf("a daemon/permission inspect failure must surface ERR_CONNECT, got %v", err3)
 	}
 }
 

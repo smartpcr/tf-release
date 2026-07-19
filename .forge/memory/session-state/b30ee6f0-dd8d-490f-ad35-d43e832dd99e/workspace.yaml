@@ -1,0 +1,12 @@
+id: b30ee6f0-dd8d-490f-ad35-d43e832dd99e
+cwd: C:\forge\release\.worktree\stage-8.1-docker-container-pattern
+git_root: C:\forge\release\.worktree\stage-8.1-docker-container-pattern
+repository: smartpcr/tf-release
+host_type: github
+branch: ws/release-RELEASE-PROVIDER/phase-docker-examples-and-packaging-stage-docker-container-pattern
+client_name: sdk
+name: "## Engineer changes — GROUND TRUTH (uncommitted `git status` + commits vs the PR base)\r\n\r\nThe engineer's branch changes 8 file(s) vs the merge target:\r\n\r\n8 file(s) changed:\r\n\r\n- `docs/stories/release-RELEASE-PROVIDER/implementation-plan.md`\r\n- `internal/pattern/docker_container_test.go`\r\n- `internal/pattern/testdata/docker_pull_digest.golden`\r\n- `internal/pattern/testdata/docker_pull_linux.golden`\r\n- `internal/pattern/testdata/docker_pull_windows.golden`\r\n- `internal/pattern/testdata/docker_run_..."
+user_named: false
+summary_count: 1
+created_at: 2026-07-19T00:09:17.847Z
+updated_at: 2026-07-19T00:51:59.409Z

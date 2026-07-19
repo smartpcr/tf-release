@@ -341,3 +341,79 @@ func TestDockerSameVersionConfigChangeRedeploys(t *testing.T) {
 	}
 }
 
+// TestDockerRollbackRestoresPriorConfig covers evaluator iter5 item 2: when an
+// update changes BOTH the version AND the container configuration (ports/env/…)
+// and then fails health, the rollback must restore the old image with the OLD
+// configuration recorded in the prior manifest's docker_config snapshot — not
+// the rejected new ports/env. This matches Terraform's retained prior state.
+func TestDockerRollbackRestoresPriorConfig(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:v1img"}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	// Phase 1: land 1.0.0 with port 8080 and env FOO=old.
+	s1 := dockerSpec(t, "1.0.0")
+	s1.Pattern.Ports = []string{"8080:8080"}
+	s1.Environment = map[string]string{"FOO": "old"}
+	if _, err := eng.Deploy(context.Background(), s1); err != nil {
+		t.Fatalf("phase-1 deploy 1.0.0 should succeed: %v", err)
+	}
+
+	// Phase 2: 2.0.0 changes BOTH the version AND the config (port 9090, FOO=new);
+	// health fails on the new image, forcing a rollback to the previous release.
+	n.runImage = "sha256:v2img"
+	n.rollbackImage = "sha256:v1img"
+	n.runScripts = nil
+	n.fakeHost.healthGate = func() bool { return n.image == "sha256:v2img" }
+
+	s2 := dockerSpec(t, "2.0.0")
+	s2.Pattern.Ports = []string{"9090:9090"}
+	s2.Environment = map[string]string{"FOO": "new"}
+	_, err := eng.Deploy(context.Background(), s2)
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_HEALTH_CHECK" {
+		t.Fatalf("health failure must surface ERR_HEALTH_CHECK, got %v", err)
+	}
+
+	var rollbackRun, newRun string
+	for _, s := range n.runScripts {
+		if strings.Contains(s, "sha256:v1img") {
+			rollbackRun = s // rollback runs the OLD image id explicitly
+		} else if strings.Contains(s, "LD_VERSION=2.0.0") {
+			newRun = s // the failed new-version run (image ref, not id)
+		}
+	}
+	if rollbackRun == "" {
+		t.Fatalf("no rollback run against the old image id sha256:v1img: %v", n.runScripts)
+	}
+	// The rollback must restore the PRIOR configuration, not the rejected new one.
+	if !strings.Contains(rollbackRun, "-p '8080:8080'") {
+		t.Errorf("rollback must restore the PRIOR port 8080:\n%s", rollbackRun)
+	}
+	if strings.Contains(rollbackRun, "-p '9090:9090'") {
+		t.Errorf("rollback must NOT apply the rejected new port 9090:\n%s", rollbackRun)
+	}
+	if !strings.Contains(rollbackRun, "-e 'FOO=old'") {
+		t.Errorf("rollback must restore the PRIOR env FOO=old:\n%s", rollbackRun)
+	}
+	if strings.Contains(rollbackRun, "-e 'FOO=new'") {
+		t.Errorf("rollback must NOT apply the rejected new env FOO=new:\n%s", rollbackRun)
+	}
+	if !strings.Contains(rollbackRun, "LD_VERSION=1.0.0") {
+		t.Errorf("rollback must advertise the previous version LD_VERSION=1.0.0:\n%s", rollbackRun)
+	}
+	// Sanity: the failed new-version run used the NEW config.
+	if newRun == "" || !strings.Contains(newRun, "-p '9090:9090'") || !strings.Contains(newRun, "-e 'FOO=new'") {
+		t.Errorf("the new-version run should have used the new port 9090 and FOO=new:\n%s", newRun)
+	}
+
+	// The rolled_back manifest records the previous version and its config snapshot.
+	m := string(n.fakeHost.files[dockerManifestPath])
+	if !strings.Contains(m, `"current_version": "1.0.0"`) || !strings.Contains(m, `"result": "rolled_back"`) {
+		t.Fatalf("rollback must persist a rolled_back manifest at 1.0.0: %s", m)
+	}
+	if !strings.Contains(m, `8080:8080`) || strings.Contains(m, `9090:9090`) {
+		t.Fatalf("rolled_back manifest snapshot must record the restored prior port 8080, not 9090: %s", m)
+	}
+}
+

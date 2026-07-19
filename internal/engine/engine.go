@@ -556,8 +556,19 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		// release) rather than reusing the failed new-version rc. Health is rechecked
 		// with the same previous-version env.
 		rbRC := rc
-		if prev != "" {
-			rbRC = releaseCtxVersion(s, p, prev)
+		if prev != "" && m != nil {
+			// §10.4: restore the PREVIOUS release with the PREVIOUS configuration.
+			// A combined update may have changed ports/volumes/env/restart/run_args
+			// as well as the version; replaying the failed *desired* config against
+			// the old image would leave the machine in neither the old nor the new
+			// state. Prefer the config snapshot persisted at the prior deploy; fall
+			// back to the version-only context for manifests written before snapshots
+			// existed (evaluator iter5 item 2).
+			if prc, ok := dockerRollbackCtx(s, p, prev, m.Extra["docker_config"]); ok {
+				rbRC = prc
+			} else {
+				rbRC = releaseCtxVersion(s, p, prev)
+			}
 		}
 		rerr := dc.RunNew(ctx, t, rbRC, oldImage)
 		if rerr == nil {
@@ -593,7 +604,7 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 			rm := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
 				CurrentVersion: prev, CurrentRelease: "docker://" + rc.Spec.Pattern.ContainerName,
 				ProviderVersion: ProviderVersion,
-				Extra:           map[string]string{"image_id": oldImage, "config_hash": dc.ConfigFingerprint(rbRC)},
+				Extra:           map[string]string{"image_id": oldImage, "config_hash": dc.ConfigFingerprint(rbRC), "docker_config": dockerConfigJSON(dc, rbRC)},
 				LastOperation: LastOp{Type: "deploy", Result: "rolled_back",
 					Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 			}
@@ -631,7 +642,7 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		CurrentVersion: s.Artifact.Version, PreviousVersion: prev,
 		CurrentRelease:  "docker://" + rc.Spec.Pattern.ContainerName,
 		ProviderVersion: ProviderVersion,
-		Extra:           map[string]string{"image_id": newImage, "config_hash": dc.ConfigFingerprint(rc)},
+		Extra:           map[string]string{"image_id": newImage, "config_hash": dc.ConfigFingerprint(rc), "docker_config": dockerConfigJSON(dc, rc)},
 		LastOperation: LastOp{Type: "deploy", Result: "success",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
@@ -760,6 +771,49 @@ func releaseCtxVersion(s *spec.Deployment, p layout.Paths, version string) patte
 	env := layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, version, p, nodePort), s.Environment)
 	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: version,
 		P: p, Spec: s, Env: env}
+}
+
+// dockerConfigJSON serializes the container config snapshot for `rc` for
+// persistence in manifest.extra["docker_config"]. Returns "" on marshal error
+// (the rollback path then falls back to the version-only context).
+func dockerConfigJSON(dc *pattern.DockerContainer, rc pattern.ReleaseCtx) string {
+	b, err := json.Marshal(dc.Snapshot(rc))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// dockerRollbackCtx rebuilds a pattern context that restores the PREVIOUS docker
+// configuration recorded in manifest.extra["docker_config"] at `version` — the
+// old ports/volumes/env/restart/run_args, not the rejected desired ones
+// (evaluator iter5 item 2). Returns ok=false when no usable snapshot exists so
+// the caller can fall back to the version-only context.
+func dockerRollbackCtx(s *spec.Deployment, p layout.Paths, version, snapJSON string) (pattern.ReleaseCtx, bool) {
+	if snapJSON == "" {
+		return pattern.ReleaseCtx{}, false
+	}
+	var snap pattern.DockerConfigSnapshot
+	if err := json.Unmarshal([]byte(snapJSON), &snap); err != nil {
+		return pattern.ReleaseCtx{}, false
+	}
+	sc := *s
+	pc := s.Pattern
+	if snap.ContainerName != "" {
+		pc.ContainerName = snap.ContainerName
+	}
+	pc.Ports = snap.Ports
+	pc.Volumes = snap.Volumes
+	if snap.Restart != "" {
+		pc.RestartPolicy = snap.Restart
+	}
+	pc.RunArgs = snap.RunArgs
+	sc.Pattern = pc
+	env := snap.Env
+	if env == nil {
+		env = layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, version, p, 0), s.Environment)
+	}
+	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: version, P: p, Spec: &sc, Env: env}, true
 }
 
 func lockOwner() string {
