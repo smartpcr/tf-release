@@ -54,10 +54,13 @@ import (
 //
 // This reproducible core runs on the plain `go test -tags e2e` gate with NO
 // external service and NO skip. When TF_ACC=1 AND the W1/L1 connection env is
-// present, each scenario ADDITIONALLY drives the full toolchain matrix
-// (WSV/NOD/NET on real W1 over WinRM; CAP + DRF/DST/IDP/LCK/RBK on real L1 over
-// SSH) against the REAL host (mirrors internal/provider/acc_harness_test.go); a
-// missing var under TF_ACC=1 FAILS the scenario. The suite never sets TF_ACC.
+// present, each scenario ADDITIONALLY drives the full toolchain matrix against
+// the REAL host (mirrors internal/provider/acc_harness_test.go): on W1 over
+// WinRM this now includes real, COMPLETE WSV/NOD/NET service pattern
+// deployments through engine.Deploy that SUCCEED (the service is registered via
+// `sc.exe create`/winsw and verified with `sc.exe query`, then destroy-purged);
+// on L1 over SSH the CAP + DRF/DST/IDP/LCK/RBK matrix runs with native `ln -sfn`.
+// A missing var under TF_ACC=1 FAILS the scenario. The suite never sets TF_ACC.
 //
 // LAB DEPENDENCY (honestly out of the gate's reach): the WSV/NOD/NET/vstest
 // service-registration matrix needs Administrator + node/.NET/WinSW toolchains
@@ -85,6 +88,14 @@ const (
 	w91EnvL1HostKey  = "LABDEPLOY_ACC_L1_HOST_KEY"
 
 	w91EnvArtifactBaseURL = "LABDEPLOY_ACC_ARTIFACT_BASE_URL"
+
+	// Optional W1 service-deployment knobs (defaults suit a standard acceptance
+	// artifact). The lab's sample-svc-1.0.0.zip must contain the referenced
+	// files for the WSV/NET/NOD service deployments to complete.
+	w91EnvW1SvcInstallRoot = "LABDEPLOY_ACC_W1_SERVICE_INSTALL_ROOT"
+	w91EnvNetDLL           = "LABDEPLOY_ACC_NET_DLL"
+	w91EnvNodEntry         = "LABDEPLOY_ACC_NOD_ENTRY"
+	w91EnvNodWinsw         = "LABDEPLOY_ACC_NOD_WINSW"
 
 	// Private-key env the in-process (self-provisioned) SSH target authenticates
 	// with; set/unset around the bare-gate Linux SSH deploy steps.
@@ -1295,6 +1306,13 @@ func w91Port(name string, def int) int {
 	return def
 }
 
+func w91Env(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
 // w91LabMatrix drives the FULL DESIGN §18 single-target matrix against a REAL
 // host over its real transport (WinRM for W1, SSH for L1): CAP console deploy ->
 // IDP idempotent re-apply -> DRF on-host drift + converge -> LCK real lock
@@ -1430,7 +1448,7 @@ strategy: { keep_releases: 3, rollback_on_failure: true }
 
 	// WSV/NOD/NET/vstest: live-host toolchain preflights (Windows / W1 only).
 	if osKind == spec.OSWindows {
-		if err := w91LabWindowsToolchain(ctx, tr, p, host); err != nil {
+		if err := w91LabWindowsToolchain(ctx, tr, p, host, targetYAML); err != nil {
 			_ = eng.Destroy(ctx, dRb, "purge")
 			return err
 		}
@@ -1449,7 +1467,7 @@ strategy: { keep_releases: 3, rollback_on_failure: true }
 
 // w91LabWindowsToolchain runs the NOD/NET/vstest/WSV toolchain preflights on the
 // real W1 host over WinRM — the Windows matrix the console core does not cover.
-func w91LabWindowsToolchain(ctx context.Context, tr transport.Transport, p layout.Paths, host string) error {
+func w91LabWindowsToolchain(ctx context.Context, tr transport.Transport, p layout.Paths, host, targetYAML string) error {
 	nod, _ := pattern.For(spec.PatternNodeWebApp)
 	rcNod := pattern.ReleaseCtx{App: "sample-svc", Version: "1.0.0", P: p,
 		Spec: &spec.Deployment{Pattern: spec.Pattern{Type: spec.PatternNodeWebApp, NodeExe: "node", Entry: "server.js"}}}
@@ -1484,6 +1502,94 @@ func w91LabWindowsToolchain(ctx context.Context, tr transport.Transport, p layou
 	}
 	if err := w91RunVstest(ctx, tr); err != nil {
 		return fmt.Errorf("lab NET real vstest acceptance run on %s: %w", host, err)
+	}
+	// Real, COMPLETE WSV/NOD/NET service pattern deployments on the admin W1 host
+	// (the acceptance requirement that all service deployments pass — the SCM
+	// `sc.exe create` / winsw install the non-admin bare gate cannot cross).
+	if err := w91LabServiceDeployments(ctx, tr, targetYAML, host); err != nil {
+		return err
+	}
+	return nil
+}
+
+// w91LabServiceDeployments runs the REAL WSV/NOD/NET service pattern deployments
+// through engine.Deploy against the live, Administrator W1 host, asserting each
+// COMPLETES SUCCESSFULLY (reaches DeployedVersion 1.0.0 — the service
+// registration the non-admin bare gate cannot perform), then destroy --purges to
+// leave the host clean. Fails loudly (never skips) if a required artifact/env is
+// missing so a mis-provisioned lab cannot pass as green. On the bare gate these
+// same patterns run through their non-privileged stages via
+// w91DeployServicePatternStages; here on W1 they run to full completion.
+func w91LabServiceDeployments(ctx context.Context, tr transport.Transport, targetYAML, host string) error {
+	base, err := w91MustEnv(w91EnvArtifactBaseURL, "service-pattern artifact host")
+	if err != nil {
+		return err
+	}
+	sha, err := w91SHA("1.0.0", "zip")
+	if err != nil {
+		return err
+	}
+	url := strings.TrimRight(base, "/") + "/sample-svc-1.0.0.zip"
+	installRoot := w91Env(w91EnvW1SvcInstallRoot, `C:\labdeploy-e2e-svc`)
+
+	deploy := func(name, patYAML, serviceName string) error {
+		y := fmt.Sprintf(`
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: %s }
+target:
+%s
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: %q
+  source: { type: http, url: %q }
+pattern:
+%s
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, name, targetYAML, sha, url, patYAML)
+		d, _, e := spec.ParseDeployment(y, nil, "")
+		if e != nil {
+			return fmt.Errorf("lab %s service spec on %s: %w", name, host, e)
+		}
+		st, e := engine.New().Deploy(ctx, d)
+		if e != nil {
+			return fmt.Errorf("lab %s service deployment on %s did not COMPLETE successfully: %w", name, host, e)
+		}
+		if st == nil || st.DeployedVersion != "1.0.0" {
+			return fmt.Errorf("lab %s service deployment on %s did not reach 1.0.0: %+v", name, host, st)
+		}
+		// The Windows service must be registered after a successful deployment.
+		rq, qe := tr.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 60,
+			Script: fmt.Sprintf(`& sc.exe query %q *> $null; if($LASTEXITCODE -eq 0){exit 0}else{exit 1}`, serviceName)})
+		if qe != nil {
+			_ = engine.New().Destroy(ctx, d, "purge")
+			return fmt.Errorf("lab %s sc.exe query on %s: %w", name, host, qe)
+		}
+		if rq.ExitCode != 0 {
+			_ = engine.New().Destroy(ctx, d, "purge")
+			return fmt.Errorf("lab %s deployment on %s did not register service %q", name, host, serviceName)
+		}
+		if de := engine.New().Destroy(ctx, d, "purge"); de != nil {
+			return fmt.Errorf("lab %s destroy purge on %s: %w", name, host, de)
+		}
+		return nil
+	}
+
+	wsvPat := fmt.Sprintf("  type: windows_service\n  install_root: %q\n  service_name: LabdeployE2EWsv\n  exe: %s\n  wrapper: none\n  start_type: manual",
+		installRoot, w91Exe(spec.OSWindows))
+	if err := deploy("labdeploy-wsv", wsvPat, "LabdeployE2EWsv"); err != nil {
+		return err
+	}
+	netPat := fmt.Sprintf("  type: dotnet_api\n  install_root: %q\n  launcher: dotnet_dll\n  dll: %s\n  service_name: LabdeployE2ENet",
+		installRoot, w91Env(w91EnvNetDLL, "app.dll"))
+	if err := deploy("labdeploy-net", netPat, "LabdeployE2ENet"); err != nil {
+		return err
+	}
+	nodPat := fmt.Sprintf("  type: node_web_app\n  install_root: %q\n  node_exe: node\n  entry: %s\n  service_name: LabdeployE2ENod\n  port: 8080\n  winsw_exe: %s",
+		installRoot, w91Env(w91EnvNodEntry, "server.js"), w91Env(w91EnvNodWinsw, "winsw.exe"))
+	if err := deploy("labdeploy-nod", nodPat, "LabdeployE2ENod"); err != nil {
+		return err
 	}
 	return nil
 }
