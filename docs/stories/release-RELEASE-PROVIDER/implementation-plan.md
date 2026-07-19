@@ -419,8 +419,8 @@ storyId: "release:RELEASE-PROVIDER"
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Docker run script golden -- Given a docker_container spec, When the D1..D7 scripts are generated, Then they match the committed golden including digest pull and rollback [proof: golden; deps: none -- committed fixtures under internal/pattern/testdata]
-- [ ] Scenario: Docker preflight fail -- Given `docker version` failing via a fake transport, When `Preflight` runs, Then it yields `ERR_PREFLIGHT` [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
+- [x] Scenario: Docker run script golden -- Given a docker_container spec, When the D1..D7 scripts are generated, Then they match the committed golden including digest pull and rollback [proof: golden; deps: none -- committed fixtures under internal/pattern/testdata]
+- [x] Scenario: Docker preflight fail -- Given `docker version` failing via a fake transport, When `Preflight` runs, Then it yields `ERR_PREFLIGHT` [proof: in-process; deps: none -- fake Transport with a scripted Result queue]
 
 ## Stage 8.2: Examples and Pipeline Templates
 

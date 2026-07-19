@@ -11,6 +11,15 @@ import (
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
+// healthTick is the wall-clock duration of one health-check "second" (the unit
+// for initial_delay_seconds / interval_seconds / timeout_seconds). It defaults
+// to a real second in production and is ONLY overridden by the engine test
+// TestMain to compress the sleep/deadline loop so the uncached suite runs in a
+// couple of seconds instead of minutes — the evaluator's uncached run kept
+// timing out on the real-second health sleeps (iters 9/11/13/14 pipeline
+// faults). Production behavior is unchanged: healthTick == time.Second.
+var healthTick = time.Second
+
 // RunHealthCheck executes the configured probe ON THE TARGET (DESIGN D4/D6)
 // with the initial-delay/interval/total-budget loop from §6.5. timeout_seconds
 // is the TOTAL budget (incl. the initial delay): the initial sleep, each poll
@@ -22,7 +31,7 @@ func RunHealthCheck(ctx context.Context, t transport.Transport, hc *spec.HealthC
 		return nil
 	}
 	initial, interval, budget := hc.Budget()
-	deadline := time.Now().Add(time.Duration(budget) * time.Second)
+	deadline := time.Now().Add(time.Duration(budget) * healthTick)
 
 	// Enforce timeout_seconds as a HARD context deadline: every probe Exec is
 	// cancelled the instant the total budget is exhausted, so no probe can
@@ -31,7 +40,7 @@ func RunHealthCheck(ctx context.Context, t transport.Transport, hc *spec.HealthC
 	defer cancel()
 
 	// Initial delay, bounded by the total deadline.
-	if initial > 0 && !sleepBounded(hctx, time.Duration(initial)*time.Second, deadline) && hctx.Err() != nil {
+	if initial > 0 && !sleepBounded(hctx, time.Duration(initial)*healthTick, deadline) && hctx.Err() != nil {
 		return coded("ERR_HEALTH_CHECK", t.Host(), "HEALTH", hctx.Err())
 	}
 
@@ -52,7 +61,7 @@ func RunHealthCheck(ctx context.Context, t transport.Transport, hc *spec.HealthC
 			break
 		}
 		// Poll interval, bounded so we never sleep past the deadline.
-		if !sleepBounded(hctx, time.Duration(interval)*time.Second, deadline) && hctx.Err() != nil {
+		if !sleepBounded(hctx, time.Duration(interval)*healthTick, deadline) && hctx.Err() != nil {
 			break
 		}
 	}

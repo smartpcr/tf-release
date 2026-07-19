@@ -2,6 +2,8 @@ package pattern
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"sort"
@@ -55,27 +57,45 @@ func imageRef(a *spec.Artifact) string {
 	return src.Image + ":" + tag
 }
 
-// Pull = D1+D2 (+D7 logout). Login credentials travel via env/stdin only.
+// Pull = D1+D2 (+D7 logout). Login credentials travel via env/stdin only. Every
+// interpolated value (registry, username, image ref) is single-quoted for the
+// target shell via `q` so registry/image/user metacharacters cannot be
+// interpreted (DESIGN §9.6 D1/D2).
 func (d *DockerContainer) Pull(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
 	a := &rc.Spec.Artifact
 	ref := imageRef(a)
 	registry := ""
-	if i := strings.Index(a.Source.Image, "/"); i > 0 && strings.ContainsAny(a.Source.Image[:i], ".:") {
-		registry = a.Source.Image[:i]
+	if i := strings.Index(a.Source.Image, "/"); i > 0 {
+		host := a.Source.Image[:i]
+		// Docker's own registry-vs-repository rule: the first path component is a
+		// REGISTRY host only when it contains a `.` or `:` OR is exactly `localhost`
+		// (the one dotless host Docker treats as a registry). Otherwise it is a Hub
+		// namespace (e.g. `library/nginx`). Missing the `localhost` case made
+		// authenticated `localhost/repo` pulls log into Docker Hub instead of the
+		// local registry (evaluator iter5 item 3).
+		if host == "localhost" || strings.ContainsAny(host, ".:") {
+			registry = host
+		}
 	}
 	env := map[string]string{}
 	login, logout := "", ""
 	if a.Source.Auth.Username != "" && a.Source.Auth.PasswordEnv != "" {
 		env["LD_REG_PW"] = os.Getenv(a.Source.Auth.PasswordEnv)
+		regArg := ""
+		if registry != "" {
+			regArg = " " + d.q(t, registry)
+		}
+		user := d.q(t, a.Source.Auth.Username)
 		if t.OS() == spec.OSWindows {
-			login = fmt.Sprintf(`$env:LD_REG_PW | docker login %s -u %s --password-stdin
-if($LASTEXITCODE -ne 0){ Write-Error 'docker login failed'; exit 40 }`, registry, psq(a.Source.Auth.Username))
-			logout = fmt.Sprintf("docker logout %s | Out-Null", registry)
+			login = fmt.Sprintf(`$env:LD_REG_PW | docker login%s -u %s --password-stdin
+if($LASTEXITCODE -ne 0){ Write-Error 'docker login failed'; exit 40 }`, regArg, user)
+			logout = fmt.Sprintf("docker logout%s | Out-Null", regArg)
 		} else {
-			login = fmt.Sprintf(`printf '%%s' "$LD_REG_PW" | docker login %s -u '%s' --password-stdin || { echo 'docker login failed' >&2; exit 40; }`, registry, a.Source.Auth.Username)
-			logout = fmt.Sprintf("docker logout %s >/dev/null 2>&1 || true", registry)
+			login = fmt.Sprintf(`printf '%%s' "$LD_REG_PW" | docker login%s -u %s --password-stdin || { echo 'docker login failed' >&2; exit 40; }`, regArg, user)
+			logout = fmt.Sprintf("docker logout%s >/dev/null 2>&1 || true", regArg)
 		}
 	}
+	qref := d.q(t, ref)
 	var script string
 	if t.OS() == spec.OSWindows {
 		script = fmt.Sprintf(`%s
@@ -83,13 +103,13 @@ docker pull %s
 $code=$LASTEXITCODE
 %s
 if($code -ne 0){ exit 40 }
-exit 0`, login, ref, logout)
+exit 0`, login, qref, logout)
 	} else {
 		script = fmt.Sprintf(`%s
-docker pull '%s'; code=$?
+docker pull %s; code=$?
 %s
 [ $code -eq 0 ] || exit 40
-exit 0`, login, ref, logout)
+exit 0`, login, qref, logout)
 	}
 	r, err := d.run(ctx, t, "FETCH", script, env, 1800)
 	if err != nil {
@@ -101,34 +121,128 @@ exit 0`, login, ref, logout)
 	return nil
 }
 
-// CurrentImageID = D3, "" when container absent.
+// CurrentImageID = D3. Returns the running container's image id, or "" when the
+// container is ABSENT. A non-zero `docker inspect` is classified via a sentinel
+// exit code: 0 = found, 20 = "No such object/container" (absent ⇒ ""), anything
+// else = a GENUINE failure (daemon unreachable, permission denied, CLI error)
+// surfaced as a coded ERR_CONNECT so the engine aborts BEFORE D4 `rm -f` instead
+// of masking the failure as an empty rollback anchor (evaluator iter5 item 1).
 func (d *DockerContainer) CurrentImageID(ctx context.Context, t transport.Transport, rc ReleaseCtx) (string, error) {
-	name := rc.Spec.Pattern.ContainerName
+	qn := d.q(t, rc.Spec.Pattern.ContainerName)
 	var script string
 	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf(`docker inspect -f '{{.Image}}' %s 2>$null
-if($LASTEXITCODE -ne 0){ Write-Output '' }
-exit 0`, name)
+		script = fmt.Sprintf(`$out = (docker inspect -f '{{.Image}}' %s 2>&1 | Out-String).Trim()
+$rc = $LASTEXITCODE
+if($rc -eq 0){ Write-Output $out; exit 0 }
+if($out -match 'No such'){ exit 20 }
+[Console]::Error.Write($out); exit 21`, qn)
 	} else {
-		script = fmt.Sprintf(`docker inspect -f '{{.Image}}' '%s' 2>/dev/null || echo ''`, name)
+		script = fmt.Sprintf(`out=$(docker inspect -f '{{.Image}}' %s 2>&1); rc=$?
+if [ $rc -eq 0 ]; then printf '%%s' "$out"; exit 0; fi
+case "$out" in *"No such"*) exit 20;; esac
+printf '%%s' "$out" >&2; exit 21`, qn)
 	}
 	r, err := d.run(ctx, t, "STAGE", script, nil, 60)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(r.Stdout), nil
+	switch r.ExitCode {
+	case 0:
+		return strings.TrimSpace(r.Stdout), nil
+	case 20:
+		return "", nil // container absent — a fresh install, not a failure
+	default:
+		return "", stepErr("ERR_CONNECT", t.Host(), "STAGE",
+			fmt.Errorf("docker inspect failed (exit %d): %s", r.ExitCode, truncOut(r)))
+	}
 }
 
-func (d *DockerContainer) runArgs(rc ReleaseCtx) string {
+// DockerConfigSnapshot captures the MUTABLE container configuration of a landed
+// release so a later rollback can restore the OLD image with the OLD
+// configuration (ports/env/volumes/restart/run_args), not the rejected new one
+// (evaluator iter5 item 2). It is persisted in manifest.extra["docker_config"].
+type DockerConfigSnapshot struct {
+	ContainerName string            `json:"container_name"`
+	Ports         []string          `json:"ports,omitempty"`
+	Volumes       []string          `json:"volumes,omitempty"`
+	Restart       string            `json:"restart,omitempty"`
+	RunArgs       []string          `json:"run_args,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
+	// HealthCheck is the health probe the PRIOR release was validated with, so a
+	// rollback re-checks HEALTH(prev) — the probe that matched the restored
+	// container — rather than the rejected desired probe (DESIGN §10.2). A URL/
+	// port/command change in the failed update must not make a successful restore
+	// report ERR_ROLLBACK_FAILED (evaluator iter7 item 1).
+	HealthCheck *spec.HealthCheck `json:"health_check,omitempty"`
+}
+
+// Snapshot records the configuration that a `docker run` for `rc` would apply,
+// so it can be replayed verbatim on rollback.
+func (d *DockerContainer) Snapshot(rc ReleaseCtx) DockerConfigSnapshot {
+	p := rc.Spec.Pattern
+	restart := p.RestartPolicy
+	if restart == "" {
+		restart = "unless-stopped"
+	}
+	hc := rc.Spec.HealthCheck
+	return DockerConfigSnapshot{
+		ContainerName: p.ContainerName,
+		Ports:         p.Ports,
+		Volumes:       p.Volumes,
+		Restart:       restart,
+		RunArgs:       p.RunArgs,
+		Env:           rc.Env,
+		HealthCheck:   &hc,
+	}
+}
+
+// Remove force-removes the named container (D4 `docker rm -f`) independently of
+// a `docker run`. Used on rollback to tear down a container that a failed update
+// started under a CHANGED desired name before restoring the prior container name,
+// so a name change cannot leave both the failed and the restored container
+// running (evaluator iter7 item 2). Classifies via SENTINEL EXIT CODES — 0 =
+// removed, 20 = "No such container" (already absent, the desired end state), else
+// = a GENUINE removal failure (daemon rejected removal, permission, CLI error)
+// surfaced as a coded ERR_ROLLBACK_FAILED so the engine does NOT restore the old
+// container alongside the still-running failed one and does NOT record a bogus
+// rolled_back state (evaluator iter8 item 1).
+func (d *DockerContainer) Remove(ctx context.Context, t transport.Transport, name string) error {
+	qn := d.q(t, name)
+	var script string
+	if t.OS() == spec.OSWindows {
+		script = fmt.Sprintf(`$out = (docker rm -f %s 2>&1 | Out-String).Trim()
+if($LASTEXITCODE -eq 0){ exit 0 }
+if($out -match 'No such'){ exit 20 }
+[Console]::Error.Write($out); exit 21`, qn)
+	} else {
+		script = fmt.Sprintf(`out=$(docker rm -f %s 2>&1); rc=$?
+if [ $rc -eq 0 ]; then exit 0; fi
+case "$out" in *"No such"*) exit 20;; esac
+printf '%%s' "$out" >&2; exit 21`, qn)
+	}
+	r, err := d.run(ctx, t, "ROLLBACK", script, nil, 120)
+	if err != nil {
+		return err
+	}
+	switch r.ExitCode {
+	case 0, 20:
+		return nil // removed, or already absent — both leave no failed container
+	default:
+		return stepErr("ERR_ROLLBACK_FAILED", t.Host(), "ROLLBACK",
+			fmt.Errorf("docker rm -f of failed container %q failed (exit %d): %s", name, r.ExitCode, truncOut(r)))
+	}
+}
+
+func (d *DockerContainer) runArgs(t transport.Transport, rc ReleaseCtx) string {
 	p := rc.Spec.Pattern
 	restart := p.RestartPolicy
 	if restart == "" {
 		restart = "unless-stopped"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "-d --name %s --restart %s", p.ContainerName, restart)
+	fmt.Fprintf(&b, "-d --name %s --restart %s", d.q(t, p.ContainerName), d.q(t, restart))
 	for _, pt := range p.Ports {
-		fmt.Fprintf(&b, " -p %s", pt)
+		fmt.Fprintf(&b, " -p %s", d.q(t, pt))
 	}
 	keys := make([]string, 0, len(rc.Env))
 	for k := range rc.Env {
@@ -136,32 +250,90 @@ func (d *DockerContainer) runArgs(rc ReleaseCtx) string {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		fmt.Fprintf(&b, " -e %s", shellKV(k, rc.Env[k]))
+		fmt.Fprintf(&b, " -e %s", d.q(t, k+"="+rc.Env[k]))
 	}
 	for _, v := range p.Volumes {
-		fmt.Fprintf(&b, " -v %s", v)
+		fmt.Fprintf(&b, " -v %s", d.q(t, v))
 	}
+	// run_args are operator-authored raw docker flags (e.g. --pull=never); passed
+	// through verbatim, NOT container-controlled data, so they are not re-quoted.
 	for _, a := range p.RunArgs {
 		fmt.Fprintf(&b, " %s", a)
 	}
 	return b.String()
 }
 
-func shellKV(k, v string) string { return "\"" + k + "=" + strings.ReplaceAll(v, `"`, `\"`) + "\"" }
+// q single-quotes one docker run argument for the target shell so container-
+// controlled data (env values, ports, volumes, image ref) cannot be interpreted
+// by sh or PowerShell — closing the `$(...)`/backtick/`$VAR`/quote command-
+// injection hole a bare double-quoted `-e "K=V"` left open (DESIGN §9.6 D5). sh
+// escapes an embedded `'` as `'\''`; PowerShell doubles it as `''` (both literal).
+func (d *DockerContainer) q(t transport.Transport, s string) string {
+	if t.OS() == spec.OSWindows {
+		return psq(s)
+	}
+	return shq(s)
+}
 
-// RunNew = D4+D5 with a given image ref (new ref, or old image id on rollback).
+// classifyScript wraps a docker lifecycle invocation `inner` (e.g.
+// `docker rm -f 'x'` or `docker stop 'x'`) in the SHARED sentinel-exit
+// convention used across the docker D-steps: exit 0 on success, exit 20 when the
+// container is ABSENT ("No such object/container" — a satisfied post-condition,
+// nothing to do), and exit 21 on ANY OTHER (genuine) failure (daemon
+// unreachable, permission denied, CLI error). This lets the engine distinguish a
+// missing container from a real failure instead of the previous blanket
+// `|| true` / `2>$null` suppression that let daemon and permission failures pass
+// as success (evaluator iter10 items 2/3/4). The inner command's own stderr is
+// preserved on the genuine-failure path for diagnostics.
+func (d *DockerContainer) classifyScript(t transport.Transport, inner string) string {
+	if t.OS() == spec.OSWindows {
+		return fmt.Sprintf(`$out = (%s 2>&1 | Out-String).Trim()
+if($LASTEXITCODE -eq 0){ exit 0 }
+if($out -match 'No such'){ exit 20 }
+[Console]::Error.Write($out); exit 21`, inner)
+	}
+	return fmt.Sprintf(`out=$(%s 2>&1); rc=$?
+if [ $rc -eq 0 ]; then exit 0; fi
+case "$out" in *"No such"*) exit 20;; esac
+printf '%%s' "$out" >&2; exit 21`, inner)
+}
+
+// classifyLifecycle interprets a classifyScript result: exit 0 ⇒ done, exit 20 ⇒
+// container absent (returns absent=true, no error — an already-gone container
+// satisfies stop/remove), anything else ⇒ a coded StepError under `code` so the
+// genuine failure surfaces to the engine rather than being silently swallowed.
+func classifyLifecycle(host, step, code string, r transport.Result) (absent bool, err error) {
+	switch r.ExitCode {
+	case 0:
+		return false, nil
+	case 20:
+		return true, nil
+	default:
+		return false, stepErr(code, host, step,
+			fmt.Errorf("docker %s failed (exit %d): %s", strings.ToLower(step), r.ExitCode, truncOut(r)))
+	}
+}
 func (d *DockerContainer) RunNew(ctx context.Context, t transport.Transport, rc ReleaseCtx, ref string) error {
 	name := rc.Spec.Pattern.ContainerName
 	var script string
+	// D4 removes any prior container of the same name before D5 re-runs it. DESIGN
+	// §9.6 permits ignoring ONLY a not-found ("No such") result — a genuine removal
+	// failure (daemon down, container stuck) must be reported directly, NOT obscured
+	// as a later D5 start failure (evaluator iter10 item 4). We therefore classify
+	// the D4 `rm -f` first: not-found is skipped, but any other nonzero exits with
+	// ExitServiceStop so the engine surfaces ERR_SERVICE_STOP (distinct from the
+	// ERR_SERVICE_START that a genuine D5 `docker run` failure yields).
 	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf(`docker rm -f %s 2>$null | Out-Null
+		script = fmt.Sprintf(`$rmout = (docker rm -f %s 2>&1 | Out-String).Trim()
+if($LASTEXITCODE -ne 0 -and $rmout -notmatch 'No such'){ [Console]::Error.Write($rmout); exit %d }
 docker run %s %s
 if($LASTEXITCODE -ne 0){ exit %d }
-exit 0`, name, d.runArgs(rc), ref, ExitServiceStart)
+exit 0`, d.q(t, name), ExitServiceStop, d.runArgs(t, rc), d.q(t, ref), ExitServiceStart)
 	} else {
-		script = fmt.Sprintf(`docker rm -f '%s' >/dev/null 2>&1 || true
-docker run %s '%s' || exit %d
-exit 0`, name, d.runArgs(rc), ref, ExitServiceStart)
+		script = fmt.Sprintf(`rmout=$(docker rm -f %s 2>&1); rc=$?
+if [ $rc -ne 0 ]; then case "$rmout" in *"No such"*) : ;; *) printf '%%s' "$rmout" >&2; exit %d;; esac; fi
+docker run %s %s || exit %d
+exit 0`, d.q(t, name), ExitServiceStop, d.runArgs(t, rc), d.q(t, ref), ExitServiceStart)
 	}
 	r, err := d.run(ctx, t, "START", script, nil, 300)
 	if err != nil {
@@ -180,15 +352,17 @@ func (d *DockerContainer) Configure(ctx context.Context, t transport.Transport, 
 }
 
 func (d *DockerContainer) Stop(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
-	name := rc.Spec.Pattern.ContainerName
-	var script string
-	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf("docker stop %s 2>$null | Out-Null\nexit 0", name)
-	} else {
-		script = fmt.Sprintf("docker stop '%s' >/dev/null 2>&1 || true", name)
+	qn := d.q(t, rc.Spec.Pattern.ContainerName)
+	// A `docker stop` on an ABSENT container ("No such container") is a satisfied
+	// post-condition and must be ignored, but daemon/permission/stop failures must
+	// surface to the engine per the pattern lifecycle contract — the old blanket
+	// `|| true` / `2>$null` swallowed all of them (evaluator iter10 item 3).
+	r, err := d.run(ctx, t, "STOP", d.classifyScript(t, "docker stop "+qn), nil, 120)
+	if err != nil {
+		return err
 	}
-	_, err := d.run(ctx, t, "STOP", script, nil, 120)
-	return err
+	_, cerr := classifyLifecycle(t.Host(), "STOP", "ERR_SERVICE_STOP", r)
+	return cerr
 }
 
 func (d *DockerContainer) Start(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
@@ -196,32 +370,85 @@ func (d *DockerContainer) Start(ctx context.Context, t transport.Transport, rc R
 }
 
 func (d *DockerContainer) Status(ctx context.Context, t transport.Transport, rc ReleaseCtx) (string, error) {
-	name := rc.Spec.Pattern.ContainerName
+	qn := d.q(t, rc.Spec.Pattern.ContainerName)
 	var script string
+	// DESIGN §10.4: ReadStatus must fail LOUDLY on daemon/permission errors rather
+	// than report absence. Only a not-found ("No such") inspect result maps to
+	// not_installed; any other nonzero exits 21 so the engine returns a coded
+	// ERR_CONNECT refresh failure instead of a false "not_installed" (iter10 item 1).
 	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf(`$s = docker inspect -f '{{.State.Running}}' %s 2>$null
-if($LASTEXITCODE -ne 0){ Write-Output 'not_installed'; exit 0 }
-if($s -match 'true'){ Write-Output 'running' } else { Write-Output 'stopped' }
-exit 0`, name)
+		script = fmt.Sprintf(`$out = (docker inspect -f '{{.State.Running}}' %s 2>&1 | Out-String).Trim()
+if($LASTEXITCODE -eq 0){ if($out -match 'true'){ Write-Output 'running' } else { Write-Output 'stopped' }; exit 0 }
+if($out -match 'No such'){ Write-Output 'not_installed'; exit 0 }
+[Console]::Error.Write($out); exit 21`, qn)
 	} else {
-		script = fmt.Sprintf(`s=$(docker inspect -f '{{.State.Running}}' '%s' 2>/dev/null) || { echo not_installed; exit 0; }
-[ "$s" = "true" ] && echo running || echo stopped`, name)
+		script = fmt.Sprintf(`out=$(docker inspect -f '{{.State.Running}}' %s 2>&1); rc=$?
+if [ $rc -eq 0 ]; then [ "$out" = "true" ] && echo running || echo stopped; exit 0; fi
+case "$out" in *"No such"*) echo not_installed; exit 0;; esac
+printf '%%s' "$out" >&2; exit 21`, qn)
 	}
 	r, err := d.run(ctx, t, "STATUS", script, nil, 60)
 	if err != nil {
 		return "", err
 	}
+	if r.ExitCode != 0 {
+		return "", stepErr("ERR_CONNECT", t.Host(), "STATUS",
+			fmt.Errorf("docker inspect failed (exit %d): %s", r.ExitCode, truncOut(r)))
+	}
 	return strings.TrimSpace(r.Stdout), nil
 }
 
 func (d *DockerContainer) Uninstall(ctx context.Context, t transport.Transport, rc ReleaseCtx, purge bool) error {
-	name := rc.Spec.Pattern.ContainerName
-	var script string
-	if t.OS() == spec.OSWindows {
-		script = fmt.Sprintf("docker rm -f %s 2>$null | Out-Null\nexit 0", name)
-	} else {
-		script = fmt.Sprintf("docker rm -f '%s' >/dev/null 2>&1 || true", name)
+	qn := d.q(t, rc.Spec.Pattern.ContainerName)
+	// Uninstall backs Engine.Destroy, which removes the manifest/tree once this
+	// returns nil. A blanket-suppressed `docker rm -f` let Destroy report success
+	// while the container was still running (evaluator iter10 item 2); classify so
+	// only a not-found container is treated as already-gone and genuine removal
+	// failures propagate as ERR_SERVICE_STOP.
+	r, err := d.run(ctx, t, "CONFIGURE", d.classifyScript(t, "docker rm -f "+qn), nil, 120)
+	if err != nil {
+		return err
 	}
-	_, err := d.run(ctx, t, "CONFIGURE", script, nil, 120)
-	return err
+	_, cerr := classifyLifecycle(t.Host(), "CONFIGURE", "ERR_SERVICE_STOP", r)
+	return cerr
+}
+
+// ConfigFingerprint hashes the MUTABLE docker_container settings — image ref
+// (tag or digest), container name, restart policy, ports, volumes, run_args and
+// the rendered env — so the engine can tell a same-version CONFIGURATION change
+// (new tag/digest, ports, env, volumes, restart, run args) apart from a true
+// no-op and avoid silently ignoring it (DESIGN §10.1). Ports/volumes/env are
+// order-normalized; run_args keep author order (docker flag order is meaningful).
+func (d *DockerContainer) ConfigFingerprint(rc ReleaseCtx) string {
+	p := rc.Spec.Pattern
+	restart := p.RestartPolicy
+	if restart == "" {
+		restart = "unless-stopped"
+	}
+	h := sha256.New()
+	fmt.Fprintf(h, "ref=%s\n", imageRef(&rc.Spec.Artifact))
+	fmt.Fprintf(h, "name=%s\n", p.ContainerName)
+	fmt.Fprintf(h, "restart=%s\n", restart)
+	ports := append([]string(nil), p.Ports...)
+	sort.Strings(ports)
+	for _, x := range ports {
+		fmt.Fprintf(h, "port=%s\n", x)
+	}
+	vols := append([]string(nil), p.Volumes...)
+	sort.Strings(vols)
+	for _, x := range vols {
+		fmt.Fprintf(h, "vol=%s\n", x)
+	}
+	for _, x := range p.RunArgs {
+		fmt.Fprintf(h, "arg=%s\n", x)
+	}
+	keys := make([]string, 0, len(rc.Env))
+	for k := range rc.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(h, "env=%s=%s\n", k, rc.Env[k])
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

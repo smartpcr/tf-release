@@ -490,7 +490,11 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 	host := t.Host()
 	sl = sl.forHost(host)
 	started := time.Now().UTC()
-	if m != nil && m.CurrentVersion == s.Artifact.Version {
+	if m != nil && m.CurrentVersion == s.Artifact.Version && m.Extra["config_hash"] == dc.ConfigFingerprint(rc) {
+		// True no-op only when the version AND the mutable container configuration
+		// (image ref/ports/env/volumes/restart/run_args) are unchanged AND running
+		// (DESIGN §10.1). A same-version config change has a different fingerprint
+		// and falls through to a redeploy instead of being silently ignored.
 		if st, err := dc.Status(ctx, t, rc); err == nil && st == "running" {
 			return statusFrom(m, host, st), nil
 		}
@@ -509,7 +513,16 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 	if perr != nil {
 		return nil, perr
 	}
-	if cur, err := dc.CurrentImageID(ctx, t, rc); err == nil && cur != "" {
+	// D3 (pre-run inspect): record the live image id as the rollback anchor. A
+	// TRANSPORT error here must abort BEFORE D4 `rm -f` — destroying the running
+	// container with no recorded rollback image would leave the target
+	// unrecoverable (evaluator iter3 item 1). An absent container is reported as
+	// ("", nil) by CurrentImageID, so only a real failure surfaces an error.
+	cur, cerr := dc.CurrentImageID(ctx, t, rc)
+	if cerr != nil {
+		return nil, cerr
+	}
+	if cur != "" {
 		oldImage = cur
 	}
 	runErr := sl.timed(ctx, "START", func() error { return dc.Start(ctx, t, rc) }) // rm -f old + run new
@@ -519,27 +532,111 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		})
 	}
 	if runErr != nil {
-		if !s.Strategy.EffectiveRollback() || oldImage == "" {
-			// §10.2: record last_operation=failed so Read reports drift even when no
-			// rollback is performed (rollback disabled or previous image unknown).
+		if !s.Strategy.EffectiveRollback() {
+			// §10.2 "any, rollback_on_failure=false": the engine takes NO
+			// compensating action. The rejected container is deliberately LEFT
+			// as-is — for a FRESH install as well as an update — so the operator
+			// can inspect it, and a failed manifest is persisted so Read reports
+			// drift (§10.4). Recording no compensating cleanup here is required by
+			// the matrix's rollback-disabled row (evaluator iter15 item 3).
 			// Record at the previous version if known, else the attempted version so
 			// a fresh docker failure still persists failed state (evaluator iter5 item 2).
 			failVer := prev
 			if failVer == "" {
 				failVer = s.Artifact.Version
 			}
-			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started)
-			out := fmt.Errorf("%w; no docker rollback performed (prev image unknown or rollback disabled)", runErr)
+			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started, manifestExtra(m))
+			out := fmt.Errorf("%w; no docker rollback performed (rollback disabled)", runErr)
 			if fmErr != nil {
 				return nil, coded("ERR_CONNECT", host, "FINALIZE",
 					fmt.Errorf("%v; failed-manifest write error: %v", out, fmErr))
 			}
 			return nil, out
 		}
+		if oldImage == "" {
+			// §10.2 fresh-install row (rollback ENABLED): there is no prior image
+			// to restore, so the outcome is "machine clean, apply error, no TF
+			// state" — Stop the rejected container AND leave NO manifest behind.
+			// The container that D5 started — or a partial container from a failed
+			// D5 — must be torn down (`docker rm -f`, already-absent = success),
+			// otherwise a rejected container keeps running under the desired name.
+			if cleanupErr := sl.timed(ctx, "STOP", func() error {
+				return dc.Remove(ctx, t, rc.Spec.Pattern.ContainerName)
+			}); cleanupErr != nil {
+				// The fresh container could not be removed — the machine is NOT
+				// clean. §10.6 requires that ERR_ROLLBACK_FAILED still persist
+				// manifest.last_operation={type:deploy,result:failed} before the
+				// error is surfaced, so a subsequent Read reports the unknown state
+				// as drift and a re-apply attempts a repairing deploy. Record at the
+				// attempted version (fresh ⇒ prev==""; evaluator iter17 items 1/2).
+				failVer := prev
+				if failVer == "" {
+					failVer = s.Artifact.Version
+				}
+				fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started, manifestExtra(m))
+				detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — fresh container %q could not be removed after a failed install: %v; deploy error: %v",
+					host, rc.Spec.Pattern.ContainerName, cleanupErr, runErr)
+				if fmErr != nil {
+					detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
+				}
+				return nil, coded("ERR_ROLLBACK_FAILED", host, "STOP", detail)
+			}
+			// Machine is clean ⇒ manifest MUST be ABSENT (§10.2: "manifest absent",
+			// "no TF state"). removePath is idempotent — on a first install there is
+			// usually no manifest yet — but it also clears any stale/partial manifest
+			// so Read yields RemoveResource and the next plan re-creates from scratch
+			// (evaluator iter15 items 1/2). A genuine delete failure is surfaced.
+			if delErr := sl.timed(ctx, "FINALIZE", func() error {
+				return e.removePath(ctx, t, p.Manifest)
+			}); delErr != nil {
+				return nil, coded("ERR_CONNECT", host, "FINALIZE",
+					fmt.Errorf("%w; fresh-install manifest removal failed: %v", runErr, delErr))
+			}
+			return nil, fmt.Errorf("%w; fresh install failed — machine left clean, no manifest written (§10.2)", runErr)
+		}
 		rbStart := time.Now()
-		rerr := dc.RunNew(ctx, t, rc, oldImage)
+		// §9.6 D6 / §10.4: restore the PREVIOUS release. The restored container must
+		// advertise the previous version, so rebuild the pattern context at `prev`
+		// (LD_VERSION and the -e env baked into `docker run` reflect the running
+		// release) rather than reusing the failed new-version rc. Health is rechecked
+		// with the same previous-version env.
+		rbRC := rc
+		if prev != "" && m != nil {
+			// §10.4: restore the PREVIOUS release with the PREVIOUS configuration.
+			// A combined update may have changed ports/volumes/env/restart/run_args
+			// as well as the version; replaying the failed *desired* config against
+			// the old image would leave the machine in neither the old nor the new
+			// state. Prefer the config snapshot persisted at the prior deploy; fall
+			// back to the version-only context for manifests written before snapshots
+			// existed (evaluator iter5 item 2).
+			if prc, ok := dockerRollbackCtx(s, p, prev, m.Extra["docker_config"]); ok {
+				rbRC = prc
+			} else {
+				rbRC = releaseCtxVersion(s, p, prev)
+			}
+		}
+		// §10.4: if the failed update also RENAMED the container, the failed
+		// container is running under the NEW desired name while the rollback is
+		// about to `docker run` the old image under the PRIOR name — `RunNew` only
+		// `rm -f`s the prior name, so the failed container would survive and both
+		// would run. Tear the failed container down first (evaluator iter7 item 2).
+		// A GENUINE removal failure (daemon rejected removal) must ABORT the restore
+		// and be surfaced as a rollback failure — restoring the old container next
+		// to the still-running failed one and reporting rolled_back would be a lie
+		// (evaluator iter8 item 1). Remove treats "No such container" as success.
+		var rerr error
+		if newName := rc.Spec.Pattern.ContainerName; newName != "" && newName != rbRC.Spec.Pattern.ContainerName {
+			rerr = dc.Remove(ctx, t, newName)
+		}
 		if rerr == nil {
-			rerr = RunHealthCheck(ctx, t, &s.HealthCheck, p.Root, rc.Env)
+			rerr = dc.RunNew(ctx, t, rbRC, oldImage)
+		}
+		if rerr == nil {
+			// HEALTH(prev): re-check with the PRIOR release's probe (carried in
+			// rbRC.Spec.HealthCheck via the snapshot), not the rejected desired one,
+			// so a changed health URL/command cannot mis-report a good restore as a
+			// rollback failure (§10.2, evaluator iter7 item 1).
+			rerr = RunHealthCheck(ctx, t, &rbRC.Spec.HealthCheck, p.Root, rbRC.Env)
 		}
 		sl.emit(ctx, "ROLLBACK", rbStart)
 		if rerr != nil {
@@ -551,7 +648,7 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 			if failVer == "" {
 				failVer = s.Artifact.Version
 			}
-			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started)
+			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started, manifestExtra(m))
 			detail := fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — manual intervention required; deploy: %v; rollback: %v", host, runErr, rerr)
 			if fmErr != nil {
 				detail = fmt.Errorf("%v; failed-manifest write error: %v", detail, fmErr)
@@ -569,9 +666,9 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		// no version to record.
 		if prev != "" {
 			rm := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
-				CurrentVersion: prev, CurrentRelease: "docker://" + rc.Spec.Pattern.ContainerName,
+				CurrentVersion: prev, CurrentRelease: "docker://" + rbRC.Spec.Pattern.ContainerName,
 				ProviderVersion: ProviderVersion,
-				Extra:           map[string]string{"image_id": oldImage},
+				Extra:           map[string]string{"image_id": oldImage, "config_hash": dc.ConfigFingerprint(rbRC), "docker_config": dockerConfigJSON(dc, rbRC)},
 				LastOperation: LastOp{Type: "deploy", Result: "rolled_back",
 					Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 			}
@@ -588,12 +685,31 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 		}
 		return nil, fmt.Errorf("%w; rolled back to previous image %s", runErr, short(oldImage))
 	}
-	newImage, _ := dc.CurrentImageID(ctx, t, rc)
+	// D3-equivalent post-run inspect: the recorded image id backs a FUTURE
+	// rollback. The new container is ALREADY RUNNING at this point, so a missing/
+	// failed inspect must NOT just error out and leave Terraform pointing at the
+	// OLD version while the machine runs the new one (evaluator iter3 item 2).
+	// Persist a FAILED manifest at the NEW version so Read reports drift
+	// (deployed_version = "<new>!failed") and a re-apply converges the state to
+	// match the actually-running container.
+	newImage, ierr := dc.CurrentImageID(ctx, t, rc)
+	if ierr != nil || strings.TrimSpace(newImage) == "" {
+		// The container is running the NEW desired config; record its snapshot so a
+		// re-apply converges from the actual state (evaluator iter7 item 3).
+		fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, s.Artifact.Version, strings.TrimSpace(newImage), started,
+			map[string]string{"docker_config": dockerConfigJSON(dc, rc), "config_hash": dc.ConfigFingerprint(rc)})
+		out := coded("ERR_CONNECT", host, "FINALIZE",
+			fmt.Errorf("container started at %s but its image id could not be recorded (inspect err=%v, image_id=%q); recorded failed state for reconvergence", s.Artifact.Version, ierr, newImage))
+		if fmErr != nil {
+			return nil, coded("ERR_CONNECT", host, "FINALIZE", fmt.Errorf("%v; failed-manifest write error: %v", out, fmErr))
+		}
+		return nil, out
+	}
 	nm := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
 		CurrentVersion: s.Artifact.Version, PreviousVersion: prev,
 		CurrentRelease:  "docker://" + rc.Spec.Pattern.ContainerName,
 		ProviderVersion: ProviderVersion,
-		Extra:           map[string]string{"image_id": newImage},
+		Extra:           map[string]string{"image_id": newImage, "config_hash": dc.ConfigFingerprint(rc), "docker_config": dockerConfigJSON(dc, rc)},
 		LastOperation: LastOp{Type: "deploy", Result: "success",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
@@ -616,14 +732,25 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 // §10.2/§10.6) recording last_operation.result=failed. The manifest write is
 // emitted as a structured FINALIZE step (evaluator iter5 item 3).
 func (e *Engine) dockerFinalizeFailed(ctx context.Context, sl stepLogger, t transport.Transport, s *spec.Deployment,
-	p layout.Paths, prev, prevImage string, started time.Time) error {
+	p layout.Paths, prev, prevImage string, started time.Time, carry map[string]string) error {
 	if prev == "" {
 		return nil
+	}
+	// Preserve the rollback metadata (docker_config snapshot + config_hash) from
+	// the prior manifest so a LATER repair attempt can still restore the complete
+	// prior machine state; recording only image_id would strip the configuration a
+	// subsequent rollback needs (evaluator iter7 item 3).
+	extra := map[string]string{"image_id": prevImage}
+	if v := carry["docker_config"]; v != "" {
+		extra["docker_config"] = v
+	}
+	if v := carry["config_hash"]; v != "" {
+		extra["config_hash"] = v
 	}
 	m := &Manifest{Schema: 1, App: s.Metadata.Name, Pattern: string(s.Pattern.Type),
 		CurrentVersion: prev, CurrentRelease: "docker://" + s.Pattern.ContainerName,
 		ProviderVersion: ProviderVersion,
-		Extra:           map[string]string{"image_id": prevImage},
+		Extra:           extra,
 		LastOperation: LastOp{Type: "deploy", Result: "failed",
 			Started: started.Format(time.RFC3339), Finished: time.Now().UTC().Format(time.RFC3339)},
 	}
@@ -722,6 +849,64 @@ func releaseCtxVersion(s *spec.Deployment, p layout.Paths, version string) patte
 	env := layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, version, p, nodePort), s.Environment)
 	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: version,
 		P: p, Spec: s, Env: env}
+}
+
+// manifestExtra returns the prior manifest's extra map (rollback metadata:
+// docker_config snapshot + config_hash) or nil, so a failed-state write can
+// carry it forward instead of discarding it (evaluator iter7 item 3).
+func manifestExtra(m *Manifest) map[string]string {
+	if m == nil {
+		return nil
+	}
+	return m.Extra
+}
+
+// dockerConfigJSON serializes the container config snapshot for `rc` for
+// persistence in manifest.extra["docker_config"]. Returns "" on marshal error
+// (the rollback path then falls back to the version-only context).
+func dockerConfigJSON(dc *pattern.DockerContainer, rc pattern.ReleaseCtx) string {
+	b, err := json.Marshal(dc.Snapshot(rc))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// dockerRollbackCtx rebuilds a pattern context that restores the PREVIOUS docker
+// configuration recorded in manifest.extra["docker_config"] at `version` — the
+// old ports/volumes/env/restart/run_args, not the rejected desired ones
+// (evaluator iter5 item 2). Returns ok=false when no usable snapshot exists so
+// the caller can fall back to the version-only context.
+func dockerRollbackCtx(s *spec.Deployment, p layout.Paths, version, snapJSON string) (pattern.ReleaseCtx, bool) {
+	if snapJSON == "" {
+		return pattern.ReleaseCtx{}, false
+	}
+	var snap pattern.DockerConfigSnapshot
+	if err := json.Unmarshal([]byte(snapJSON), &snap); err != nil {
+		return pattern.ReleaseCtx{}, false
+	}
+	sc := *s
+	pc := s.Pattern
+	if snap.ContainerName != "" {
+		pc.ContainerName = snap.ContainerName
+	}
+	pc.Ports = snap.Ports
+	pc.Volumes = snap.Volumes
+	if snap.Restart != "" {
+		pc.RestartPolicy = snap.Restart
+	}
+	pc.RunArgs = snap.RunArgs
+	sc.Pattern = pc
+	// Restore the health probe the PRIOR release was validated with so the
+	// rollback re-checks HEALTH(prev), not the rejected desired probe (§10.2).
+	if snap.HealthCheck != nil {
+		sc.HealthCheck = *snap.HealthCheck
+	}
+	env := snap.Env
+	if env == nil {
+		env = layout.MergeEnv(layout.BuiltinEnv(s.Metadata.Name, version, p, 0), s.Environment)
+	}
+	return pattern.ReleaseCtx{App: s.Metadata.Name, Version: version, P: p, Spec: &sc, Env: env}, true
 }
 
 func lockOwner() string {
