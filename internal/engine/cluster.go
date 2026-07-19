@@ -459,7 +459,12 @@ func (e *Engine) clusterRollingUpdate(ctx context.Context, cc *clusterCtx, owner
 		if err := newStepLogger(s, cc.hosts[0]).timed(ctx, "CONFIGURE", func() error {
 			return cc.cg.SetPreferredOwners(ctx, cc.coord(), s.Pattern.RoleName, ordered)
 		}); err != nil {
-			e.warnf("set preferred owners failed: %v", err)
+			// The new release is deployed and healthy on the preferred owner, but
+			// PERSISTING the preferred-owner ordering failed. Do NOT finalize a clean
+			// success (which would falsely report the preferred_owner change applied);
+			// record a failed manifest (current=new so state reflects the running
+			// release) and surface the error, consistent with the create C3 path.
+			return nil, foldFinalize(err, e.clusterFinalizeVersion(ctx, cc, s.Artifact.Version, prevVersion, started, "failed"))
 		}
 	}
 	// U8: finalize. A finalize (manifest-write) failure means the successful
