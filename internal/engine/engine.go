@@ -533,6 +533,22 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 	}
 	if runErr != nil {
 		if !s.Strategy.EffectiveRollback() || oldImage == "" {
+			// §10.2: a FRESH install failure (no prior image to roll back TO) must
+			// leave the machine CLEAN. The container that D5 started — or a partial
+			// container left behind by a failed D5 — must be torn down before we
+			// return the apply error, otherwise a rejected container keeps running
+			// under the desired name and Read would report it as deployed. Cleanup is
+			// scoped to oldImage=="" (no rollback target); a rollback-DISABLED upgrade
+			// intentionally keeps its failed container so the operator can inspect it
+			// (evaluator iter12 item 1, DESIGN §10.2). `docker rm -f` treats an
+			// already-absent container as success, so this is safe after either a
+			// START or a HEALTH failure.
+			var cleanupErr error
+			if oldImage == "" {
+				cleanupErr = sl.timed(ctx, "STOP", func() error {
+					return dc.Remove(ctx, t, rc.Spec.Pattern.ContainerName)
+				})
+			}
 			// §10.2: record last_operation=failed so Read reports drift even when no
 			// rollback is performed (rollback disabled or previous image unknown).
 			// Record at the previous version if known, else the attempted version so
@@ -543,6 +559,14 @@ func (e *Engine) deployDocker(ctx context.Context, sl stepLogger, t transport.Tr
 			}
 			fmErr := e.dockerFinalizeFailed(ctx, sl, t, s, p, failVer, oldImage, started, manifestExtra(m))
 			out := fmt.Errorf("%w; no docker rollback performed (prev image unknown or rollback disabled)", runErr)
+			if cleanupErr != nil {
+				// The fresh container could not be removed — the machine is NOT clean.
+				// Surface UNKNOWN STATE so the operator intervenes rather than trusting
+				// the recorded failed state (evaluator iter12 item 1).
+				out = coded("ERR_ROLLBACK_FAILED", host, "STOP",
+					fmt.Errorf("MACHINE IN UNKNOWN STATE host=%s — fresh container %q could not be removed after a failed install: %v; deploy error: %v",
+						host, rc.Spec.Pattern.ContainerName, cleanupErr, runErr))
+			}
 			if fmErr != nil {
 				return nil, coded("ERR_CONNECT", host, "FINALIZE",
 					fmt.Errorf("%v; failed-manifest write error: %v", out, fmErr))

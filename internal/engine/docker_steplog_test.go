@@ -68,15 +68,17 @@ func (n *dockerNode) Exec(ctx context.Context, c transport.Cmd) (transport.Resul
 	case strings.Contains(s, "docker stop"):
 		return ok(""), nil
 	case strings.Contains(s, "docker rm -f"):
-		// Standalone `docker rm -f` (rollback name teardown) — RunNew's combined
-		// rm+run script matched the `docker run` case above, so this only fires for
-		// dc.Remove of a renamed failed container.
+		// Standalone `docker rm -f` (rollback name teardown, or fresh-install
+		// failure cleanup) — RunNew's combined rm+run script matched the `docker
+		// run` case above, so this only fires for dc.Remove of a container.
 		n.removeScripts = append(n.removeScripts, s)
 		if n.removeErr {
 			// Simulate the daemon REJECTING removal (not a "No such container"):
 			// exit 21 is the pattern's genuine-failure sentinel.
 			return transport.Result{ExitCode: 21, Stderr: "Error response from daemon: cannot remove container"}, nil
 		}
+		// A successful force-remove leaves no container behind.
+		n.image = ""
 		return ok(""), nil
 	}
 	return n.fakeHost.Exec(ctx, c)
@@ -629,6 +631,71 @@ func TestDockerFailedManifestPreservesRollbackMetadata(t *testing.T) {
 	}
 	if !strings.Contains(m, `"config_hash"`) {
 		t.Fatalf("failed manifest must preserve the prior config_hash: %s", m)
+	}
+}
+
+// TestDockerFreshHealthFailureRemovesContainer covers evaluator iter12 item 1 /
+// DESIGN §10.2: a FRESH install (no prior image to roll back to) whose D5 `docker
+// run` succeeds but whose HEALTH check then fails must NOT leave the rejected
+// container running. The engine must tear it down (`docker rm -f`) so the machine
+// is left clean before returning the apply error, and still persist a failed
+// manifest at the attempted version so Read reports drift. This test would FAIL
+// if the rejected container remained running (n.image stays set).
+func TestDockerFreshHealthFailureRemovesContainer(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:freshimg"}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	// Fresh install (no prior manifest ⇒ oldImage==""): D5 run succeeds, health
+	// always fails. There is nothing to roll back to, so the fresh container must
+	// be removed rather than left running.
+	n.fakeHost.healthGate = func() bool { return true }
+
+	_, err := eng.Deploy(context.Background(), dockerSpec(t, "2.0.0"))
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_HEALTH_CHECK" {
+		t.Fatalf("fresh health failure must surface ERR_HEALTH_CHECK, got %v", err)
+	}
+	// The fresh container must have been force-removed (machine left clean).
+	if len(n.removeScripts) == 0 {
+		t.Fatalf("fresh-install failure must `docker rm -f` the rejected container; no removal issued (log=%v)", n.fakeHost.log)
+	}
+	if !strings.Contains(n.removeScripts[len(n.removeScripts)-1], "'sample'") {
+		t.Fatalf("cleanup must remove the desired container name 'sample': %v", n.removeScripts)
+	}
+	if n.image != "" {
+		t.Fatalf("rejected fresh container must not remain running after cleanup; image=%q", n.image)
+	}
+	// A failed manifest is still persisted at the attempted version for drift.
+	m := string(n.fakeHost.files[dockerManifestPath])
+	if !strings.Contains(m, `"current_version": "2.0.0"`) || !strings.Contains(m, `"result": "failed"`) {
+		t.Fatalf("fresh failure must persist a failed manifest at attempted version 2.0.0: %s", m)
+	}
+}
+
+// TestDockerFreshHealthFailureCleanupFailureAborts is the negative half of iter12
+// item 1: when the fresh-install cleanup `docker rm -f` itself GENUINELY fails
+// (daemon rejects removal), the machine is NOT clean — a rejected container may
+// still be running — so the engine must surface ERR_ROLLBACK_FAILED / MACHINE IN
+// UNKNOWN STATE rather than quietly returning the health error and trusting the
+// recorded failed state.
+func TestDockerFreshHealthFailureCleanupFailureAborts(t *testing.T) {
+	n := &dockerNode{fakeHost: newFakeHost("lab-01"), image: "", runImage: "sha256:freshimg", removeErr: true}
+	eng := New()
+	eng.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) { return n, nil }
+
+	n.fakeHost.healthGate = func() bool { return true }
+
+	_, err := eng.Deploy(context.Background(), dockerSpec(t, "2.0.0"))
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_ROLLBACK_FAILED" {
+		t.Fatalf("a failed fresh-install cleanup must surface ERR_ROLLBACK_FAILED, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "MACHINE IN UNKNOWN STATE host=lab-01") {
+		t.Fatalf("cleanup failure must report MACHINE IN UNKNOWN STATE: %v", err)
+	}
+	if len(n.removeScripts) == 0 {
+		t.Fatalf("cleanup must have ATTEMPTED a `docker rm -f`; none issued (log=%v)", n.fakeHost.log)
 	}
 }
 
