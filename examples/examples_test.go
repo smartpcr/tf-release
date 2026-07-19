@@ -2,16 +2,18 @@
 // artifacts (Stage 8.2). They read examples/specs/*.yaml and
 // examples/pipelines/*.yml straight from disk and assert that:
 //
-//   - every deployment/test spec parses and validates through the real spec
-//     validator (merge-then-validate, mirroring how the provider applies the
-//     example provider `default_target` from main.tf); and
-//   - both pipeline templates are well-formed YAML and retain the
-//     always()/condition: always() publish steps that guarantee test results
-//     and logs are uploaded even on a failed rollout.
+//   - EVERY committed deployment/test spec (discovered from disk, not a
+//     hard-coded list) parses and validates through the real spec validator
+//     (merge-then-validate, mirroring how the provider applies the example
+//     provider `default_target` from main.tf); and
+//   - both pipeline templates are well-formed YAML, carry the required
+//     job/stage topology, and place the always()/condition: always() guards on
+//     the actual upload-artifact / publish steps (not merely somewhere in the
+//     file text) so results and logs upload even when the rollout fails.
 //
-// The tests keep the committed examples honest: if a future edit drifts a
-// spec out of contract or breaks a pipeline template, `go test ./examples/...`
-// fails.
+// The tests keep the committed examples honest: a newly added spec fixture is
+// automatically covered, and renaming/removing a pipeline job/stage or dropping
+// a publish guard fails `go test ./examples/...`.
 package examples
 
 import (
@@ -69,92 +71,268 @@ func setExampleEnv(t *testing.T) {
 	}
 }
 
-func readSpec(t *testing.T, name string) string {
+// discoverSpecs returns every committed examples/specs/*.yaml path. Discovery
+// (rather than a hard-coded list) guarantees a newly added fixture cannot
+// bypass the "each committed spec validates" acceptance gate.
+func discoverSpecs(t *testing.T) []string {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("specs", name))
+	entries, err := os.ReadDir("specs")
 	if err != nil {
-		t.Fatalf("read spec %s: %v", name, err)
+		t.Fatalf("read specs dir: %v", err)
 	}
-	return string(raw)
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasSuffix(n, ".yaml") || strings.HasSuffix(n, ".yml") {
+			files = append(files, filepath.Join("specs", n))
+		}
+	}
+	if len(files) == 0 {
+		t.Fatal("no committed specs/*.yaml fixtures found")
+	}
+	return files
 }
 
-// TestDeploymentSpecsValidate proves every committed Deployment spec parses and
-// validates (after merging the example provider default_target).
-func TestDeploymentSpecsValidate(t *testing.T) {
+// kindProbe extracts the discriminator so each discovered spec is routed to the
+// matching validator.
+type kindProbe struct {
+	Kind string `yaml:"kind"`
+}
+
+// TestExampleSpecsValidate proves EVERY committed spec fixture (discovered from
+// disk) parses and validates after merging the example provider default_target.
+// It routes each file to the Deployment or TestRun validator by its kind, and
+// asserts both kinds are represented so the e2e TestRun stays covered.
+func TestExampleSpecsValidate(t *testing.T) {
 	setExampleEnv(t)
-	deployments := []string{
-		"cluster-service.yaml",
-		"console-app.yaml",
-		"docker-container.yaml",
-		"dotnet-api.yaml",
-		"node-web-app.yaml",
-		"windows-service.yaml",
-	}
-	for _, name := range deployments {
-		name := name
-		t.Run(name, func(t *testing.T) {
-			raw := readSpec(t, name)
-			d, hash, err := spec.ParseDeploymentLenient(raw, exampleVars(), "")
+	var sawDeployment, sawTestRun bool
+	for _, path := range discoverSpecs(t) {
+		path := path
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			raw, err := os.ReadFile(path)
 			if err != nil {
-				t.Fatalf("parse %s: %v", name, err)
+				t.Fatalf("read %s: %v", path, err)
 			}
-			if hash == "" {
-				t.Fatalf("%s: empty spec_hash", name)
+			var probe kindProbe
+			if err := yaml.Unmarshal(raw, &probe); err != nil {
+				t.Fatalf("%s: not well-formed YAML: %v", path, err)
 			}
-			spec.MergeTargetDefaults(&d.Target, defaultTarget())
-			if err := spec.ValidateDeployment(d); err != nil {
-				t.Fatalf("validate %s: %v", name, err)
+			switch probe.Kind {
+			case "Deployment":
+				sawDeployment = true
+				d, hash, err := spec.ParseDeploymentLenient(string(raw), exampleVars(), "")
+				if err != nil {
+					t.Fatalf("parse %s: %v", path, err)
+				}
+				if hash == "" {
+					t.Fatalf("%s: empty spec_hash", path)
+				}
+				spec.MergeTargetDefaults(&d.Target, defaultTarget())
+				if err := spec.ValidateDeployment(d); err != nil {
+					t.Fatalf("validate %s: %v", path, err)
+				}
+			case "TestRun":
+				sawTestRun = true
+				tr, hash, err := spec.ParseTestRunLenient(string(raw), exampleVars())
+				if err != nil {
+					t.Fatalf("parse %s: %v", path, err)
+				}
+				if hash == "" {
+					t.Fatalf("%s: empty spec_hash", path)
+				}
+				spec.MergeTargetDefaults(&tr.Target, defaultTarget())
+				if err := spec.ValidateTestRun(tr); err != nil {
+					t.Fatalf("validate %s: %v", path, err)
+				}
+			default:
+				t.Fatalf("%s: unknown kind %q (want Deployment|TestRun)", path, probe.Kind)
 			}
 		})
 	}
+	if !sawDeployment {
+		t.Error("no Deployment spec fixture discovered")
+	}
+	if !sawTestRun {
+		t.Error("no TestRun spec fixture discovered")
+	}
 }
 
-// TestTestRunSpecValidates proves the committed e2e TestRun spec parses and
-// validates (after merging the example provider default_target).
-func TestTestRunSpecValidates(t *testing.T) {
-	setExampleEnv(t)
-	raw := readSpec(t, "e2e-testrun.yaml")
-	tr, hash, err := spec.ParseTestRunLenient(raw, exampleVars())
+// --- pipeline template models (typed so assertions target real nodes) --------
+
+type ghWorkflow struct {
+	Jobs map[string]ghJob `yaml:"jobs"`
+}
+
+type ghJob struct {
+	Needs interface{} `yaml:"needs"`
+	If    string      `yaml:"if"`
+	Steps []ghStep    `yaml:"steps"`
+}
+
+type ghStep struct {
+	Name string `yaml:"name"`
+	Uses string `yaml:"uses"`
+	If   string `yaml:"if"`
+	Run  string `yaml:"run"`
+}
+
+type adoPipeline struct {
+	Stages []adoStage `yaml:"stages"`
+}
+
+type adoStage struct {
+	Stage     string      `yaml:"stage"`
+	DependsOn interface{} `yaml:"dependsOn"`
+	Condition string      `yaml:"condition"`
+	Jobs      []adoJob    `yaml:"jobs"`
+}
+
+type adoJob struct {
+	Job   string    `yaml:"job"`
+	Steps []adoStep `yaml:"steps"`
+}
+
+type adoStep struct {
+	Task        string `yaml:"task"`
+	Script      string `yaml:"script"`
+	DisplayName string `yaml:"displayName"`
+	Condition   string `yaml:"condition"`
+}
+
+// asStringSet normalises a YAML scalar-or-sequence (needs:/dependsOn:) to a set.
+func asStringSet(v interface{}) map[string]bool {
+	out := map[string]bool{}
+	switch t := v.(type) {
+	case string:
+		out[t] = true
+	case []interface{}:
+		for _, e := range t {
+			if s, ok := e.(string); ok {
+				out[s] = true
+			}
+		}
+	}
+	return out
+}
+
+func containsFold(hay, needle string) bool {
+	return strings.Contains(strings.ToLower(hay), strings.ToLower(needle))
+}
+
+// TestGitHubPipelineTopologyAndGuards parses github-deploy.yml structurally and
+// asserts the deploy/e2e/rollback topology plus the always() upload guard on
+// the actual upload-artifact step.
+func TestGitHubPipelineTopologyAndGuards(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("pipelines", "github-deploy.yml"))
 	if err != nil {
-		t.Fatalf("parse e2e-testrun.yaml: %v", err)
+		t.Fatalf("read github-deploy.yml: %v", err)
 	}
-	if hash == "" {
-		t.Fatal("e2e-testrun.yaml: empty spec_hash")
+	var wf ghWorkflow
+	if err := yaml.Unmarshal(raw, &wf); err != nil {
+		t.Fatalf("github-deploy.yml not well-formed YAML: %v", err)
 	}
-	spec.MergeTargetDefaults(&tr.Target, defaultTarget())
-	if err := spec.ValidateTestRun(tr); err != nil {
-		t.Fatalf("validate e2e-testrun.yaml: %v", err)
+	deploy, ok := wf.Jobs["deploy"]
+	if !ok {
+		t.Fatal("github-deploy.yml: missing required job \"deploy\"")
+	}
+	rollback, ok := wf.Jobs["rollback"]
+	if !ok {
+		t.Fatal("github-deploy.yml: missing required job \"rollback\"")
+	}
+
+	// deploy job must run e2e (in the same apply) and upload results always().
+	var sawE2E, sawUpload bool
+	for _, s := range deploy.Steps {
+		if containsFold(s.Name, "e2e") || containsFold(s.Run, "e2e") {
+			sawE2E = true
+		}
+		if strings.HasPrefix(s.Uses, "actions/upload-artifact") {
+			sawUpload = true
+			if strings.TrimSpace(s.If) != "always()" {
+				t.Errorf("deploy job upload-artifact step must carry `if: always()`, got %q", s.If)
+			}
+		}
+	}
+	if !sawE2E {
+		t.Error("deploy job: no step references e2e (deploy + e2e run in one apply)")
+	}
+	if !sawUpload {
+		t.Error("deploy job: missing actions/upload-artifact step for results/logs")
+	}
+
+	// rollback job must depend on deploy and only run on failure.
+	if !asStringSet(rollback.Needs)["deploy"] {
+		t.Errorf("rollback job must `needs: deploy`, got %v", rollback.Needs)
+	}
+	if strings.TrimSpace(rollback.If) != "failure()" {
+		t.Errorf("rollback job must carry `if: failure()`, got %q", rollback.If)
 	}
 }
 
-// TestPipelineTemplatesWellFormed proves both committed pipeline templates are
-// well-formed YAML and keep the always()/condition: always() publish steps that
-// guarantee results and logs upload even when the rollout fails.
-func TestPipelineTemplatesWellFormed(t *testing.T) {
-	cases := []struct {
-		file       string
-		mustContain string
-	}{
-		{filepath.Join("pipelines", "github-deploy.yml"), "if: always()"},
-		{filepath.Join("pipelines", "azure-pipelines.yml"), "condition: always()"},
+// TestAzurePipelineTopologyAndGuards parses azure-pipelines.yml structurally and
+// asserts the Deploy/publish/Rollback topology plus condition: always() on the
+// actual Publish* tasks.
+func TestAzurePipelineTopologyAndGuards(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("pipelines", "azure-pipelines.yml"))
+	if err != nil {
+		t.Fatalf("read azure-pipelines.yml: %v", err)
 	}
-	for _, c := range cases {
-		c := c
-		t.Run(c.file, func(t *testing.T) {
-			raw, err := os.ReadFile(c.file)
-			if err != nil {
-				t.Fatalf("read %s: %v", c.file, err)
+	var p adoPipeline
+	if err := yaml.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("azure-pipelines.yml not well-formed YAML: %v", err)
+	}
+	stages := map[string]adoStage{}
+	for _, s := range p.Stages {
+		stages[s.Stage] = s
+	}
+	deploy, ok := stages["Deploy"]
+	if !ok {
+		t.Fatal("azure-pipelines.yml: missing required stage \"Deploy\"")
+	}
+	rollback, ok := stages["Rollback"]
+	if !ok {
+		t.Fatal("azure-pipelines.yml: missing required stage \"Rollback\"")
+	}
+
+	// Deploy stage must run e2e and publish results + artifacts with always().
+	var sawE2E, sawPublishResults, sawPublishArtifact bool
+	for _, j := range deploy.Jobs {
+		for _, s := range j.Steps {
+			if containsFold(s.DisplayName, "e2e") || containsFold(s.Script, "e2e") {
+				sawE2E = true
 			}
-			var doc interface{}
-			if err := yaml.Unmarshal(raw, &doc); err != nil {
-				t.Fatalf("%s is not well-formed YAML: %v", c.file, err)
+			if strings.HasPrefix(s.Task, "PublishTestResults") {
+				sawPublishResults = true
+				if strings.TrimSpace(s.Condition) != "always()" {
+					t.Errorf("PublishTestResults task must carry `condition: always()`, got %q", s.Condition)
+				}
 			}
-			if doc == nil {
-				t.Fatalf("%s decoded to an empty document", c.file)
+			if strings.HasPrefix(s.Task, "PublishPipelineArtifact") {
+				sawPublishArtifact = true
+				if strings.TrimSpace(s.Condition) != "always()" {
+					t.Errorf("PublishPipelineArtifact task must carry `condition: always()`, got %q", s.Condition)
+				}
 			}
-			if !strings.Contains(string(raw), c.mustContain) {
-				t.Fatalf("%s: missing required publish guard %q", c.file, c.mustContain)
-			}
-		})
+		}
+	}
+	if !sawE2E {
+		t.Error("Deploy stage: no step references e2e (deploy + e2e run in one apply)")
+	}
+	if !sawPublishResults {
+		t.Error("Deploy stage: missing PublishTestResults task")
+	}
+	if !sawPublishArtifact {
+		t.Error("Deploy stage: missing PublishPipelineArtifact task")
+	}
+
+	// Rollback stage must depend on Deploy and only run on failure.
+	if !asStringSet(rollback.DependsOn)["Deploy"] {
+		t.Errorf("Rollback stage must `dependsOn: Deploy`, got %v", rollback.DependsOn)
+	}
+	if strings.TrimSpace(rollback.Condition) != "failed()" {
+		t.Errorf("Rollback stage must carry `condition: failed()`, got %q", rollback.Condition)
 	}
 }
