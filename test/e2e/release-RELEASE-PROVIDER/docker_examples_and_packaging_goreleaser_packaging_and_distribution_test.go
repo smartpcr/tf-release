@@ -15,8 +15,10 @@
 //     (`go run ./tools/zipbin …`). Asserts that a
 //     `terraform-provider-labdeploy_v<version>_<os>_<arch>.zip` is produced for
 //     both linux_amd64 and windows_amd64, matching the archive name_template,
-//     and that each zip contains the provider binary named per the build's
-//     `binary:` template (with the `.exe` suffix GoReleaser adds for windows).
+//     that each zip contains the provider binary named per the build's
+//     `binary:` template (with the `.exe` suffix GoReleaser adds for windows),
+//     and that each binary's embedded build settings report the target's
+//     GOOS/GOARCH so the matrix's platform identity is proven, not just its name.
 //     Only when the `goreleaser` binary is genuinely absent from the host does
 //     it fall back to faithfully replicating that build from the parsed config
 //     plus the same real hook, so the suite still proves packaging off a
@@ -340,6 +342,37 @@ func grExtractBinary(zipPath, binPrefix string) (string, []byte, error) {
 	return "", nil, fmt.Errorf("zip %s: no entry with prefix %q", zipPath, binPrefix)
 }
 
+// grBuildSettings extracts the recorded build settings (debug/buildinfo) from
+// the in-memory binary bytes as a key->value map. This is how the suite reads
+// each artifact's compile-time identity straight out of the packaged binary:
+// the Go toolchain records GOOS, GOARCH and CGO_ENABLED here, and they survive
+// the config's `-trimpath`/`-s -w` flags (verified: `go version -m` on the
+// emitted binaries reports GOOS=linux/windows, GOARCH=amd64, CGO_ENABLED=0).
+func grBuildSettings(data []byte) (map[string]string, error) {
+	tmp, err := os.CreateTemp("", "gr-bin-*")
+	if err != nil {
+		return nil, err
+	}
+	path := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(path)
+		return nil, err
+	}
+	tmp.Close()
+
+	info, err := buildinfo.ReadFile(path)
+	os.Remove(path)
+	if err != nil {
+		return nil, fmt.Errorf("read buildinfo: %w", err)
+	}
+	settings := make(map[string]string, len(info.Settings))
+	for _, s := range info.Settings {
+		settings[s.Key] = s.Value
+	}
+	return settings, nil
+}
+
 // --- world ------------------------------------------------------------------
 
 type grWorld struct {
@@ -428,6 +461,30 @@ func (w *grWorld) eachZipNamedAndContainsBinary() error {
 		if len(data) == 0 {
 			return fmt.Errorf("%s: zip binary entry %q is empty", token, name)
 		}
+		// Prove the matrix's platform *identity*, not just its filename. The
+		// name/`.exe` checks above only constrain the entry name; a build that
+		// emitted (say) a linux binary under the windows filename or the wrong
+		// arch would still satisfy them. The Go toolchain records the compile
+		// target GOOS/GOARCH in the binary's build settings, so read them back
+		// out of the packaged binary and assert they equal this target token.
+		settings, err := grBuildSettings(data)
+		if err != nil {
+			return fmt.Errorf("%s: %w", token, err)
+		}
+		gotOS, ok := settings["GOOS"]
+		if !ok {
+			return fmt.Errorf("%s: binary %q has no GOOS build setting", token, name)
+		}
+		if gotOS != goos {
+			return fmt.Errorf("%s: binary %q GOOS = %q, want %q", token, name, gotOS, goos)
+		}
+		gotArch, ok := settings["GOARCH"]
+		if !ok {
+			return fmt.Errorf("%s: binary %q has no GOARCH build setting", token, name)
+		}
+		if gotArch != goarch {
+			return fmt.Errorf("%s: binary %q GOARCH = %q, want %q", token, name, gotArch, goarch)
+		}
 	}
 	return nil
 }
@@ -448,31 +505,11 @@ func (w *grWorld) everyBinaryIsCgoFree() error {
 		if err != nil {
 			return err
 		}
-		tmp, err := os.CreateTemp("", "gr-bin-*")
+		settings, err := grBuildSettings(data)
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", token, err)
 		}
-		path := tmp.Name()
-		if _, err := tmp.Write(data); err != nil {
-			tmp.Close()
-			os.Remove(path)
-			return err
-		}
-		tmp.Close()
-
-		info, err := buildinfo.ReadFile(path)
-		os.Remove(path)
-		if err != nil {
-			return fmt.Errorf("%s: read buildinfo: %w", token, err)
-		}
-		var cgo string
-		var found bool
-		for _, s := range info.Settings {
-			if s.Key == "CGO_ENABLED" {
-				cgo = s.Value
-				found = true
-			}
-		}
+		cgo, found := settings["CGO_ENABLED"]
 		if !found {
 			return fmt.Errorf("%s: binary has no CGO_ENABLED build setting", token)
 		}
