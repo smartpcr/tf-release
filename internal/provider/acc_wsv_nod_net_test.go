@@ -186,39 +186,47 @@ func TestAccWSV05_NoRollbackLeavesDrift(t *testing.T) {
 	)
 }
 
-// WSV-06: wrapper=winsw wrapping a console build with stop_timeout_seconds=10 ⇒
-// fresh + upgrade both ok; the WinSW service XML under `current` is REGENERATED
-// on upgrade AND carries <stopwait>10sec</stopwait>. Per DESIGN §18.5 the slow-
-// stop behavior must be INJECTED and MEASURED: we deploy the SLOW-STOP build
-// FIRST, then upgrade AWAY from it to a normal build — so the service being
-// STOPPED during the upgrade IS the slow-stop build. winsw must then wait ~the
-// stopwait budget before force-killing, so the STOP phase takes AT LEAST ~8s
-// (winsw actually waited) and at most ~25s (force-killed at the deadline rather
-// than hanging) — evaluator item 4.
+// WSV-06: wrapper=winsw with stop_timeout_seconds=10 ⇒ fresh + upgrade both ok;
+// the WinSW xml is REGENERATED on upgrade and carries <stopwait>10sec</stopwait>.
+// Per DESIGN §18.5 the slow-stop behavior must be INJECTED and MEASURED. To ensure
+// the measured wall reflects the STOP phase and NOT artifact work, the destination
+// (1.0.0) is PRE-CACHED first; the slow-stop build is then installed; finally we
+// roll to the CACHED 1.0.0 — that final apply does NO fetch/stage (cache_hit=true,
+// asserted from the TRACE log), so its wall is dominated by winsw waiting out the
+// <stopwait> on the running slow-stop service before force-killing. That wall must
+// be ≥8s (winsw actually waited) and ≤25s (killed at the deadline, not hung) —
+// evaluator item 4.
 func TestAccWSV06_WinswWrapper(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
+	logPath := tfLogCapture(t)
 	extra := "  wrapper: winsw\n  winsw_exe: tools\\winsw.exe\n  stop_timeout_seconds: 10"
-	slow := accDeploymentConfig(winServiceSpec(t, at, "1.1.0-slowstop", "zip", healthURL(8080), extra))
 	normal := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), extra))
+	slow := accDeploymentConfig(winServiceSpec(t, at, "1.1.0-slowstop", "zip", healthURL(8080), extra))
 	var t0 time.Time
 	runScenario(t, at,
-		// Fresh install of the SLOW-STOP build under winsw.
-		applyStep(at, slow,
-			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0-slowstop"),
-			checkWinswXMLVersion(at, "1.1.0-slowstop", "WSV-06: fresh winsw xml references the slow-stop build"),
+		// Fresh install of 1.0.0 under winsw — seeds the on-target cache for 1.0.0.
+		applyStep(at, normal,
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
+			checkWinswXMLVersion(at, "1.0.0", "WSV-06: fresh winsw xml references 1.0.0"),
 			checkWinswStopwait(at, 10, "WSV-06: winsw xml must honor stop_timeout_seconds"),
 		),
-		// Upgrade AWAY from the slow-stop build: winsw must STOP the running
-		// slow-stop service, which ignores graceful stop, so it waits the full
-		// stopwait before force-killing — the apply wall proves the stopwait was
-		// HONORED against a genuinely slow-stopping service.
+		// Upgrade to the SLOW-STOP build (this STOP is of the normal 1.0.0 build,
+		// fast; we are only getting the slow-stop service RUNNING here).
+		applyStep(at, slow,
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0-slowstop"),
+			checkWinswXMLVersion(at, "1.1.0-slowstop", "WSV-06: winsw xml regenerated on upgrade"),
+		),
+		// Roll to the CACHED 1.0.0: no FETCH/STAGE (cache_hit) so the wall isolates
+		// the STOP phase — winsw must wait out <stopwait> on the running slow-stop
+		// build then force-kill.
 		resource.TestStep{
-			PreConfig: func() { t0 = time.Now() },
+			PreConfig: func() { truncateTFLog(t, logPath)(); t0 = time.Now() },
 			Config:    normal,
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
-				checkWinswXMLVersion(at, "1.0.0", "WSV-06: winsw xml regenerated on upgrade"),
+				checkCacheHitLogged(logPath, "WSV-06: the roll to 1.0.0 must reuse the cache (no FETCH) so the measured wall is the STOP phase, not artifact work"),
+				checkWinswXMLVersion(at, "1.0.0", "WSV-06: winsw xml regenerated on the cached roll"),
 				checkWinswStopwait(at, 10, "WSV-06: regenerated winsw xml must still carry stopwait"),
 				wallSinceBetween(&t0, 8*time.Second, 25*time.Second, "WSV-06: winsw must honor <stopwait> (wait ~10s then kill) stopping the slow-stop build"),
 				checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
@@ -263,21 +271,15 @@ func TestAccWSV07_ForceKillOnSlowStop(t *testing.T) {
 }
 
 // WSV-08: non-builtin account `.\svcuser` with password_env ⇒ service
-// ObjectName=.\svcuser AND the account password never appears in either the
-// provider TRACE log or the on-host `sc qc` service-configuration capture
-// (DESIGN §18 WSV-08). Secrets ride only in the base64 env blob, never in any
-// logged command text, so the redaction proof is twofold: (a) capture the whole
-// provider TRACE and assert the password value is absent; (b) run `sc qc` on the
-// host and assert the password is absent from the service configuration the SCM
-// exposes — evaluator item 5. Requires LABDEPLOY_ACC_SVCUSER_PW.
-//
-// NOTE: DESIGN §18.5 phrases this as "secret absent from the sc qc capture in TF
-// logs at TRACE". The current provider does not emit an `sc qc` record into its
-// tflog stream, and adding one is a production observability change that alters
-// internal/pattern/windows_service.go's committed configure-script goldens — out
-// of scope for this acceptance-test workstream (proposed as a follow-up). The
-// realizable in-harness proof of the SAME property is the on-host `sc qc`
-// redaction check below plus whole-TRACE password absence.
+// ObjectName=.\svcuser AND the account password is absent from the `sc qc`
+// capture the provider emits into the TF TRACE log (DESIGN §18.5 WSV-08). The
+// provider's traceServiceConfig runs `sc.exe qc <svc>` after configure and logs it
+// via tflog.Trace; sc qc reports BINARY_PATH_NAME + SERVICE_START_NAME but NEVER
+// the password, so the proof is: (a) the sc qc capture record is PRESENT in the
+// TRACE log AND the password value is absent FROM that record
+// (checkSCQCTraceRedacted); (b) the password is absent from the whole TRACE log;
+// (c) the on-host `sc qc` output does not leak the password — evaluator item 5.
+// Requires LABDEPLOY_ACC_SVCUSER_PW.
 func TestAccWSV08_NonBuiltinAccount(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
@@ -291,7 +293,8 @@ func TestAccWSV08_NonBuiltinAccount(t *testing.T) {
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
 		resource.TestCheckResourceAttr("labdeploy_deployment.val", "service_status", "running"),
 		checkServiceObjectName(at, "SampleSvc", `.\svcuser`),
-		checkSecretAbsentInLog(logPath, "LABDEPLOY_ACC_SVCUSER_PW", "WSV-08: the account password must never appear in the provider TRACE log"),
+		checkSCQCTraceRedacted(logPath, "LABDEPLOY_ACC_SVCUSER_PW", "WSV-08: the password must be absent from the sc qc capture in the TRACE log"),
+		checkSecretAbsentInLog(logPath, "LABDEPLOY_ACC_SVCUSER_PW", "WSV-08: the account password must never appear anywhere in the provider TRACE log"),
 		checkNoSecretInSCQC(at, "SampleSvc", "LABDEPLOY_ACC_SVCUSER_PW", "WSV-08: the on-host sc qc capture must not leak the password"),
 	))
 }

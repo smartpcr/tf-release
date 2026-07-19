@@ -50,11 +50,15 @@ func TestWindowsServiceS4Golden(t *testing.T) {
 	if err := w.Configure(context.Background(), f, rc); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
-	if len(f.scripts) != 2 {
-		t.Fatalf("windows_service Configure should emit S4 configure + S5 env scripts, got %d", len(f.scripts))
+	if len(f.scripts) != 3 {
+		t.Fatalf("windows_service Configure should emit S4 configure + S5 env + sc-qc TRACE scripts, got %d", len(f.scripts))
 	}
 	checkGolden(t, "winsvc_s4_configure.golden", f.scripts[0])
 	checkGolden(t, "winsvc_s5_env.golden", f.scripts[1])
+	// The trailing script is the DESIGN §18.5 sc qc TRACE capture (WSV-08).
+	if !strings.Contains(f.scripts[2], "sc.exe qc") {
+		t.Errorf("Configure must end with an sc qc capture for the TRACE log:\n%s", f.scripts[2])
+	}
 
 	// The single S4 script embeds BOTH the fresh and update branches.
 	if !strings.Contains(f.scripts[0], "sc.exe create") || !strings.Contains(f.scripts[0], "sc.exe config") {
@@ -135,10 +139,13 @@ func TestWindowsServiceWinswConfigureGolden(t *testing.T) {
 	if err := w.Configure(context.Background(), f, rc); err != nil {
 		t.Fatalf("Configure(winsw): %v", err)
 	}
-	if len(f.scripts) != 1 {
-		t.Fatalf("winsw Configure should emit a single install/refresh script, got %d", len(f.scripts))
+	if len(f.scripts) != 2 {
+		t.Fatalf("winsw Configure should emit a single install/refresh script + sc-qc TRACE capture, got %d", len(f.scripts))
 	}
 	checkGolden(t, "winsvc_winsw_configure.golden", f.scripts[0])
+	if !strings.Contains(f.scripts[1], "sc.exe qc") {
+		t.Errorf("winsw Configure must end with an sc qc capture for the TRACE log:\n%s", f.scripts[1])
+	}
 	if !strings.Contains(f.scripts[0], "<stopwait>60sec</stopwait>") {
 		t.Errorf("winsw configure script must embed <stopwait>60sec</stopwait>:\n%s", f.scripts[0])
 	}

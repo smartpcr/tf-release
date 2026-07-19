@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
@@ -160,7 +162,35 @@ exit 0`,
 }
 
 func (w *WindowsService) Configure(ctx context.Context, t transport.Transport, rc ReleaseCtx) error {
-	return w.configure(ctx, t, rc, "")
+	if err := w.configure(ctx, t, rc, ""); err != nil {
+		return err
+	}
+	w.traceServiceConfig(ctx, t, rc)
+	return nil
+}
+
+// traceServiceConfig captures `sc.exe qc <svc>` and records it in the provider's
+// TF log at TRACE (DESIGN §18.5 WSV-08: "secret absent from `sc qc` capture in TF
+// logs at TRACE"). sc.exe qc reports the service's BINARY_PATH_NAME and
+// SERVICE_START_NAME (ObjectName) but NEVER the account password, so emitting the
+// capture makes the redaction of the service-account secret an OBSERVABLE fact in
+// the Terraform TRACE log rather than an implicit one. Best-effort: a probe
+// failure is logged but never fails the deploy (the service is already configured).
+func (w *WindowsService) traceServiceConfig(ctx context.Context, t transport.Transport, rc ReleaseCtx) {
+	svc := w.svcName(rc)
+	script := fmt.Sprintf(`$ErrorActionPreference='Continue'
+& sc.exe qc %s | Out-String
+exit 0`, psq(svc))
+	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, nil, 60)
+	if err != nil {
+		tflog.Trace(ctx, "sc qc capture failed", map[string]interface{}{"service": svc, "host": t.Host(), "error": err.Error()})
+		return
+	}
+	tflog.Trace(ctx, "sc qc capture", map[string]interface{}{
+		"service": svc,
+		"host":    t.Host(),
+		"sc_qc":   strings.TrimSpace(r.Stdout),
+	})
 }
 
 // writeServiceEnv = S5: HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Environment.

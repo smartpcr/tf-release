@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,6 +62,101 @@ func plantLock(at accTarget, installRoot, app, owner string, ageSeconds int) err
 		strings.ReplaceAll(root, "'", `'\''`), strings.ReplaceAll(content, "'", `'\''`), strings.ReplaceAll(p.Lock, "'", `'\''`))
 	_, err := probeHost(at, winScript, shScript)
 	return err
+}
+
+// asyncT is a minimal go-testing-interface T that lets a `resource.Test` apply run
+// inside a goroutine (for LCK-01's real concurrent apply A). Failures are recorded
+// instead of aborting the parent test; FailNow/SkipNow stop only the goroutine via
+// runtime.Goexit so deferred Cleanups still run.
+type asyncT struct {
+	mu       sync.Mutex
+	name     string
+	failed   bool
+	skipped  bool
+	msgs     []string
+	cleanups []func()
+}
+
+func (a *asyncT) log(s string) { a.mu.Lock(); a.msgs = append(a.msgs, s); a.mu.Unlock() }
+func (a *asyncT) Cleanup(f func()) {
+	a.mu.Lock()
+	a.cleanups = append(a.cleanups, f)
+	a.mu.Unlock()
+}
+func (a *asyncT) runCleanups() {
+	a.mu.Lock()
+	cs := append([]func(){}, a.cleanups...)
+	a.mu.Unlock()
+	for i := len(cs) - 1; i >= 0; i-- {
+		cs[i]()
+	}
+}
+func (a *asyncT) Error(args ...interface{})            { a.log(fmt.Sprint(args...)); a.Fail() }
+func (a *asyncT) Errorf(f string, args ...interface{}) { a.log(fmt.Sprintf(f, args...)); a.Fail() }
+func (a *asyncT) Fail()                                { a.mu.Lock(); a.failed = true; a.mu.Unlock() }
+func (a *asyncT) FailNow()                             { a.Fail(); runtime.Goexit() }
+func (a *asyncT) Failed() bool                         { a.mu.Lock(); defer a.mu.Unlock(); return a.failed }
+func (a *asyncT) Fatal(args ...interface{})            { a.log(fmt.Sprint(args...)); a.FailNow() }
+func (a *asyncT) Fatalf(f string, args ...interface{}) { a.log(fmt.Sprintf(f, args...)); a.FailNow() }
+func (a *asyncT) Helper()                              {}
+func (a *asyncT) Log(args ...interface{})              { a.log(fmt.Sprint(args...)) }
+func (a *asyncT) Logf(f string, args ...interface{})  { a.log(fmt.Sprintf(f, args...)) }
+func (a *asyncT) Name() string                        { return a.name }
+func (a *asyncT) Parallel()                           {}
+func (a *asyncT) Skip(args ...interface{})            { a.log(fmt.Sprint(args...)); a.SkipNow() }
+func (a *asyncT) SkipNow()                            { a.mu.Lock(); a.skipped = true; a.mu.Unlock(); runtime.Goexit() }
+func (a *asyncT) Skipf(f string, args ...interface{}) { a.log(fmt.Sprintf(f, args...)); a.SkipNow() }
+func (a *asyncT) Skipped() bool                       { a.mu.Lock(); defer a.mu.Unlock(); return a.skipped }
+func (a *asyncT) summary() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return strings.Join(a.msgs, "\n")
+}
+
+var lockOwnerRe = regexp.MustCompile(`"owner"\s*:\s*"([^"]*)"`)
+
+// readLockOwner returns the owner recorded in the on-host `.lock`, or ok=false if
+// the lock is absent.
+func readLockOwner(at accTarget, installRoot, app string) (string, bool, error) {
+	p := layout.NewPaths(at.tgt.OS, installRoot, app, "")
+	out, err := probeHost(at,
+		fmt.Sprintf("if (Test-Path -LiteralPath '%s') { Get-Content -Raw -LiteralPath '%s' } else { 'NOLOCK' }",
+			strings.ReplaceAll(p.Lock, "'", "''"), strings.ReplaceAll(p.Lock, "'", "''")),
+		fmt.Sprintf("if [ -e '%s' ]; then cat '%s'; else echo NOLOCK; fi",
+			strings.ReplaceAll(p.Lock, "'", `'\''`), strings.ReplaceAll(p.Lock, "'", `'\''`)))
+	if err != nil {
+		return "", false, err
+	}
+	if strings.Contains(out, "NOLOCK") {
+		return "", false, nil
+	}
+	m := lockOwnerRe.FindStringSubmatch(out)
+	if m == nil {
+		return "", false, nil
+	}
+	return m[1], true, nil
+}
+
+// waitForLockOwner polls the target until a `.lock` appears (apply A acquired it)
+// and returns its owner, or errors after timeout.
+func waitForLockOwner(at accTarget, installRoot, app string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		owner, ok, err := readLockOwner(at, installRoot, app)
+		if err == nil && ok && owner != "" {
+			return owner, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return "", fmt.Errorf("timed out after %s waiting for apply A to acquire the .lock on %s", timeout, at.host)
+}
+
+// forceRemoveLock best-effort removes a stranded `.lock` (LCK-01 cleanup safety).
+func forceRemoveLock(at accTarget, installRoot, app string) {
+	p := layout.NewPaths(at.tgt.OS, installRoot, app, "")
+	_, _ = probeHost(at,
+		fmt.Sprintf("Remove-Item -LiteralPath '%s' -Force -ErrorAction SilentlyContinue", strings.ReplaceAll(p.Lock, "'", "''")),
+		fmt.Sprintf("rm -f '%s'", strings.ReplaceAll(p.Lock, "'", `'\''`)))
 }
 
 // deletePathOnHost removes a file/dir on the target (drift induction: DRF-02
@@ -730,12 +827,16 @@ func checkServiceState(at accTarget, svc, wantState string) func(*terraform.Stat
 func checkServiceNotRunning(at accTarget, svc, why string) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		out, err := probeHost(at,
-			fmt.Sprintf("(Get-Service -Name '%s' -ErrorAction SilentlyContinue).Status; if(-not $?){'NOSVC'}", psq(svc)),
-			"echo NOSVC")
+			fmt.Sprintf("$s=Get-Service -Name '%s' -ErrorAction SilentlyContinue; if($null -eq $s){'ABSENT'} else {'PRESENT:'+$s.Status}", psq(svc)),
+			"echo ABSENT")
 		if err != nil {
 			return fmt.Errorf("%s: service state probe: %w", why, err)
 		}
-		if strings.Contains(strings.ToUpper(out), "RUNNING") {
+		up := strings.ToUpper(out)
+		if strings.Contains(up, "ABSENT") || !strings.Contains(up, "PRESENT") {
+			return fmt.Errorf("%s: service %s is ABSENT; WSV-05 requires it to EXIST but be stopped-or-crashed, not deleted (probe=%q)", why, svc, strings.TrimSpace(out))
+		}
+		if strings.Contains(up, "RUNNING") {
 			return fmt.Errorf("%s: service %s is RUNNING, want stopped-or-crashed on the failed release", why, svc)
 		}
 		return nil
@@ -1125,6 +1226,38 @@ func checkSecretAbsentInLog(path, secretEnv, why string) func(*terraform.State) 
 		}
 		if strings.Contains(string(b), secret) {
 			return fmt.Errorf("%s: the account password leaked into the provider TRACE log", why)
+		}
+		return nil
+	}
+}
+
+// checkSCQCTraceRedacted proves DESIGN §18.5 WSV-08 directly: the provider MUST
+// have emitted an `sc qc capture` record into the TRACE log (presence), and the
+// account password MUST be absent from THAT record specifically (redaction of the
+// logged capture, not merely whole-log absence). It locates the sc qc capture line
+// and asserts the secret value does not appear within it.
+func checkSCQCTraceRedacted(path, secretEnv, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		secret := os.Getenv(secretEnv)
+		if secret == "" {
+			return fmt.Errorf("%s: %s not set (needed to prove redaction of the sc qc capture)", why, secretEnv)
+		}
+		lines, err := readTFLogLines(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		var capture string
+		for _, ln := range lines {
+			if strings.Contains(ln, "sc qc capture") {
+				capture = ln
+				break
+			}
+		}
+		if capture == "" {
+			return fmt.Errorf("%s: no `sc qc capture` record found in the TRACE log; the provider must emit one at TRACE (DESIGN §18.5)", why)
+		}
+		if strings.Contains(capture, secret) {
+			return fmt.Errorf("%s: the account password leaked into the sc qc capture TRACE record", why)
 		}
 		return nil
 	}

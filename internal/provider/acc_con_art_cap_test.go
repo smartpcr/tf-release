@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
-
-	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 )
 
 // Stage 9.1 — CON (§18.2), ART (§18.3) and CAP (§18.4) acceptance scenarios.
@@ -23,19 +21,28 @@ import (
 // ---------------------------------------------------------------------------
 
 // CON-01: W1, apply minimal console spec over winrm https insecure ⇒ success;
-// exactly one WARN diag about insecure TLS. The acceptance framework cannot
-// inspect diagnostics from a Check, so the "exactly one WARN" invariant is
-// asserted structurally by the unit test TestApplyWinRMInsecureEmitsExactlyOneWarnDiag
-// (same insecure_skip_verify code path); here we prove the end-to-end apply
-// succeeds, records the release path, and leaves no lock.
+// exactly one WARN diag about insecure TLS. Terraform surfaces provider WARN
+// diagnostics into the TRACE log (terraform-plugin-testing exposes no Check hook
+// for warning diagnostics), so this acceptance scenario captures the provider
+// TRACE and asserts the DESIGN §11 insecure-TLS warning was actually emitted
+// end-to-end — evaluator item 8. The stricter "exactly one" invariant is also
+// unit-covered by TestApplyWinRMInsecureEmitsExactlyOneWarnDiag.
 func TestAccCON01_InsecureTLSApplies(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
+	logPath := tfLogCapture(t)
 	cfg := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", ""))
-	runScenario(t, at, applyStep(at, cfg,
-		resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
-		resource.TestMatchResourceAttr("labdeploy_deployment.val", "release_path", mustRe(`releases[\\/]1\.0\.0$`)),
-	))
+	runScenario(t, at, resource.TestStep{
+		PreConfig: truncateTFLog(t, logPath),
+		Config:    cfg,
+		Check: resource.ComposeAggregateTestCheckFunc(
+			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
+			resource.TestMatchResourceAttr("labdeploy_deployment.val", "release_path", mustRe(`releases[\\/]1\.0\.0$`)),
+			checkTFLogMatches(logPath, mustRe(`insecure_skip_verify=true`),
+				"CON-01: the apply must emit the DESIGN §11 insecure-TLS WARN diagnostic into the TRACE log"),
+			checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
+		),
+	})
 }
 
 // CON-02: W1 with a wrong password ⇒ ERR_AUTH, exactly one auth attempt. We set
@@ -153,15 +160,20 @@ pattern: { type: console_app, exe: bin/sample-svc }
 }
 
 // CON-05: runner==W1, transport local, os windows ⇒ apply a console spec
-// succeeds without opening any socket. This is inherently a Windows-runner
-// scenario (local transport on a Windows box), so it is gated on the RUNTIME OS,
-// not an opt-in env: on a Windows runner (the W1 matrix — DESIGN "runner==W1")
-// it RUNS unconditionally under TF_ACC=1; on a non-Windows runner local Windows
-// transport is impossible, so it self-skips with a clear reason — evaluator item 8.
+// succeeds without opening any socket. Local Windows transport can only be
+// exercised when the test process runs ON Windows. To stop a REMOTELY-driven W1
+// gate (a Linux runner driving a remote W1 over WinRM) from finishing green
+// WITHOUT this coverage, the scenario HARD-FAILS under TF_ACC=1 whenever the W1
+// matrix is configured but the runner is not Windows — the operator must run the
+// Windows matrix on the Windows target itself. It self-skips only on a pure Linux
+// run where W1 is not configured at all — evaluator item 9.
 func TestAccCON05_LocalTransport(t *testing.T) {
 	accPreCheck(t)
 	if runtime.GOOS != "windows" {
-		t.Skip("CON-05 exercises LOCAL Windows transport; run the Windows (W1) acceptance matrix on the Windows target itself")
+		if os.Getenv(envW1Host) != "" {
+			t.Fatalf("CON-05 requires LOCAL Windows transport but the runner OS is %q; the W1 matrix (LABDEPLOY_ACC_W1_HOST set) MUST run on the Windows target itself so local transport is actually exercised", runtime.GOOS)
+		}
+		t.Skip("CON-05 exercises LOCAL Windows transport; no W1 matrix configured on this non-Windows runner")
 	}
 	at := accTarget{
 		tgt:  buildLocalWindowsTarget(),
@@ -391,18 +403,35 @@ func TestAccCAP01_WindowsConsole(t *testing.T) {
 	))
 }
 
-// CAP-02: W1 apply THREE distinct versions (1.0.0 → 1.1.0 → 1.2.0-bad) with
-// keep_releases=2 ⇒ after the last apply exactly 2 dirs remain under releases
-// (newest+previous) and the OLDEST (1.0.0) is pruned. Three distinct versions are
-// required to actually exercise pruning — two would never exceed the keep bound —
-// evaluator item 10. 1.2.0-bad fail-starts only as a *service*; as a console_app
-// it merely lays down the release tree, so it is a valid third version here.
+// CAP-02: W1, keep_releases=2. Seed three versions (1.0.0→1.1.0→1.2.0) so the
+// oldest (1.0.0) is pruned, then roll the CACHED releases forward ×3 among the two
+// retained versions — each roll-forward MUST reuse the on-target cache (no FETCH,
+// cache_hit=true in the TRACE log) and after every apply exactly 2 dirs remain
+// (newest+previous), with the pruned 1.0.0 gone. This exercises the DESIGN §18.4
+// CAP-02 "v1.0.0-cached rolled forward again ×3 with keep_releases=2" sequence,
+// not three distinct one-shot deploys — evaluator item 7.
 func TestAccCAP02_KeepReleasesPrune(t *testing.T) {
 	accPreCheck(t)
 	at := requireW1(t)
+	logPath := tfLogCapture(t)
 	v10 := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", ""))
 	v11 := accDeploymentConfig(consoleSpec(t, at, "1.1.0", "zip", ""))
 	v12 := accDeploymentConfig(consoleSpec(t, at, "1.2.0-bad", "zip", ""))
+	// A cached roll-forward step: truncate the TRACE first, apply an already-cached
+	// version, and assert the deploy reused the cache (no FETCH) and left exactly 2
+	// release dirs.
+	cachedRoll := func(cfg, version string, n int) resource.TestStep {
+		return resource.TestStep{
+			PreConfig: truncateTFLog(t, logPath),
+			Config:    cfg,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", version),
+				checkCacheHitLogged(logPath, fmt.Sprintf("CAP-02: cached roll-forward #%d to %s must reuse the cache (no FETCH)", n, version)),
+				checkReleaseCount(at, 2),
+				checkReleaseAbsent(at, "1.0.0", "CAP-02: keep_releases=2 must keep the oldest (1.0.0) pruned across roll-forwards"),
+			),
+		}
+	}
 	runScenario(t, at,
 		applyStep(at, v10, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")),
 		applyStep(at, v11, resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0")),
@@ -410,9 +439,11 @@ func TestAccCAP02_KeepReleasesPrune(t *testing.T) {
 			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.2.0-bad"),
 			checkReleaseCount(at, 2),
 			checkReleaseAbsent(at, "1.0.0", "CAP-02: keep_releases=2 must prune the oldest (1.0.0)"),
-			checkPathPresent(at, layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "1.1.0").Release, "CAP-02: previous (1.1.0) retained"),
-			checkPathPresent(at, layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "1.2.0-bad").Release, "CAP-02: newest (1.2.0-bad) retained"),
 		),
+		// Three cached roll-forwards among the two retained releases.
+		cachedRoll(v11, "1.1.0", 1),
+		cachedRoll(v12, "1.2.0-bad", 2),
+		cachedRoll(v11, "1.1.0", 3),
 	)
 }
 
