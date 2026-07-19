@@ -374,12 +374,23 @@ func backstopTimeout(timeout int) int {
 // prints the timeout marker, and exits with the timeout sentinel (DESIGN §5.3;
 // E2E-04 "process-tree kill on runner.timeout_seconds"). timeout<=0 runs the
 // command unwrapped.
+//
+// `$null = $__pi.Handle` is REQUIRED on the documented target platform (Windows
+// PowerShell 5.1 / .NET Framework — DESIGN §D10). Start-Process -PassThru does
+// not keep the child's OS handle open, and the timed WaitForExit(ms) overload
+// does not cache the exit code; without a cached handle `.ExitCode` reads back
+// as $null AFTER the process exits, so `exit $__pi.ExitCode` becomes `exit $null`
+// (⇒ 0) and every within-timeout run — the DEFAULT path, since
+// runner.timeout_seconds defaults to 1800 (>0) — would report exit 0 regardless
+// of the runner's real code, breaking pass_criteria.exit_codes (E2E-07). Touching
+// .Handle right after Start-Process caches the handle so .ExitCode stays readable.
 func runnerScriptWindows(workDir, cmdline string, timeout int) string {
 	if timeout <= 0 {
 		return fmt.Sprintf("Set-Location %s\n%s\nexit $LASTEXITCODE", psq(workDir), cmdline)
 	}
 	return fmt.Sprintf(`Set-Location %s
 $__pi = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c',%s -PassThru -NoNewWindow
+$null = $__pi.Handle
 if ($__pi.WaitForExit(%d)) { exit $__pi.ExitCode }
 taskkill /PID $__pi.Id /T /F | Out-Null
 Write-Output '%s'
