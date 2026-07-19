@@ -27,8 +27,11 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
   `current` switch) COMPLETE SUCCESSFULLY on disk — only the final service
   registration (`sc.exe create` / winsw) needs Administrator and is the W1 lab
   remainder. The Linux scenario runs its FULL deploy/drift/lock/rollback/purge
-  lifecycle over ssh (the privileged NATIVE `ln -sfn` symlink needs a real L1 —
-  asserted as golden here).
+  lifecycle over ssh. The engine's `ln -sfn` repoint is proven to produce a REAL
+  POSIX symlink on the target — `test -L current` holds and `readlink current`
+  resolves to `releases/1.0.0` over the ssh channel (DESIGN §18 redirect
+  semantics), while the privileged NATIVE-kernel symlink on a real L1 stays
+  lab-only under TF_ACC).
 
   This reproducible core runs on the plain `go test -tags e2e` gate with NO
   external service and NO skip. When TF_ACC=1 AND the W1/L1 connection env is

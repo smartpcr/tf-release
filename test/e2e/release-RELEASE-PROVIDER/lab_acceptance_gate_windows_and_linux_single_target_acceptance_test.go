@@ -195,6 +195,7 @@ type w91World struct {
 	linuxExtractOK   bool // engine's real linux extractScript run over the real SSH transport
 	linuxChecksumOK  bool // real sha256sum over the SSH transport
 	linuxSwitchCmdOK bool // engine's real linux switchScript == `ln -sfn` (DESIGN §9.1)
+	linuxSymlinkOK   bool // on-target `current` IS a POSIX symlink (test -L) resolving to the release (readlink)
 	linuxSSHOK       bool // a self-provisioned in-process SSH+SFTP target carried the real deploy steps
 }
 
@@ -1133,6 +1134,26 @@ func (w *w91World) runLinuxLifecycleOverSSH() error {
 		return fmt.Errorf("ssh list release: %w", xerr)
 	}
 	w.linuxExtractOK = rl.ExitCode == 0 && strings.Contains(rl.Stdout, w91Exe(spec.OSLinux))
+	// SYMLINK SEMANTICS proof (DESIGN §18): the `current` handle the engine
+	// repointed with `ln -sfn` IS a real POSIX symbolic link on the target
+	// (`test -L`) whose `readlink` target resolves to the deployed release —
+	// i.e. `current` -> releases/1.0.0. This asserts the design's symlink
+	// BEHAVIOUR (a link that redirects), not the emitted command string, over
+	// the real ssh channel. The privileged NATIVE-filesystem symlink on a real
+	// L1 kernel stays lab-only under TF_ACC.
+	rlk, lerr := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh,
+		Script: "test -L " + w91ShQuote(pl.Current) + " && readlink " + w91ShQuote(pl.Current), TimeoutSec: 20})
+	if lerr != nil {
+		tr.Close()
+		return fmt.Errorf("ssh readlink current: %w", lerr)
+	}
+	linkTarget := strings.TrimSpace(rlk.Stdout)
+	w.linuxSymlinkOK = rlk.ExitCode == 0 && linkTarget != "" &&
+		(strings.HasSuffix(linkTarget, "releases/1.0.0") || strings.HasSuffix(linkTarget, "/1.0.0"))
+	if !w.linuxSymlinkOK {
+		tr.Close()
+		return fmt.Errorf("`current` is not a POSIX symlink resolving to the release: exit=%d target=%q", rlk.ExitCode, linkTarget)
+	}
 	// CHECKSUM proof: SFTP-upload the artifact bytes and sha256sum over ssh ==
 	// Go's digest (an independent, self-contained transfer+hash over the transport).
 	pkg := w.payloads["1.0.0"]
@@ -1753,6 +1774,9 @@ func (w *w91World) thenCurrentSymlink() error {
 	if !w.linuxSwitchCmdOK {
 		return errors.New("linux `current` repoint is not the DESIGN §9.1 `ln -sfn`")
 	}
+	if !w.linuxSymlinkOK {
+		return errors.New("linux `current` is not a POSIX symlink resolving to the deployed release")
+	}
 	return nil
 }
 
@@ -1856,6 +1880,9 @@ func (w *w91World) thenLinuxSemantics() error {
 	}
 	if !w.linuxSwitchCmdOK {
 		return errors.New("linux `current` symlink command is not the DESIGN §9.1 `ln -sfn`")
+	}
+	if !w.linuxSymlinkOK {
+		return errors.New("linux `current` is not a POSIX symlink (test -L) resolving to the deployed release over ssh")
 	}
 	return nil
 }
