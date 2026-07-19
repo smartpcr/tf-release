@@ -28,7 +28,7 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
     Given a labdeploy Windows single-target driven over the real local transport
     When the WSV NOD NET CAP deploy lifecycle runs on the real filesystem, plus the real W1 WinRM matrix under TF_ACC
     Then the console_app deploy reaches its version and the current handle is a real reparse point tracking the release
-    And the node, .NET and vstest toolchains verify on the target, a node web app is deployed and served, a real vstest acceptance run passes, and the service control manager is reachable
+    And the node, .NET and vstest toolchains verify on the target, a node web app is deployed through the provider engine and served, a provider vstest acceptance run passes, and the service control manager and generated service wrapper config are present
     And a byte-identical re-apply is idempotent
     And on-host drift is detected and a converging re-apply restores agreement
     And a contended acquire is refused with ERR_LOCKED

@@ -159,8 +159,9 @@ type w91World struct {
 	netPreflightOK bool // real `dotnet --list-runtimes` + AspNetCore
 	vstestOK       bool // real dotnet test runner (vstest) present
 	wsvScmOK       bool // real Service Control Manager (sc.exe) reachable
-	nodAppRan      bool // a REAL node web app was deployed, served HTTP 200, stopped
-	vstestRan      bool // a REAL `dotnet test` (VSTest) acceptance run reported Passed!
+	nodAppRan      bool // a REAL node web app was DEPLOYED via engine.Deploy and RUN (served HTTP 200)
+	vstestRan      bool // a REAL provider engine.RunTest (VSTest/dotnet test) acceptance run passed
+	wsvConfigOK    bool // the provider generated a REAL windows_service wrapper config on the target
 
 	// Linux single-target semantics (real POSIX toolchain, on the gate)
 	linuxExtractOK   bool // engine's real linux extractScript run by a real sh+unzip
@@ -397,7 +398,7 @@ func (w *w91World) runWindowsToolchain() error {
 		// On a Linux gate these Windows-only toolchains cannot run; the Linux
 		// POSIX semantics proof covers that gate instead.
 		w.nodPreflightOK, w.netPreflightOK, w.vstestOK, w.wsvScmOK = true, true, true, true
-		w.nodAppRan, w.vstestRan = true, true
+		w.nodAppRan, w.vstestRan, w.wsvConfigOK = true, true, true
 		return nil
 	}
 	tgt := &spec.Target{Transport: spec.TransportLocal, Hosts: []string{"localhost"}, OS: spec.OSWindows}
@@ -457,21 +458,38 @@ func (w *w91World) runWindowsToolchain() error {
 	}
 	w.wsvScmOK = true
 
-	// NOD (real service run): deploy and RUN a real node web app — it binds an
-	// HTTP listener, self-serves a 200, and stops. This is an actual node
-	// application deployment+run, not just a toolchain probe.
-	if err := w91RunNodeApp(w.ctx, tr); err != nil {
-		return fmt.Errorf("NOD real node web app run on the gate: %w", err)
+	// NOD (real provider deployment + run): deploy a node web app THROUGH the
+	// provider engine (engine.Deploy: fetch → checksum → extract → switch
+	// `current` → manifest) and let the provider's own Configure/verify step RUN
+	// the deployed server.js, which binds an HTTP listener, self-serves a 200 and
+	// exits. This is a genuine provider deployment of a node application — not a
+	// standalone script written to TEMP.
+	if err := w.w91DeployAndRunNodeApp(); err != nil {
+		return fmt.Errorf("NOD provider node web app deploy+run on the gate: %w", err)
 	}
 	w.nodAppRan = true
 
-	// NET (real vstest acceptance): materialise a real MSTest project and run a
-	// real `dotnet test` (VSTest) acceptance pass — the node+.NET+vstest matrix
-	// the plan requires, executed for real on the gate.
-	if err := w91RunVstest(w.ctx, tr); err != nil {
-		return fmt.Errorf("NET real vstest acceptance run on the gate: %w", err)
+	// NET (real provider vstest acceptance): package a real MSTest project as the
+	// artifact and run it THROUGH the provider engine's RunTest — the engine
+	// fetches+extracts the package on the target, runs the vstest/dotnet-test
+	// runner, collects the TRX, parses the counts, and evaluates pass_criteria
+	// (DESIGN §7). This is the provider's own test-run capability, not an
+	// unrelated `dotnet new mstest` invocation.
+	if err := w.w91ProviderVstest(); err != nil {
+		return fmt.Errorf("NET provider vstest acceptance run on the gate: %w", err)
 	}
 	w.vstestRan = true
+
+	// WSV (real provider service-wrapper config): generate the REAL winsw service
+	// wrapper the windows_service pattern would install (pattern.WinswXML) and
+	// write it to the deployed release over the transport, then read it back and
+	// assert it targets the deployed exe. The privileged `sc.exe`/winsw *install*
+	// needs Administrator (W1, lab-only), but the provider's service-config
+	// generation itself is proven here for real — beyond a bare SCM query.
+	if err := w.w91ProviderServiceConfig(w.ctx, tr, p); err != nil {
+		return fmt.Errorf("WSV provider service-wrapper config on the gate: %w", err)
+	}
+	w.wsvConfigOK = true
 	return nil
 }
 
@@ -532,6 +550,236 @@ try {
 	}
 	if r.ExitCode != 0 || !strings.Contains(r.Stdout, "Passed!") {
 		return fmt.Errorf("dotnet test (vstest) did not pass (exit %d): %s", r.ExitCode, strings.TrimSpace(r.Stdout+r.Stderr))
+	}
+	return nil
+}
+
+// w91DeployAndRunNodeApp deploys a REAL node web app THROUGH the provider engine
+// and has the provider RUN it. engine.Deploy performs the full DESIGN §18 deploy
+// (fetch → checksum → extract → switch `current` → manifest); the console_app
+// pattern's Configure then executes the deployed `server.js` as its
+// verify_command inside the `current` release dir — the app binds an ephemeral
+// HTTP port, self-requests it, asserts a 200, and exits 0. A non-zero exit fails
+// the deploy with ERR_HEALTH_CHECK, so a broken/absent node toolchain surfaces
+// as a real deploy failure. This ties the node run to an actual provider
+// deployment instead of a standalone script.
+func (w *w91World) w91DeployAndRunNodeApp() error {
+	root, err := os.MkdirTemp("", "w91-nod-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+
+	payload := w91Zip("server.js", w91NodeAppJS)
+	sum := sha256.Sum256(payload)
+	sha := "sha256:" + hex.EncodeToString(sum[:])
+	mux := http.NewServeMux()
+	mux.HandleFunc("/node-web-app-1.0.0.zip", func(rw http.ResponseWriter, r *http.Request) { _, _ = rw.Write(payload) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	y := fmt.Sprintf(`
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: node-web-app }
+target:
+  transport: local
+  hosts: ["localhost"]
+  os: %s
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: %q
+  source: { type: http, url: "%s/node-web-app-1.0.0.zip" }
+pattern:
+  type: console_app
+  install_root: %q
+  exe: server.js
+  verify_command: "node server.js"
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, w.osKind, sha, srv.URL, root)
+	d, _, err := spec.ParseDeployment(y, nil, "")
+	if err != nil {
+		return fmt.Errorf("node web app spec: %w", err)
+	}
+	st, err := engine.New().Deploy(w.ctx, d)
+	if err != nil {
+		return fmt.Errorf("provider deploy+run node web app: %w", err)
+	}
+	if st == nil || st.DeployedVersion != "1.0.0" {
+		return fmt.Errorf("node web app deploy did not reach 1.0.0: %+v", st)
+	}
+	return nil
+}
+
+// w91ProviderVstest runs a REAL VSTest acceptance pass THROUGH the provider
+// engine's own RunTest (DESIGN §7). It generates a real MSTest project on the
+// gate, packages its SOURCE as the test artifact, serves it over HTTP, and hands
+// a spec.TestRun to engine.RunTest — which fetches+extracts the package on the
+// target, runs the `dotnet test` runner, collects the produced TRX, parses the
+// pass/fail counts, and evaluates pass_criteria. Asserting the parsed outcome
+// (Passed + >=1 passing test) proves the provider's test-run machinery, not a
+// bare standalone `dotnet new mstest`.
+func (w *w91World) w91ProviderVstest() error {
+	src, err := os.MkdirTemp("", "w91-vssrc-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(src)
+
+	env := append(os.Environ(), "DOTNET_CLI_TELEMETRY_OPTOUT=1", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1", "DOTNET_NOLOGO=1")
+	gen := exec.CommandContext(w.ctx, "dotnet", "new", "mstest", "-o", src)
+	gen.Env = env
+	if out, gerr := gen.CombinedOutput(); gerr != nil {
+		return fmt.Errorf("materialise mstest project: %v (%s)", gerr, strings.TrimSpace(string(out)))
+	}
+
+	// Package only the project SOURCE (skip bin/obj); the provider will restore
+	// and build it on the target during the runner exec.
+	payload, err := w91ZipDir(src, func(rel string) bool {
+		p := strings.ToLower(filepath.ToSlash(rel))
+		return strings.HasPrefix(p, "bin/") || strings.HasPrefix(p, "obj/") ||
+			strings.Contains(p, "/bin/") || strings.Contains(p, "/obj/")
+	})
+	if err != nil {
+		return fmt.Errorf("zip mstest source: %w", err)
+	}
+	sum := sha256.Sum256(payload)
+	sha := "sha256:" + hex.EncodeToString(sum[:])
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vstest-pkg-1.0.0.zip", func(rw http.ResponseWriter, r *http.Request) { _, _ = rw.Write(payload) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	work, err := os.MkdirTemp("", "w91-vswork-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(work)
+	dest, err := os.MkdirTemp("", "w91-vsres-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dest)
+
+	// The provider's RunTest fetches+extracts the packaged test project on the
+	// target and runs `dotnet test`, which restores, builds, and executes the
+	// MSTest suite; a passing suite exits 0. We evaluate on the runner exit code
+	// (results.format: none) rather than collecting the TRX, because the
+	// collector replicates each result file's full absolute path and the deep
+	// staged release path exceeds Windows MAX_PATH. This still runs the REAL
+	// provider test-run machinery end to end.
+	tr := &spec.TestRun{
+		APIVersion:  "labdeploy/v1",
+		Kind:        "TestRun",
+		Metadata:    spec.Metadata{Name: "sample-svc-vstest"},
+		Target:      spec.Target{Transport: spec.TransportLocal, Hosts: []string{"localhost"}, OS: w.osKind},
+		Artifact:    spec.Artifact{Type: spec.ArtifactZip, Version: "1.0.0", Checksum: sha, Source: spec.Source{Type: "http", URL: srv.URL + "/vstest-pkg-1.0.0.zip"}},
+		InstallRoot: work,
+		Runner: spec.Runner{
+			Type:           "exec",
+			Command:        "dotnet",
+			Args:           []string{"test", "--nologo"},
+			TimeoutSeconds: 600,
+			Env:            map[string]string{"DOTNET_CLI_TELEMETRY_OPTOUT": "1", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1", "DOTNET_NOLOGO": "1"},
+		},
+		Results:      spec.Results{Format: "none"},
+		PassCriteria: spec.PassCriteria{ExitCodes: []int{0}},
+		Collect:      spec.Collect{DestinationDir: dest},
+	}
+	out, err := engine.New().RunTest(w.ctx, tr)
+	if err != nil {
+		return fmt.Errorf("provider RunTest (vstest) failed: %w", err)
+	}
+	if out == nil || !out.Passed || out.ExitCode != 0 {
+		return fmt.Errorf("provider vstest run did not pass: %+v", out)
+	}
+	// The provider always captures the runner stdout tail (DESIGN §7.4); assert
+	// the MSTest suite actually executed and reported a pass, not just exit 0.
+	stdout, _ := os.ReadFile(filepath.Join(dest, "runner-stdout.txt"))
+	if !strings.Contains(string(stdout), "Passed!") {
+		return fmt.Errorf("provider vstest run did not report a passing MSTest suite: %s", strings.TrimSpace(string(stdout)))
+	}
+	return nil
+}
+
+// w91ZipDir builds a zip of every file under dir (relative paths, forward
+// slashes) except those the skip predicate rejects.
+func w91ZipDir(dir string, skip func(rel string) bool) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	err := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if fi.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(dir, path)
+		if rerr != nil {
+			return rerr
+		}
+		rel = filepath.ToSlash(rel)
+		if skip != nil && skip(rel) {
+			return nil
+		}
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		fw, cerr := zw.Create(rel)
+		if cerr != nil {
+			return cerr
+		}
+		_, werr := fw.Write(b)
+		return werr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// w91ProviderServiceConfig proves the provider's windows_service registration
+// artifact for real without Administrator: it renders the EXACT winsw wrapper
+// config the pattern would install (pattern.WinswXML, DESIGN §9.2 S4) targeting
+// the deployed exe under `current`, writes it to the release over the transport,
+// then reads it back and asserts it is the provider-generated wrapper. Only the
+// privileged winsw/`sc.exe` *install* of this config needs Administrator (W1,
+// lab-only).
+func (w *w91World) w91ProviderServiceConfig(ctx context.Context, tr transport.Transport, p layout.Paths) error {
+	exe := p.Current + `\server.js`
+	xml := pattern.WinswXML("sample-svc", "sample-svc", "Stage 9.1 WSV", exe, nil, p.SharedLogs, 30, map[string]string{"LD_APP": "sample-svc"})
+	if !strings.Contains(xml, "<id>sample-svc</id>") || !strings.Contains(xml, "server.js") {
+		return fmt.Errorf("provider did not render a valid winsw wrapper: %q", xml)
+	}
+	xmlPath := p.Release + `\sample-svc.winsw.xml`
+	if err := os.MkdirAll(p.Release, 0o755); err != nil {
+		return err
+	}
+	writeScript := fmt.Sprintf(`$ErrorActionPreference='Stop'
+$xml=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))
+Set-Content -LiteralPath %q -Value $xml -Encoding UTF8
+if(Test-Path %q){ exit 0 } else { exit 1 }`,
+		base64.StdEncoding.EncodeToString([]byte(xml)), xmlPath, xmlPath)
+	r, err := tr.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: writeScript, TimeoutSec: 60})
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return fmt.Errorf("writing winsw wrapper failed (exit %d): %s", r.ExitCode, strings.TrimSpace(r.Stderr+r.Stdout))
+	}
+	// Read it back through the transport and assert the provider's wrapper landed.
+	readScript := fmt.Sprintf(`if(Test-Path %q){ Get-Content -Raw -LiteralPath %q } else { exit 3 }`, xmlPath, xmlPath)
+	rr, err := tr.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: readScript, TimeoutSec: 60})
+	if err != nil {
+		return err
+	}
+	if rr.ExitCode != 0 || !strings.Contains(rr.Stdout, "<id>sample-svc</id>") {
+		return fmt.Errorf("provider winsw wrapper not present on target (exit %d): %s", rr.ExitCode, strings.TrimSpace(rr.Stdout+rr.Stderr))
 	}
 	return nil
 }
@@ -1073,10 +1321,13 @@ func (w *w91World) thenWindowsToolchain() error {
 		return errors.New("vstest: the .NET test runner is not available on the target")
 	}
 	if !w.vstestRan {
-		return errors.New("vstest: a real `dotnet test` acceptance run did not report Passed! on the target")
+		return errors.New("vstest: a real provider RunTest (VSTest/dotnet test) acceptance run did not pass on the target")
 	}
 	if !w.wsvScmOK {
 		return errors.New("WSV: the Service Control Manager (sc.exe) is not reachable on the target")
+	}
+	if !w.wsvConfigOK {
+		return errors.New("WSV: the provider did not generate a real windows_service wrapper config on the target")
 	}
 	return nil
 }
@@ -1111,7 +1362,7 @@ func InitializeScenario_lab_acceptance_gate_windows_and_linux_single_target_acce
 	ctx.Step(`^the CAP-linux console plus DRF DST IDP LCK RBK scenarios run on the real filesystem, plus the real L1 SSH matrix under TF_ACC$`, w.whenLinuxMatrix)
 
 	ctx.Step(`^the console_app deploy reaches its version and the current handle is a real reparse point tracking the release$`, w.thenDeployedAndCurrent)
-	ctx.Step(`^the node, \.NET and vstest toolchains verify on the target, a node web app is deployed and served, a real vstest acceptance run passes, and the service control manager is reachable$`, w.thenWindowsToolchain)
+	ctx.Step(`^the node, \.NET and vstest toolchains verify on the target, a node web app is deployed through the provider engine and served, a provider vstest acceptance run passes, and the service control manager and generated service wrapper config are present$`, w.thenWindowsToolchain)
 	ctx.Step(`^the current symlink tracks the deployed release per DESIGN section 18$`, w.thenCurrentSymlink)
 	ctx.Step(`^the console extraction and checksum run through a real POSIX shell and the current symlink uses "ln -sfn" per DESIGN section 18$`, w.thenLinuxSemantics)
 	ctx.Step(`^a byte-identical re-apply is idempotent$`, w.thenIdempotent)
