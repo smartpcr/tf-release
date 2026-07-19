@@ -25,6 +25,15 @@ builds:
       - windows
     goarch:
       - amd64
+    hooks:
+      # Emit the filesystem-mirror zip per target as a build hook so the plain
+      # `goreleaser build --snapshot` subcommand also produces the
+      # terraform-provider-labdeploy_v<version>_<os>_<arch>.zip matrix (the
+      # `build` subcommand never runs the `archives` stage below). The zip lands
+      # next to the binary in the per-target dist dir, so it never collides with
+      # the release `archives` output written to the dist root.
+      post:
+        - cmd: go run ./tools/zipbin "{{ .Path }}" "{{ .Version }}" "{{ .Os }}" "{{ .Arch }}"
 
 archives:
   - id: zip
