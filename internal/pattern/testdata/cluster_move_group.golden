@@ -1,0 +1,7 @@
+Import-Module FailoverClusters
+try { Move-ClusterGroup -Name 'PaymentsRole' -Node 'lab-02' -Wait 300 -ErrorAction Stop | Out-Null }
+catch { Write-Error $_.Exception.Message; exit 47 }
+$g = Get-ClusterGroup -Name 'PaymentsRole'
+if($g.OwnerNode.Name.ToLower() -ne 'lab-02'.ToLower() -or $g.State -ne 'Online'){
+  Write-Error ("post-move: owner=" + $g.OwnerNode.Name + " state=" + $g.State); exit 47 }
+exit 0

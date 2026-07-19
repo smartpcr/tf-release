@@ -154,18 +154,13 @@ func (e *Engine) deployCluster(ctx context.Context, s *spec.Deployment) (*Status
 
 	role := s.Pattern.RoleName
 	var exists bool
-	var boundSvc, owner string
+	var owner string
 	if err := slCoord0.timed(ctx, "VALIDATE", func() error {
 		var berr error
-		exists, boundSvc, owner, _, berr = cc.cg.RoleBinding(ctx, cc.coord(), role)
+		exists, owner, berr = cc.cg.PreflightRole(ctx, cc.coord(), role, s.Pattern.ServiceName)
 		return berr
 	}); err != nil {
 		return nil, err
-	}
-	if exists && !strings.EqualFold(boundSvc, s.Pattern.ServiceName) {
-		return nil, coded("ERR_PREFLIGHT", cc.hosts[0], "PREFLIGHT",
-			fmt.Errorf("role %q already bound to service %q, spec wants %q — refusing (CLU-06)",
-				role, boundSvc, s.Pattern.ServiceName))
 	}
 
 	// Idempotency short-circuit across all nodes (IDP-02).

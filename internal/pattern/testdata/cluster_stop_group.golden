@@ -1,0 +1,3 @@
+Import-Module FailoverClusters
+Stop-ClusterGroup -Name 'PaymentsRole' -ErrorAction SilentlyContinue | Out-Null
+exit 0

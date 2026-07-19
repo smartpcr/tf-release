@@ -97,6 +97,27 @@ exit 0`, psq(role))
 	return true, parts[0], parts[1], parts[2], nil
 }
 
+// PreflightRole performs the coordinator role-binding conflict check
+// (DESIGN §9.5 preflight): if the WSFC Generic Service role `role` already
+// exists bound to a service OTHER than `wantSvc`, it returns an
+// ERR_SERVICE_INSTALL-coded error that names BOTH the already-bound service and
+// the service the spec wants, and performs NO mutation (the only script it runs
+// is the read-only RoleBinding probe). On no conflict it returns
+// (exists, ownerNode, nil). This is the in-process seam the "role binding
+// conflict" scenario exercises with a scripted fake Transport.
+func (c *ClusterGeneric) PreflightRole(ctx context.Context, t transport.Transport, role, wantSvc string) (bool, string, error) {
+	exists, boundSvc, owner, _, err := c.RoleBinding(ctx, t, role)
+	if err != nil {
+		return false, "", err
+	}
+	if exists && !strings.EqualFold(boundSvc, wantSvc) {
+		return false, "", stepErr("ERR_SERVICE_INSTALL", t.Host(), "PREFLIGHT",
+			fmt.Errorf("role %q already bound to service %q, spec wants service %q — refusing (CLU-06)",
+				role, boundSvc, wantSvc))
+	}
+	return exists, owner, nil
+}
+
 // NodesUp returns cluster nodes in Up state (lower-cased).
 func (c *ClusterGeneric) NodesUp(ctx context.Context, t transport.Transport) ([]string, error) {
 	script := `Import-Module FailoverClusters
