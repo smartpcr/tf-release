@@ -85,6 +85,10 @@ const (
 	w91EnvL1HostKey  = "LABDEPLOY_ACC_L1_HOST_KEY"
 
 	w91EnvArtifactBaseURL = "LABDEPLOY_ACC_ARTIFACT_BASE_URL"
+
+	// Private-key env the in-process (self-provisioned) SSH target authenticates
+	// with; set/unset around the bare-gate Linux SSH deploy steps.
+	w91EnvSSHKey = "LABDEPLOY_E2E_SELFPROV_SSH_KEY"
 )
 
 func w91GateOS() spec.OSKind {
@@ -164,9 +168,10 @@ type w91World struct {
 	wsvConfigOK    bool // the provider generated a REAL windows_service wrapper config on the target
 
 	// Linux single-target semantics (real POSIX toolchain, on the gate)
-	linuxExtractOK   bool // engine's real linux extractScript run by a real sh+unzip
-	linuxChecksumOK  bool // real sha256sum over the staged package
+	linuxExtractOK   bool // engine's real linux extractScript run over the real SSH transport
+	linuxChecksumOK  bool // real sha256sum over the SSH transport
 	linuxSwitchCmdOK bool // engine's real linux switchScript == `ln -sfn` (DESIGN §9.1)
+	linuxSSHOK       bool // a self-provisioned in-process SSH+SFTP target carried the real deploy steps
 }
 
 // w91Zip builds a real zip whose single entry is the console exe.
@@ -797,63 +802,96 @@ if(Test-Path %q){ exit 0 } else { exit 1 }`,
 // TF_ACC.
 // ---------------------------------------------------------------------------
 
-func w91ToPosixPath(p string) string {
-	if runtime.GOOS != "windows" {
-		return p
-	}
-	p = strings.ReplaceAll(p, `\`, "/")
-	if len(p) > 1 && p[1] == ':' {
-		return "/" + strings.ToLower(string(p[0])) + p[2:]
-	}
-	return p
-}
-
 func (w *w91World) runLinuxPosixSemantics() error {
-	posixRoot := w91ToPosixPath(w.root)
-	pl := layout.NewPaths(spec.OSLinux, posixRoot, w.app, "1.0.0")
+	if _, err := os.Stat(w91ShPath()); err != nil {
+		return fmt.Errorf("no POSIX shell available to prove linux/ssh execution: %w", err)
+	}
+	// SELF-PROVISION an L1-style Linux target: an in-process SSH+SFTP server on
+	// the bare gate. The provider's REAL `ssh` transport (Connect over TCP, Exec
+	// over an SSH session channel, Upload/Download over the SFTP subsystem) then
+	// carries the engine's REAL Linux deploy steps — a genuine L1/SSH exercise,
+	// not just local POSIX-script execution. Only the privileged `ln -sfn` switch
+	// (needs SeCreateSymbolicLinkPrivilege/admin) and the flock-based lock stay
+	// lab-only on this non-admin Windows gate.
+	srv, err := w91StartSSHServer()
+	if err != nil {
+		return fmt.Errorf("start in-process ssh (self-provisioned L1) server: %w", err)
+	}
+	defer srv.Close()
+	if err := os.Setenv(w91EnvSSHKey, srv.clientPEM); err != nil {
+		return err
+	}
+	defer os.Unsetenv(w91EnvSSHKey)
 
-	// Linux `current` symlink command is the DESIGN §9.1 `ln -sfn`.
+	root := w91SFTPPath(w.root)
+	pl := layout.NewPaths(spec.OSLinux, root, w.app, "1.0.0")
+
+	// Linux `current` symlink command is the DESIGN §9.1 `ln -sfn` (the privileged
+	// symlink creation itself stays lab-only; assert the provider emits it).
 	sw := engine.SwitchScript(pl)
 	w.linuxSwitchCmdOK = strings.Contains(sw, "ln -sfn "+w91ShQuote(pl.Release)) &&
 		strings.Contains(sw, w91ShQuote(pl.Current))
 
-	// Stage a real package where the engine's linux extractScript expects it.
-	stageDir := filepath.Join(w.root, w.app, "staging")
-	if err := os.MkdirAll(stageDir, 0o755); err != nil {
-		return err
+	tgt := &spec.Target{
+		Transport:   spec.TransportSSH,
+		OS:          spec.OSLinux,
+		Hosts:       []string{"127.0.0.1"},
+		Port:        srv.port,
+		Credentials: spec.Credentials{Username: "labdeploy", PrivateKeyEnv: w91EnvSSHKey},
+		SSH:         spec.SSHOpts{TimeoutSeconds: 20},
 	}
+	tr, err := transport.NewTransport(tgt, "127.0.0.1")
+	if err != nil {
+		return fmt.Errorf("new ssh transport: %w", err)
+	}
+	if err := tr.Connect(w.ctx); err != nil {
+		return fmt.Errorf("ssh connect to self-provisioned L1: %w", err)
+	}
+	defer tr.Close()
+
 	pkg := w91Zip(w91Exe(spec.OSLinux), "linux-release-v1")
-	if err := os.WriteFile(filepath.Join(stageDir, "pkg.zip"), pkg, 0o644); err != nil {
-		return err
+
+	// FETCH/STAGE: real provider SFTP upload of the artifact onto the target.
+	if err := tr.Upload(w.ctx, bytes.NewReader(pkg), int64(len(pkg)), pl.StagePkg); err != nil {
+		return fmt.Errorf("ssh/sftp upload artifact: %w", err)
 	}
 
-	// Real linux extraction: engine.ExtractScript run by a real POSIX sh+unzip.
-	if _, err := os.Stat(w91ShPath()); err != nil {
-		return fmt.Errorf("no POSIX shell available to prove linux extraction: %w", err)
-	}
-	ex := engine.ExtractScript(pl)
-	out, err := exec.CommandContext(w.ctx, w91ShPath(), "-c", ex).CombinedOutput()
+	// EXTRACT: the engine's REAL linux extract script, executed over the SSH channel.
+	re, err := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh, Script: engine.ExtractScript(pl), TimeoutSec: 60})
 	if err != nil {
-		return fmt.Errorf("linux extractScript via POSIX sh failed: %v (%s)", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("ssh extract exec: %w", err)
 	}
-	relDir := filepath.Join(w.root, w.app, "releases", "1.0.0")
-	if entries, err := os.ReadDir(relDir); err == nil && len(entries) > 0 {
-		w.linuxExtractOK = true
-	} else {
-		return fmt.Errorf("linux extraction produced no files in %s", relDir)
+	rl, err := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh, Script: "ls " + w91ShQuote(pl.Release), TimeoutSec: 30})
+	if err != nil {
+		return fmt.Errorf("ssh list release exec: %w", err)
+	}
+	w.linuxExtractOK = re.ExitCode == 0 && rl.ExitCode == 0 && strings.Contains(rl.Stdout, w91Exe(spec.OSLinux))
+	if !w.linuxExtractOK {
+		return fmt.Errorf("linux extraction over ssh produced no files: extract=%d list=%d out=%q stderr=%q",
+			re.ExitCode, rl.ExitCode, rl.Stdout, re.Stderr)
 	}
 
-	// Real linux checksum: sha256sum over the staged package == Go's digest.
+	// CHECKSUM: real sha256sum over the SSH channel == Go's digest of the artifact.
 	want := w91Sha256Hex(pkg)
-	shSum := fmt.Sprintf("sha256sum %s | cut -d' ' -f1", w91ShQuote(pl.StagePkg))
-	so, err := exec.CommandContext(w.ctx, w91ShPath(), "-c", shSum).CombinedOutput()
+	rc, err := tr.Exec(w.ctx, transport.Cmd{Shell: transport.ShellSh, Script: "sha256sum " + w91ShQuote(pl.StagePkg) + " | cut -d' ' -f1", TimeoutSec: 30})
 	if err != nil {
-		return fmt.Errorf("linux sha256sum via POSIX sh failed: %v (%s)", err, strings.TrimSpace(string(so)))
+		return fmt.Errorf("ssh checksum exec: %w", err)
 	}
-	w.linuxChecksumOK = strings.EqualFold(strings.TrimSpace(string(so)), want)
+	w.linuxChecksumOK = rc.ExitCode == 0 && strings.EqualFold(strings.TrimSpace(rc.Stdout), want)
 	if !w.linuxChecksumOK {
-		return fmt.Errorf("linux checksum mismatch: sha256sum=%q want=%q", strings.TrimSpace(string(so)), want)
+		return fmt.Errorf("linux checksum over ssh mismatch: got=%q want=%q", strings.TrimSpace(rc.Stdout), want)
 	}
+
+	// DOWNLOAD round-trip: pull the extracted file back over SFTP to prove the
+	// provider's file transfer works both directions over the real SSH transport.
+	back := filepath.Join(w.root, "ssh-download-check")
+	if err := tr.Download(w.ctx, pl.Release+"/"+w91Exe(spec.OSLinux), back); err != nil {
+		return fmt.Errorf("ssh/sftp download extracted file: %w", err)
+	}
+	if fi, err := os.Stat(back); err != nil || fi.Size() == 0 {
+		return fmt.Errorf("ssh/sftp download produced no file: %v", err)
+	}
+	w.linuxSSHOK = true
 	return nil
 }
 
@@ -1333,11 +1371,14 @@ func (w *w91World) thenWindowsToolchain() error {
 }
 
 func (w *w91World) thenLinuxSemantics() error {
+	if !w.linuxSSHOK {
+		return errors.New("the self-provisioned SSH/SFTP target did not carry the linux deploy steps")
+	}
 	if !w.linuxExtractOK {
-		return errors.New("linux console extraction did not run through a POSIX shell")
+		return errors.New("linux console extraction did not run through the real SSH transport + POSIX shell")
 	}
 	if !w.linuxChecksumOK {
-		return errors.New("linux artifact checksum did not verify through a POSIX shell")
+		return errors.New("linux artifact checksum did not verify over the real SSH transport")
 	}
 	if !w.linuxSwitchCmdOK {
 		return errors.New("linux `current` symlink command is not the DESIGN §9.1 `ln -sfn`")
@@ -1364,7 +1405,7 @@ func InitializeScenario_lab_acceptance_gate_windows_and_linux_single_target_acce
 	ctx.Step(`^the console_app deploy reaches its version and the current handle is a real reparse point tracking the release$`, w.thenDeployedAndCurrent)
 	ctx.Step(`^the node, \.NET and vstest toolchains verify on the target, a node web app is deployed through the provider engine and served, a provider vstest acceptance run passes, and the service control manager and generated service wrapper config are present$`, w.thenWindowsToolchain)
 	ctx.Step(`^the current symlink tracks the deployed release per DESIGN section 18$`, w.thenCurrentSymlink)
-	ctx.Step(`^the console extraction and checksum run through a real POSIX shell and the current symlink uses "ln -sfn" per DESIGN section 18$`, w.thenLinuxSemantics)
+	ctx.Step(`^the console extraction and checksum run over a real self-provisioned SSH and SFTP transport and the current symlink uses "ln -sfn" per DESIGN section 18$`, w.thenLinuxSemantics)
 	ctx.Step(`^a byte-identical re-apply is idempotent$`, w.thenIdempotent)
 	ctx.Step(`^on-host drift is detected and a converging re-apply restores agreement$`, w.thenDriftConverges)
 	ctx.Step(`^console drift is detected and a re-apply converges$`, w.thenDriftConverges)

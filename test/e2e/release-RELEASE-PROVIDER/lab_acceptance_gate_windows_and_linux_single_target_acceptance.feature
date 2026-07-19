@@ -39,7 +39,7 @@ Feature: Windows and Linux single-target acceptance matrix (DESIGN §18)
     Given a labdeploy Linux single-target driven over the real local transport
     When the CAP-linux console plus DRF DST IDP LCK RBK scenarios run on the real filesystem, plus the real L1 SSH matrix under TF_ACC
     Then the current symlink tracks the deployed release per DESIGN section 18
-    And the console extraction and checksum run through a real POSIX shell and the current symlink uses "ln -sfn" per DESIGN section 18
+    And the console extraction and checksum run over a real self-provisioned SSH and SFTP transport and the current symlink uses "ln -sfn" per DESIGN section 18
     And a byte-identical re-apply is idempotent
     And console drift is detected and a re-apply converges
     And a contended acquire is refused with ERR_LOCKED
