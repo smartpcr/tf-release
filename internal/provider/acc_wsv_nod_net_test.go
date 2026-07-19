@@ -203,7 +203,6 @@ func TestAccWSV06_WinswWrapper(t *testing.T) {
 	extra := "  wrapper: winsw\n  winsw_exe: tools\\winsw.exe\n  stop_timeout_seconds: 10"
 	normal := accDeploymentConfig(winServiceSpec(t, at, "1.0.0", "zip", healthURL(8080), extra))
 	slow := accDeploymentConfig(winServiceSpec(t, at, "1.1.0-slowstop", "zip", healthURL(8080), extra))
-	var t0 time.Time
 	runScenario(t, at,
 		// Fresh install of 1.0.0 under winsw — seeds the on-target cache for 1.0.0.
 		applyStep(at, normal,
@@ -217,18 +216,19 @@ func TestAccWSV06_WinswWrapper(t *testing.T) {
 			resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.1.0-slowstop"),
 			checkWinswXMLVersion(at, "1.1.0-slowstop", "WSV-06: winsw xml regenerated on upgrade"),
 		),
-		// Roll to the CACHED 1.0.0: no FETCH/STAGE (cache_hit) so the wall isolates
-		// the STOP phase — winsw must wait out <stopwait> on the running slow-stop
-		// build then force-kill.
+		// Roll to the CACHED 1.0.0: the STOP phase must wait out <stopwait> on the
+		// running slow-stop build then force-kill. We bound the STOP STEP's OWN
+		// duration_ms from the TRACE (not the whole apply wall), so FETCH/STAGE/
+		// START/HEALTH cannot satisfy the lower bound — the ≥8s is the stopwait wait.
 		resource.TestStep{
-			PreConfig: func() { truncateTFLog(t, logPath)(); t0 = time.Now() },
+			PreConfig: truncateTFLog(t, logPath),
 			Config:    normal,
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0"),
-				checkCacheHitLogged(logPath, "WSV-06: the roll to 1.0.0 must reuse the cache (no FETCH) so the measured wall is the STOP phase, not artifact work"),
+				checkCacheHitLogged(logPath, "WSV-06: the roll to 1.0.0 must reuse the cache (no FETCH)"),
 				checkWinswXMLVersion(at, "1.0.0", "WSV-06: winsw xml regenerated on the cached roll"),
 				checkWinswStopwait(at, 10, "WSV-06: regenerated winsw xml must still carry stopwait"),
-				wallSinceBetween(&t0, 8*time.Second, 25*time.Second, "WSV-06: winsw must honor <stopwait> (wait ~10s then kill) stopping the slow-stop build"),
+				checkStepDurationBetween(logPath, "STOP", 8000, 20000, "WSV-06: the STOP step itself must honor <stopwait> (wait ~10s on the slow-stop build) then force-kill — measured from step=STOP duration_ms, isolated from artifact/start/health work"),
 				checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
 			),
 		},

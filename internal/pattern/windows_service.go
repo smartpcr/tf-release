@@ -178,18 +178,35 @@ func (w *WindowsService) Configure(ctx context.Context, t transport.Transport, r
 // failure is logged but never fails the deploy (the service is already configured).
 func (w *WindowsService) traceServiceConfig(ctx context.Context, t transport.Transport, rc ReleaseCtx) {
 	svc := w.svcName(rc)
+	// Propagate sc.exe's own exit code so a probe that FAILED to query the service
+	// (e.g. it does not exist) is observable, not silently reported as an empty
+	// success. sc.exe qc prints the `SERVICE_NAME:` block on success.
 	script := fmt.Sprintf(`$ErrorActionPreference='Continue'
 & sc.exe qc %s | Out-String
-exit 0`, psq(svc))
+exit $LASTEXITCODE`, psq(svc))
 	r, err := runPS(ctx, t, t.Host(), "CONFIGURE", script, nil, 60)
 	if err != nil {
 		tflog.Trace(ctx, "sc qc capture failed", map[string]interface{}{"service": svc, "host": t.Host(), "error": err.Error()})
 		return
 	}
+	capture := strings.TrimSpace(r.Stdout)
+	// Only accept a capture that actually carries the service configuration. An
+	// empty or error output (sc.exe non-zero, or stdout without the SERVICE_NAME
+	// block) must NOT be logged as a successful "sc qc capture", so a redaction
+	// assertion can never pass against a vacuous record (DESIGN §18.5 WSV-08).
+	if r.ExitCode != 0 || !strings.Contains(capture, "SERVICE_NAME") {
+		tflog.Trace(ctx, "sc qc capture failed", map[string]interface{}{
+			"service":   svc,
+			"host":      t.Host(),
+			"exit_code": r.ExitCode,
+			"reason":    "sc.exe qc returned no service configuration",
+		})
+		return
+	}
 	tflog.Trace(ctx, "sc qc capture", map[string]interface{}{
 		"service": svc,
 		"host":    t.Host(),
-		"sc_qc":   strings.TrimSpace(r.Stdout),
+		"sc_qc":   capture,
 	})
 }
 

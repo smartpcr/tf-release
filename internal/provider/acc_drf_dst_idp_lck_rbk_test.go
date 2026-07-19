@@ -346,27 +346,30 @@ func TestAccIDP01_ReapplyPlanEmpty(t *testing.T) {
 // LCK — locking (§18.8, DESIGN §10.5)
 // ---------------------------------------------------------------------------
 
-// LCK-01: apply A (a REAL terraform apply, run CONCURRENTLY in a goroutine) holds
-// the deployment `.lock` for the duration of its deploy; apply B, started once A
-// has taken the lock, must fail FAST (<5s, non-blocking acquire) with ERR_LOCKED
-// NAMING A's owner; A then completes normally. This is the genuine DESIGN §18.8
-// two-apply race — two independent `resource.Test` applies against the same L1
-// deployment — not a lock-primitive proxy. B's expected owner is read LIVE from
-// A's on-host `.lock` so the diagnostic is asserted to name the actual holder. A
-// `t.Cleanup` force-removes any stranded lock so the `.lock`-absent invariant holds
-// even if the test aborts mid-flight — evaluator items 1, 2.
+// LCK-01: apply A (a REAL terraform apply of a SLOW ARTIFACT, run CONCURRENTLY in a
+// goroutine) holds the deployment `.lock` for the duration of its slow FETCH+deploy;
+// apply B, started once A has taken the lock, must fail FAST (<5s, non-blocking
+// acquire) with ERR_LOCKED NAMING A's owner; A then completes normally. Using the
+// DESIGN §18.8 "slow artifact" (the `1.0.0-slowfetch` fixture — a deliberately large/
+// delayed artifact the lab serves, mirroring the existing `-slowstop` build convention)
+// makes A's lock-hold DETERMINISTIC rather than relying on incidental deploy latency,
+// so the overlap window is guaranteed. B's expected owner is read LIVE from A's on-host
+// `.lock` so the diagnostic is asserted to name the actual holder. A `t.Cleanup`
+// force-removes any stranded lock so the `.lock`-absent invariant holds even if the
+// test aborts mid-flight — evaluator items 1, 2.
 //
 // Single-binary note: terraform-plugin-testing runs `resource.Test` against a
 // go-testing-interface T; apply A uses a recording `asyncT` so its concurrent
-// failures propagate to the parent without racing on *testing.T. The overlap
-// relies on A's real deploy holding the lock longer than B's fast-fail acquire,
-// which holds for any real WinRM/SSH deploy.
+// failures propagate to the parent without racing on *testing.T.
 func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	accPreCheck(t)
 	at := requireL1(t)
 	root := installRootFor(at)
 	const app = "sample-svc"
-	cfg := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", ""))
+	// Apply A fetches the SLOW artifact (holds the lock through the slow FETCH);
+	// apply B uses the normal fast artifact and must fail at LOCK before any fetch.
+	cfgA := accDeploymentConfig(consoleSpec(t, at, "1.0.0-slowfetch", "zip", ""))
+	cfgB := accDeploymentConfig(consoleSpec(t, at, "1.0.0", "zip", ""))
 	host, namespace, _ := splitAddress(t, Address)
 	t.Setenv("TF_ACC_PROVIDER_HOST", host)
 	t.Setenv("TF_ACC_PROVIDER_NAMESPACE", namespace)
@@ -374,8 +377,8 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 	// Safety net: never leave a stranded lock on L1 regardless of how this exits.
 	t.Cleanup(func() { forceRemoveLock(at, root, app) })
 
-	// Apply A: a REAL, concurrent terraform apply. It acquires and HOLDS the
-	// deployment `.lock` through its whole deploy via the production lock path.
+	// Apply A: a REAL, concurrent terraform apply of the SLOW artifact. It acquires
+	// and HOLDS the deployment `.lock` through its whole (slow) deploy.
 	aT := &asyncT{name: "LCK-01/apply-A"}
 	aDone := make(chan struct{})
 	go func() {
@@ -384,7 +387,7 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 		resource.Test(aT, resource.TestCase{
 			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 			Steps: []resource.TestStep{
-				{Config: cfg, Check: resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0")},
+				{Config: cfgA, Check: resource.TestCheckResourceAttr("labdeploy_deployment.val", "deployed_version", "1.0.0-slowfetch")},
 			},
 		})
 	}()
@@ -401,7 +404,7 @@ func TestAccLCK01_ContendedLockErrors(t *testing.T) {
 		resource.Test(t, resource.TestCase{
 			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 			Steps: []resource.TestStep{
-				{Config: cfg, ExpectError: mustRe(`ERR_LOCKED(?s).*` + regexp.QuoteMeta(owner))},
+				{Config: cfgB, ExpectError: mustRe(`ERR_LOCKED(?s).*` + regexp.QuoteMeta(owner))},
 			},
 		})
 	})

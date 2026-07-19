@@ -7,11 +7,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
@@ -707,6 +709,13 @@ func checkReleaseAbsent(at accTarget, version, why string) func(*terraform.State
 	return checkPathAbsent(at, p.Release, why)
 }
 
+// checkReleasePresent asserts a cached release dir survived (CAP-02: keep_releases
+// retains the newest+previous; the rolled-forward cached version must NOT be pruned).
+func checkReleasePresent(at accTarget, version, why string) func(*terraform.State) error {
+	p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", version)
+	return checkPathPresent(at, p.Release, why)
+}
+
 // checkStagingEmpty asserts the staging dir holds no files (ART-02: a failed
 // fetch must not leave a partial payload behind) — evaluator item 6.
 func checkStagingEmpty(at accTarget) func(*terraform.State) error {
@@ -844,13 +853,17 @@ func checkServiceNotRunning(at accTarget, svc, why string) func(*terraform.State
 }
 
 // assertAbandonZeroDial proves DESIGN §18 DST-02's "no connection made (unroutable
-// host would still succeed)" at the acceptance layer by exercising the REAL
-// production Engine.Destroy against an UNROUTABLE host with destroy_mode=abandon,
-// through an instrumented NewTransport that FAILS the test if it is ever called.
-// Because Engine.Destroy returns before it constructs a transport for abandon, the
-// dial counter stays 0 and Destroy returns nil even though the host (192.0.2.1,
-// TEST-NET-1) is unroutable — a direct, deterministic, lab-free proof that the
-// destroy itself issues zero connections — evaluator item 2.
+// host would still succeed); state empty" by exercising the REAL PROVIDER Delete
+// (CRUD) path end-to-end against an UNROUTABLE host with destroy_mode=abandon. It
+// builds a VERIFIED deployment state (inline spec) pointing at 192.0.2.1 (TEST-NET-1,
+// unroutable) and runs DeploymentResource.Delete backed by the production engine
+// whose NewTransport factory is instrumented to FAIL if it is ever called. The Delete
+// must return NO error diagnostics (which is precisely what makes Terraform drop the
+// resource from state ⇒ "state empty") AND the dial counter must stay 0 — a direct,
+// deterministic, lab-free proof that the provider's abandon destroy makes zero
+// connections and still succeeds even though the target is unreachable. This covers
+// the provider Delete/state-removal behavior against an unroutable target, not merely
+// the engine primitive — evaluator item 3.
 func assertAbandonZeroDial(t *testing.T) {
 	t.Helper()
 	t.Setenv("LABDEPLOY_ACC_ZERODIAL_PW", "unused")
@@ -870,21 +883,29 @@ artifact:
   source: { type: http, url: "http://203.0.113.1/a.zip" }
 pattern: { type: console_app, exe: bin/sample-svc }
 `
-	dep, _, err := spec.ParseDeployment(raw, nil, "")
-	if err != nil {
-		t.Fatalf("DST-02 zero-dial: parse spec: %v", err)
-	}
 	dials := 0
 	e := engine.New()
 	e.NewTransport = func(tg *spec.Target, host string) (transport.Transport, error) {
 		dials++
 		return nil, fmt.Errorf("BUG: abandon destroy dialed host %s", host)
 	}
-	if err := e.Destroy(context.Background(), dep, "abandon"); err != nil {
-		t.Fatalf("DST-02 zero-dial: abandon destroy must succeed against an unroutable host, got: %v", err)
+	r := &DeploymentResource{newEngine: func() deployEngine { return realEngine{e} }}
+	m := &deploymentModel{
+		Spec:         types.StringValue(raw),
+		SpecFile:     types.StringNull(),
+		ResolvedSpec: types.StringNull(),
+		SpecHash:     types.StringNull(),
+		DestroyMode:  types.StringValue("abandon"),
+		Hosts:        types.ListNull(types.StringType),
+		Variables:    types.MapNull(types.StringType),
+	}
+	req, resp := deleteReqForModel(t, r, m)
+	r.Delete(context.Background(), req, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("DST-02 zero-dial: provider abandon Delete against an unroutable host must succeed (no error ⇒ state dropped), got: %v", resp.Diagnostics.Errors())
 	}
 	if dials != 0 {
-		t.Fatalf("DST-02 zero-dial: abandon destroy made %d connection(s); DESIGN requires ZERO", dials)
+		t.Fatalf("DST-02 zero-dial: provider abandon Delete made %d connection(s); DESIGN requires ZERO", dials)
 	}
 }
 
@@ -1159,8 +1180,56 @@ func checkStepNotLogged(path, step, why string) func(*terraform.State) error {
 	}
 }
 
-// checkCacheHitLogged proves cache_hit=true the way the provider actually
-// expresses it (engine.go: no FETCH step + the "release cached; skipping
+// checkStepDurationBetween isolates ONE step's own wall time by parsing its
+// structured `duration_ms` from the TRACE record (engine emits app/host/step/
+// version/duration_ms per step), then asserting minMS ≤ duration_ms ≤ maxMS. Unlike
+// a whole-apply wall clock, this bounds ONLY the named step, so e.g. WSV-06 can
+// prove the STOP phase itself honored <stopwait> without FETCH/STAGE/START/HEALTH
+// contaminating the measurement — evaluator item 5.
+func checkStepDurationBetween(path, step string, minMS, maxMS int64, why string) func(*terraform.State) error {
+	durRe := regexp.MustCompile(`\bduration_ms=(\d+)`)
+	stepRe := stepLineRe(step)
+	return func(*terraform.State) error {
+		lines, err := readTFLogLines(path)
+		if err != nil {
+			return fmt.Errorf("%s: read TRACE log: %w", why, err)
+		}
+		if !haveAnyStepLog(lines) {
+			return fmt.Errorf("%s: no deploy-step records captured; cannot measure step=%s duration (log empty/uncaptured)", why, step)
+		}
+		var found bool
+		var maxDur int64 = -1
+		for _, ln := range lines {
+			if !stepRe.MatchString(ln) {
+				continue
+			}
+			m := durRe.FindStringSubmatch(ln)
+			if m == nil {
+				return fmt.Errorf("%s: step=%s record carries no numeric duration_ms: %s", why, step, ln)
+			}
+			d, perr := strconv.ParseInt(m[1], 10, 64)
+			if perr != nil {
+				return fmt.Errorf("%s: step=%s duration_ms %q not numeric: %w", why, step, m[1], perr)
+			}
+			found = true
+			if d > maxDur {
+				maxDur = d // the longest STOP record in this apply is the graceful stopwait
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s: no step=%s record found in the TRACE log", why, step)
+		}
+		if maxDur < minMS {
+			return fmt.Errorf("%s: step=%s took %dms, want >= %dms (phase returned too early — bound not honored)", why, step, maxDur, minMS)
+		}
+		if maxDur > maxMS {
+			return fmt.Errorf("%s: step=%s took %dms, want <= %dms (phase hung past its deadline)", why, step, maxDur, maxMS)
+		}
+		return nil
+	}
+}
+
+
 // fetch/extract" record) — evaluator item 8. DESIGN's `cache_hit=true` field is
 // realized as this step-skip signal.
 func checkCacheHitLogged(path, why string) func(*terraform.State) error {
@@ -1254,7 +1323,13 @@ func checkSCQCTraceRedacted(path, secretEnv, why string) func(*terraform.State) 
 			}
 		}
 		if capture == "" {
-			return fmt.Errorf("%s: no `sc qc capture` record found in the TRACE log; the provider must emit one at TRACE (DESIGN §18.5)", why)
+			return fmt.Errorf("%s: no successful `sc qc capture` record found in the TRACE log; the provider must emit one at TRACE (DESIGN §18.5)", why)
+		}
+		// The record must carry the ACTUAL service configuration, not an empty or
+		// error capture — otherwise redaction is proven against nothing. sc.exe qc
+		// prints SERVICE_NAME and the account under SERVICE_START_NAME.
+		if !strings.Contains(capture, "SERVICE_NAME") || !strings.Contains(capture, "SERVICE_START_NAME") {
+			return fmt.Errorf("%s: the `sc qc capture` record does not contain the expected sc.exe service configuration (SERVICE_NAME/SERVICE_START_NAME); capture may be empty", why)
 		}
 		if strings.Contains(capture, secret) {
 			return fmt.Errorf("%s: the account password leaked into the sc qc capture TRACE record", why)
