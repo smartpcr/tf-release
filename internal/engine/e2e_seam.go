@@ -12,9 +12,27 @@ import (
 	"context"
 
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/logs"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
+
+// RunnerCommand renders the real expanded runner command line for a TestRun's
+// runner.type, including the results-dir logger flags (DESIGN §7.2). Used by the
+// Stage 7.1 "Runner expansion golden" e2e.
+func RunnerCommand(t *spec.TestRun) string { return runnerCommand(t) }
+
+// EvaluatePass applies the real pass_criteria evaluation (DESIGN §7.3): the
+// runner exit code must be allowed AND — only when a format was parsed and
+// total>0 — the pass rate must meet min_pass_rate. Used by the Stage 7.1 "Pass
+// criteria evaluation" e2e.
+func EvaluatePass(exitCode int, format string, c logs.Counters, pc *spec.PassCriteria) (passed, exitOK, rateOK bool) {
+	return evaluatePass(exitCode, format, c, pc)
+}
+
+// NoResultCounters returns the -1 sentinel counter set emitted when
+// results.format is none|empty (DESIGN §5.3; E2E-07). Used by the Stage 7.1 e2e.
+func NoResultCounters() logs.Counters { return noResultCounters() }
 
 // BuildProbeCmd renders the real single-attempt health-probe command for the
 // given target OS and health_check config, encoding the expect_status /
