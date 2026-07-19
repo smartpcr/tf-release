@@ -428,6 +428,7 @@ type cluWorld struct {
 	hosts       []string
 	owner       string
 	prevRelease string
+	nodeCount   int // declared "N-node" size from the scenario header; enforced against len(hosts)
 	cl          *cluFakeCluster
 	nodes       map[string]*cluNode
 	order       []*cluNode // hosts order
@@ -466,19 +467,25 @@ func (w *cluWorld) seedManifest(f *cluFakeHost, version, releasePath string) err
 	return nil
 }
 
-// givenClusterOwnerRunning records the original owner and the previous release
-// version. It does not build the nodes yet — that happens once the full host
-// list is known.
+// givenClusterOwnerRunning records the declared node count, the original owner
+// and the previous release version. It does not build the nodes yet — that
+// happens once the full host list is known. The declared count is stored so
+// givenClusterHosts can enforce that the scenario header ("N-node cluster") and
+// the hosts list stay in sync.
 func (w *cluWorld) givenClusterOwnerRunning(n int, owner, version string) error {
+	w.nodeCount = n
 	w.owner = strings.ToLower(owner)
 	w.prevRelease = version
-	_ = n
 	return nil
 }
 
 // givenClusterHosts builds the shared WSFC state + one seeded fake node per host.
 func (w *cluWorld) givenClusterHosts(hostsCSV string) error {
 	w.hosts = splitCSV(hostsCSV)
+	if len(w.hosts) != w.nodeCount {
+		return fmt.Errorf("declared %d-node cluster header disagrees with hosts list %q (%d hosts); keep the scenario cardinality and the hosts list in sync",
+			w.nodeCount, hostsCSV, len(w.hosts))
+	}
 	relPath := `C:\deploy\sample-svc\releases\` + w.prevRelease
 	w.cl = &cluFakeCluster{
 		nodes: w.hosts, role: true, svc: "SampleSvc",
