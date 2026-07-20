@@ -33,7 +33,7 @@ import (
 // ---------------------------------------------------------------------------
 // Stage 9.1 — Windows and Linux Single Target Acceptance — E2E.
 //
-// Proof strategy (iteration 5). Each scenario ALWAYS runs the REAL DESIGN §18
+// Proof strategy (iteration 5). Each scenario runs the REAL DESIGN §18
 // single-target lifecycle by driving the REAL internal/engine over the REAL
 // `local` transport (internal/transport/local.go — actual powershell.exe / sh
 // execution against the REAL gate filesystem). Nothing is faked and nothing is
@@ -54,7 +54,9 @@ import (
 //   * DST — a real destroy --purge removes the whole tree and leaves no `.lock`.
 //
 // This reproducible core runs on the plain `go test -tags e2e` gate with NO
-// external service and NO skip. When TF_ACC=1 AND the W1/L1 connection env is
+// external service and behind NO opt-in flag — the ONLY skip is the Windows
+// scenario on a non-Windows gate, where it is inapplicable (see PLATFORM
+// APPLICABILITY below). When TF_ACC=1 AND the W1/L1 connection env is
 // present, each scenario ADDITIONALLY drives the full toolchain matrix against
 // the REAL host (mirrors internal/provider/acc_harness_test.go): on W1 over
 // WinRM this now includes real, COMPLETE WSV/NOD/NET service pattern
@@ -62,6 +64,15 @@ import (
 // `sc.exe create`/winsw and verified with `sc.exe query`, then destroy-purged);
 // on L1 over SSH the CAP + DRF/DST/IDP/LCK/RBK matrix runs with native `ln -sfn`.
 // A missing var under TF_ACC=1 FAILS the scenario. The suite never sets TF_ACC.
+//
+// PLATFORM APPLICABILITY: the Windows scenario is Windows-ONLY — it drives the
+// real powershell.exe over the local transport, a junction `current`, and the
+// Service Control Manager surface, none of which exists off Windows. On a
+// non-Windows gate it is therefore SKIPPED OUTRIGHT (godog.ErrSkip at
+// givenWindows) instead of reporting a green "Windows matrix" it never ran; the
+// authoritative Windows proof runs against the real W1 host under TF_ACC=1. The
+// Linux scenario self-provisions its own in-process SSH target and still runs on
+// every gate.
 //
 // LAB DEPENDENCY (honestly out of the gate's reach): the WSV/NOD/NET/vstest
 // service-registration matrix needs Administrator + node/.NET/WinSW toolchains
@@ -179,8 +190,10 @@ type w91World struct {
 
 	// toolchainDeferred is set (to the human-readable reason) when the Windows
 	// WSV/NOD/NET/vstest matrix — DESIGN §18.6 [proof: lab] — cannot run on THIS
-	// gate (a non-Windows gate, or a Windows gate missing Node.js / the .NET SDK
-	// / NuGet egress) and is therefore deferred to the W1 lab under TF_ACC=1.
+	// Windows gate because it is missing Node.js / the .NET SDK / NuGet egress,
+	// and is therefore deferred to the W1 lab under TF_ACC=1. A non-Windows gate
+	// never sets this: the whole Windows scenario is SKIPPED there (see
+	// givenWindows), so it can never report a fabricated green Windows matrix.
 	toolchainDeferred string
 
 	// Windows toolchain matrix (real, on the gate, non-admin)
@@ -437,7 +450,9 @@ func (w *w91World) proveLockContention() error {
 // gate, DEFERRED to the W1 lab on a bare one.
 //
 // The Windows scenario proves the node/.NET/vstest toolchains and the
-// service-control-manager surface on top of console_app. This whole matrix is
+// service-control-manager surface on top of console_app. It is Windows-ONLY, so
+// on a non-Windows gate the WHOLE scenario is SKIPPED at givenWindows and this
+// function runs only on a Windows gate. This whole matrix is
 // DESIGN §18.6 [proof: lab]: it hard-requires Node.js, the .NET SDK and NuGet
 // egress. runWindowsToolchain therefore CAPABILITY-PROBES the gate first
 // (w91MissingWindowsToolchain) and, when any toolchain is absent, DEFERS the
@@ -458,11 +473,13 @@ func (w *w91World) proveLockContention() error {
 
 func (w *w91World) runWindowsToolchain() error {
 	if w.osKind != spec.OSWindows {
-		// On a Linux gate these Windows-only toolchains cannot run; the matrix is
-		// DESIGN §18.6 [proof: lab] (proven on W1 under TF_ACC=1) and the Linux
-		// POSIX semantics proof covers THIS gate instead.
-		w.toolchainDeferred = "gate OS is linux; the Windows service matrix is DESIGN §18.6 [proof: lab], proven on W1 under TF_ACC=1"
-		return nil
+		// Defensive guard. The Windows scenario is SKIPPED OUTRIGHT on a
+		// non-Windows gate (godog.ErrSkip in givenWindows), so this matrix only
+		// ever runs on a Windows gate. If it is somehow reached off Windows, FAIL
+		// LOUDLY rather than fabricating success — an inapplicable gate must never
+		// masquerade as a passing Windows matrix. (The deferral-to-W1 signal below
+		// is reserved for a Windows gate that merely lacks the node/.NET toolchain.)
+		return fmt.Errorf("runWindowsToolchain reached on a non-Windows gate (osKind=%s); the Windows scenario must be skipped there", w.osKind)
 	}
 	// The WSV/NOD/NET/vstest matrix is DESIGN §18.6 [proof: lab]: it hard-requires
 	// Node.js (real node deploy + managed run), the .NET SDK (`dotnet new mstest`)
@@ -1818,8 +1835,23 @@ func (w *w91World) runLabLinux() error {
 // Steps
 // ---------------------------------------------------------------------------
 
-func (w *w91World) givenWindows() error { return w.reset("windows") }
-func (w *w91World) givenLinux() error   { return w.reset("linux") }
+// givenWindows sets up the Windows single-target scenario. That scenario proves
+// Windows-ONLY behaviour — the real `local` transport driving powershell.exe, a
+// junction `current`, and the WSV/NOD/NET/vstest toolchain + Service Control
+// Manager surface — none of which exists on a non-Windows gate. On such a gate
+// SKIP the whole scenario (godog.ErrSkip) rather than letting it report a green
+// "Windows matrix" it never exercised: the authoritative Windows proof runs on
+// the real W1 host under TF_ACC=1 (DESIGN §18.6), and the Linux scenario covers
+// THIS gate's reproducible lifecycle. Skipping (not failing) keeps the suite
+// honest on an inapplicable gate without fabricating coverage.
+func (w *w91World) givenWindows() error {
+	if w91GateOS() != spec.OSWindows {
+		return godog.ErrSkip
+	}
+	return w.reset("windows")
+}
+
+func (w *w91World) givenLinux() error { return w.reset("linux") }
 
 func (w *w91World) whenWindowsMatrix() error {
 	if err := w.runRealLifecycle(); err != nil {
@@ -1923,10 +1955,13 @@ func (w *w91World) thenLockAbsent() error {
 
 func (w *w91World) thenWindowsToolchain() error {
 	if w.toolchainDeferred != "" {
-		// The WSV/NOD/NET/vstest matrix is DESIGN §18.6 [proof: lab]; on a gate
-		// that cannot host it (non-Windows, or missing node/.NET SDK/NuGet egress)
-		// the proof is deferred to W1 under TF_ACC=1. The reproducible console_app
-		// core still ran on THIS gate (see thenDeployedAndCurrent).
+		// The WSV/NOD/NET/vstest matrix is DESIGN §18.6 [proof: lab]. This
+		// deferral fires ONLY on a Windows gate that lacks node / the .NET SDK /
+		// NuGet egress; the proof then runs on W1 under TF_ACC=1 while the
+		// reproducible console_app core still ran for real on THIS Windows gate
+		// (see thenDeployedAndCurrent). A non-Windows gate never reaches here: the
+		// whole scenario is SKIPPED at givenWindows, so a green pass on an
+		// inapplicable gate is impossible.
 		fmt.Printf("[proof: lab] Windows WSV/NOD/NET/vstest toolchain matrix deferred to the W1 lab (TF_ACC=1): %s\n", w.toolchainDeferred)
 		return nil
 	}
