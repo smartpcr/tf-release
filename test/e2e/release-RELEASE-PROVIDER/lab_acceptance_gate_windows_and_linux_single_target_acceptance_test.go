@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
 
@@ -69,7 +70,12 @@ import (
 // Those paths therefore run only under TF_ACC=1 against the operator's lab; the
 // console_app pattern is the reproducible representative of the SHARED deploy
 // state machine (fetch/extract/switch/manifest/lock/drift/rollback/destroy) that
-// every pattern goes through.
+// every pattern goes through. The non-privileged WSV/NOD/NET/vstest toolchain
+// proofs are additionally attempted on the LOCAL Windows gate, but ONLY when it
+// is equipped with Node.js, the .NET SDK and NuGet egress; a bare gate lacking
+// any of those DEFERS that matrix to the W1 lab (DESIGN §18.6 `[proof: lab]`)
+// with an explicit "toolchain absent" signal — it is NEVER a hard gate failure,
+// and the reproducible console_app core above always runs with no skip.
 // ---------------------------------------------------------------------------
 
 const (
@@ -170,6 +176,12 @@ type w91World struct {
 	purged          bool
 	lockAbsentAtEnd bool
 	labRan          bool
+
+	// toolchainDeferred is set (to the human-readable reason) when the Windows
+	// WSV/NOD/NET/vstest matrix — DESIGN §18.6 [proof: lab] — cannot run on THIS
+	// gate (a non-Windows gate, or a Windows gate missing Node.js / the .NET SDK
+	// / NuGet egress) and is therefore deferred to the W1 lab under TF_ACC=1.
+	toolchainDeferred string
 
 	// Windows toolchain matrix (real, on the gate, non-admin)
 	nodPreflightOK bool // real `node --version`
@@ -411,11 +423,17 @@ func (w *w91World) proveLockContention() error {
 }
 
 // ---------------------------------------------------------------------------
-// Windows toolchain matrix (WSV/NOD/NET/vstest) — REAL execution on the gate.
+// Windows toolchain matrix (WSV/NOD/NET/vstest) — REAL execution on an EQUIPPED
+// gate, DEFERRED to the W1 lab on a bare one.
 //
-// The evaluator requires the Windows scenario to prove the node/.NET/vstest
-// toolchains and the service-control-manager surface, not just console_app.
-// These run WITHOUT Administrator on the bare gate:
+// The Windows scenario proves the node/.NET/vstest toolchains and the
+// service-control-manager surface on top of console_app. This whole matrix is
+// DESIGN §18.6 [proof: lab]: it hard-requires Node.js, the .NET SDK and NuGet
+// egress. runWindowsToolchain therefore CAPABILITY-PROBES the gate first
+// (w91MissingWindowsToolchain) and, when any toolchain is absent, DEFERS the
+// matrix to W1 (TF_ACC=1) with an explicit signal — never a confusing hard
+// failure. When the gate IS equipped, every step below runs for real, WITHOUT
+// Administrator:
 //
 //   * NOD — the real node_web_app pattern Preflight runs `node --version`
 //     through the real local transport (ERR_PREFLIGHT if node is absent).
@@ -430,12 +448,21 @@ func (w *w91World) proveLockContention() error {
 
 func (w *w91World) runWindowsToolchain() error {
 	if w.osKind != spec.OSWindows {
-		// On a Linux gate these Windows-only toolchains cannot run; the Linux
-		// POSIX semantics proof covers that gate instead.
-		w.nodPreflightOK, w.netPreflightOK, w.vstestOK, w.wsvScmOK = true, true, true, true
-		w.nodAppRan, w.vstestRan, w.wsvConfigOK = true, true, true
-		w.nodServiceRan = true
-		w.wsvStagesOK, w.netStagesOK, w.nodStagesOK = true, true, true
+		// On a Linux gate these Windows-only toolchains cannot run; the matrix is
+		// DESIGN §18.6 [proof: lab] (proven on W1 under TF_ACC=1) and the Linux
+		// POSIX semantics proof covers THIS gate instead.
+		w.toolchainDeferred = "gate OS is linux; the Windows service matrix is DESIGN §18.6 [proof: lab], proven on W1 under TF_ACC=1"
+		return nil
+	}
+	// The WSV/NOD/NET/vstest matrix is DESIGN §18.6 [proof: lab]: it hard-requires
+	// Node.js (real node deploy + managed run), the .NET SDK (`dotnet new mstest`)
+	// and NuGet egress (`dotnet test` restore). On a bare gate missing any of
+	// those, DEFER the whole matrix to the W1 lab (TF_ACC=1) with an explicit
+	// "toolchain absent" signal rather than failing the `When` step with a
+	// confusing mid-toolchain error. When the gate IS fully equipped the REAL
+	// matrix below runs unchanged, so an equipped runner still gets full coverage.
+	if reason := w91MissingWindowsToolchain(w.ctx); reason != "" {
+		w.toolchainDeferred = reason
 		return nil
 	}
 	tgt := &spec.Target{Transport: spec.TransportLocal, Hosts: []string{"localhost"}, OS: spec.OSWindows}
@@ -561,6 +588,59 @@ func (w *w91World) runWindowsToolchain() error {
 	}
 	w.nodStagesOK = true
 	return nil
+}
+
+// w91MissingWindowsToolchain reports why THIS Windows gate cannot host the real
+// WSV/NOD/NET/vstest matrix — DESIGN §18.6 [proof: lab]. That matrix hard-requires
+// Node.js (real node deploy + managed service run), the .NET SDK (`dotnet new
+// mstest`) and NuGet egress (`dotnet test` package restore). It returns a
+// human-readable reason naming every absent capability, or "" when the gate is
+// fully equipped to run the real matrix. It performs only cheap probes and NEVER
+// fails the gate, so a bare runner defers to the lab instead of erroring mid-step.
+func w91MissingWindowsToolchain(ctx context.Context) string {
+	var missing []string
+	if _, err := exec.LookPath("node"); err != nil {
+		missing = append(missing, "Node.js not on PATH")
+	}
+	if !w91DotnetSDKPresent(ctx) {
+		missing = append(missing, ".NET SDK not installed (dotnet new/test)")
+	} else if !w91NuGetEgress(ctx) {
+		missing = append(missing, "no NuGet egress (dotnet test restore unreachable)")
+	}
+	return strings.Join(missing, "; ")
+}
+
+// w91DotnetSDKPresent reports whether a .NET SDK (not merely a runtime) is
+// installed: `dotnet new mstest` needs the SDK. `dotnet --list-sdks` prints one
+// line per installed SDK and is empty on a runtime-only box.
+func w91DotnetSDKPresent(ctx context.Context) bool {
+	dotnet, err := exec.LookPath("dotnet")
+	if err != nil {
+		return false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, dotnet, "--list-sdks").Output()
+	return err == nil && len(strings.TrimSpace(string(out))) > 0
+}
+
+// w91NuGetEgress reports whether the NuGet v3 index is reachable — a proxy for the
+// outbound network `dotnet test` needs to restore the MSTest packages. A short
+// timeout keeps a bare (offline) gate fast; any failure defers the matrix to the
+// lab rather than letting a `dotnet test` restore hang or fail confusingly.
+func w91NuGetEgress(ctx context.Context) bool {
+	cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, "https://api.nuget.org/v3/index.json", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode < 500
 }
 
 // Pattern YAML fragments for the real service-registering pattern deployments.
@@ -1832,6 +1912,14 @@ func (w *w91World) thenLockAbsent() error {
 }
 
 func (w *w91World) thenWindowsToolchain() error {
+	if w.toolchainDeferred != "" {
+		// The WSV/NOD/NET/vstest matrix is DESIGN §18.6 [proof: lab]; on a gate
+		// that cannot host it (non-Windows, or missing node/.NET SDK/NuGet egress)
+		// the proof is deferred to W1 under TF_ACC=1. The reproducible console_app
+		// core still ran on THIS gate (see thenDeployedAndCurrent).
+		fmt.Printf("[proof: lab] Windows WSV/NOD/NET/vstest toolchain matrix deferred to the W1 lab (TF_ACC=1): %s\n", w.toolchainDeferred)
+		return nil
+	}
 	if !w.nodPreflightOK {
 		return errors.New("NOD: node toolchain preflight did not pass on the target")
 	}
