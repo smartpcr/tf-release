@@ -66,7 +66,7 @@ steps:
         'LD_GH_LAB_REPO','LD_GH_TOKEN',
         'LD_PIP_GOOD_CHECKSUM','LD_PIP_BAD_VERSION','LD_PIP_BAD_CHECKSUM','LD_PIP_HEALTH_URL',
         'LD_ADO_ORG','LD_ADO_PROJECT',
-        'LD_ADO_PAT','LD_ADO_PIPELINE_ID')) {
+        'LD_ADO_PAT','LD_ADO_PIPELINE_ID','LD_ADO_REPO')) {
         if (-not (Get-Item "Env:$v" -ErrorAction SilentlyContinue).Value) { $missing += $v }
       }
       if ($missing.Count -gt 0) {
@@ -94,6 +94,8 @@ steps:
       LD_ADO_PROJECT: $(LD_ADO_PROJECT)
       LD_ADO_PAT: $(LD_ADO_PAT)
       LD_ADO_PIPELINE_ID: $(LD_ADO_PIPELINE_ID)
+      LD_ADO_REPO: $(LD_ADO_REPO)
+      LD_ADO_REPO_TYPE: $(LD_ADO_REPO_TYPE)
 
   - powershell: |
       go test -tags e2e -count=1 -timeout 60m -v `
@@ -130,6 +132,8 @@ steps:
       LD_ADO_PROJECT: $(LD_ADO_PROJECT)
       LD_ADO_PAT: $(LD_ADO_PAT)
       LD_ADO_PIPELINE_ID: $(LD_ADO_PIPELINE_ID)
+      LD_ADO_REPO: $(LD_ADO_REPO)
+      LD_ADO_REPO_TYPE: $(LD_ADO_REPO_TYPE)
 
   - powershell: |
       go test -tags e2e -count=1 -timeout 60m -v `
@@ -151,3 +155,5 @@ steps:
       LD_ADO_PROJECT: $(LD_ADO_PROJECT)
       LD_ADO_PAT: $(LD_ADO_PAT)
       LD_ADO_PIPELINE_ID: $(LD_ADO_PIPELINE_ID)
+      LD_ADO_REPO: $(LD_ADO_REPO)
+      LD_ADO_REPO_TYPE: $(LD_ADO_REPO_TYPE)

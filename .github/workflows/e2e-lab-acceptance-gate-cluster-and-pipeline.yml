@@ -67,6 +67,8 @@ jobs:
       LD_ADO_PROJECT: ${{ secrets.LD_ADO_PROJECT }}
       LD_ADO_PAT: ${{ secrets.LD_ADO_PAT }}
       LD_ADO_PIPELINE_ID: ${{ secrets.LD_ADO_PIPELINE_ID }}
+      LD_ADO_REPO: ${{ secrets.LD_ADO_REPO }}
+      LD_ADO_REPO_TYPE: ${{ secrets.LD_ADO_REPO_TYPE }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -89,7 +91,7 @@ jobs:
             'LD_GH_LAB_REPO','LD_GH_TOKEN',
             'LD_PIP_GOOD_CHECKSUM','LD_PIP_BAD_VERSION','LD_PIP_BAD_CHECKSUM','LD_PIP_HEALTH_URL',
             'LD_ADO_ORG','LD_ADO_PROJECT',
-            'LD_ADO_PAT','LD_ADO_PIPELINE_ID')) {
+            'LD_ADO_PAT','LD_ADO_PIPELINE_ID','LD_ADO_REPO')) {
             if (-not (Get-Item "Env:$v" -ErrorAction SilentlyContinue).Value) { $missing += $v }
           }
           if ($missing.Count -gt 0) {

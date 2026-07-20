@@ -728,10 +728,15 @@ type capCluCheck struct {
 }
 
 // capLiveClusterResult holds the outcome of the full CLU-01..08 matrix run
-// against the real C2/C3 lab, asserted by thenRealClusterAllSucceed.
+// against the real C2/C3 lab, asserted by thenRealClusterAllSucceed. `expected`
+// is the set of CLU ids that MUST have run for the given node count (CLU-03 is
+// three-node-only), so a C2 run cannot be accepted as "complete" while silently
+// omitting a check.
 type capLiveClusterResult struct {
-	active bool
-	checks []capCluCheck
+	active   bool
+	hosts    int
+	expected []string
+	checks   []capCluCheck
 }
 
 func capDeployCaptured(eng *engine.Engine, d *spec.Deployment) (*engine.Status, []cluStepEntry, error) {
@@ -796,16 +801,30 @@ func capLastSwitch(steps []cluStepEntry) string {
 	return last
 }
 
+// capHealthHost returns the host of the first HEALTH step. On a fresh create the
+// HEALTH step is attributed to the ACTUAL owner node, so this recovers the owner
+// the cluster elected (used to prove CLU-08 preferred-owner at create time).
+func capHealthHost(steps []cluStepEntry) string {
+	for _, s := range steps {
+		if s.step == "HEALTH" {
+			return s.host
+		}
+	}
+	return ""
+}
+
 func (w *capWorld) givenLabClusterWhenProvided() error { return nil }
 
 // whenRealClusterLifecycle drives the ENTIRE CLU-01..08 matrix against the real
-// C2/C3 WSFC lab under TF_ACC=1 (not just create/update/destroy): fresh create
-// (CLU-01), single-failover gap + preferred owner (CLU-02/CLU-08), C3 rolling
-// order (CLU-03, when ≥3 nodes), a role-conflict refusal (CLU-06), an
-// unreachable-node refusal (CLU-05), a health rollback to the last good release
-// (CLU-04) and a destroy purge (CLU-07). Each check records its own error so the
-// Then step can fail loudly on ANY unmet property. With the lab absent it records
-// nothing and the Then step reports a clear skip.
+// C2/C3 WSFC lab under TF_ACC=1 (not just create/update/destroy). Because the
+// engine's single failover ALWAYS lands the role on the first passive, and a
+// preferred_owner that differs from that first passive triggers a SECOND
+// MOVE_GROUP, CLU-02 (exactly-one-failover) and CLU-08 (preferred owner) cannot
+// share one apply. So CLU-08 is proven at CREATE (preferred_owner honored by
+// StartGroup, no extra failover) and CLU-02/CLU-03 are proven by a preferred-free
+// rolling update. Each check records its own error; the expected set (CLU-03 is
+// three-node-only) is asserted in the Then so a C2 run cannot pass while omitting
+// a check. With the lab absent it records nothing and the Then reports a clear skip.
 func (w *capWorld) whenRealClusterLifecycle(ctx context.Context) (context.Context, error) {
 	lc, live, err := capLiveClusterEnv()
 	if err != nil {
@@ -815,18 +834,40 @@ func (w *capWorld) whenRealClusterLifecycle(ctx context.Context) (context.Contex
 	if !live {
 		return context.WithValue(ctx, capLiveKey{}, res), nil
 	}
+	res.hosts = len(lc.hosts)
+	res.expected = []string{"CLU-01", "CLU-02", "CLU-04", "CLU-05", "CLU-06", "CLU-07", "CLU-08"}
+	if len(lc.hosts) >= 3 {
+		res.expected = append(res.expected, "CLU-03")
+	}
 	add := func(id string, e error) { res.checks = append(res.checks, capCluCheck{id: id, err: e}) }
 	eng := engine.New() // real transport.NewTransport
-	owner := lc.hosts[0]
-	preferred := lc.hosts[len(lc.hosts)-1] // land the role here to also prove CLU-08
 
-	// CLU-01: fresh create at 1.0.0 brings the role online running the new release.
-	add("CLU-01", func() error {
-		d, e := lc.realSpec(capRealSpecOpts{version: "1.0.0", checksum: lc.sha100})
+	// The preferred owner (also the fresh-create owner) is the LAST node — a
+	// non-coordinator on C3, so CLU-08 proves the engine honors a preference that
+	// is NOT the default coordinator election.
+	createOwner := lc.hosts[len(lc.hosts)-1]
+	// After a create-on-last-owner, the rolling update sees `createOwner` as the
+	// owner; its passives are every OTHER host in spec order, and the single
+	// failover lands on the first of them.
+	var passives []string
+	for _, h := range lc.hosts {
+		if !strings.EqualFold(h, createOwner) {
+			passives = append(passives, h)
+		}
+	}
+	firstNew := passives[0]
+
+	// CLU-01 + CLU-08: fresh create at 1.0.0 brings the role online on the
+	// PREFERRED owner running the new release (StartGroup honors preferred_owner
+	// with no extra failover).
+	var createSteps []cluStepEntry
+	createErr := func() error {
+		d, e := lc.realSpec(capRealSpecOpts{version: "1.0.0", checksum: lc.sha100, preferred: createOwner})
 		if e != nil {
 			return e
 		}
-		out, _, e := capDeployCaptured(eng, d)
+		out, steps, e := capDeployCaptured(eng, d)
+		createSteps = steps
 		if e != nil {
 			return fmt.Errorf("create failed: %w", e)
 		}
@@ -837,13 +878,27 @@ func (w *capWorld) whenRealClusterLifecycle(ctx context.Context) (context.Contex
 			return fmt.Errorf("create must report DeployedVersion 1.0.0, got %q", out.DeployedVersion)
 		}
 		return nil
+	}()
+	add("CLU-01", createErr)
+	add("CLU-08", func() error {
+		if createErr != nil {
+			return fmt.Errorf("create did not complete; cannot verify preferred owner: %w", createErr)
+		}
+		h := capHealthHost(createSteps)
+		if h == "" {
+			return fmt.Errorf("no HEALTH step recorded on create; cannot determine the elected owner")
+		}
+		if !strings.EqualFold(h, createOwner) {
+			return fmt.Errorf("create must bring the role online on the preferred owner %q, but the owner (HEALTH host) was %q", createOwner, h)
+		}
+		return nil
 	}())
 
-	// CLU-02 + CLU-08: rolling update to 1.1.0 fails over EXACTLY once, health-checks
-	// the new owner before draining the old one, and lands the role on the preferred owner.
+	// CLU-02: a preferred-free rolling update to 1.1.0 fails over EXACTLY once onto
+	// the first passive and health-checks it BEFORE draining the old owner.
 	var updateSteps []cluStepEntry
 	add("CLU-02", func() error {
-		d, e := lc.realSpec(capRealSpecOpts{version: "1.1.0", checksum: lc.sha110, preferred: preferred})
+		d, e := lc.realSpec(capRealSpecOpts{version: "1.1.0", checksum: lc.sha110})
 		if e != nil {
 			return e
 		}
@@ -859,18 +914,11 @@ func (w *capWorld) whenRealClusterLifecycle(ctx context.Context) (context.Contex
 		if moves != 1 {
 			return fmt.Errorf("rolling update must fail over EXACTLY once, saw %d MOVE_GROUP: %v", moves, cluStepNames(steps))
 		}
-		if err := capHealthBeforeStop(steps, newOwner, owner); err != nil {
+		if !strings.EqualFold(newOwner, firstNew) {
+			return fmt.Errorf("the single failover must move the role onto the first passive %q, moved to %q", firstNew, newOwner)
+		}
+		if err := capHealthBeforeStop(steps, firstNew, createOwner); err != nil {
 			return err
-		}
-		return nil
-	}())
-	add("CLU-08", func() error {
-		newOwner, _ := capOneMoveGroup(updateSteps)
-		if newOwner == "" {
-			return fmt.Errorf("no MOVE_GROUP recorded; cannot verify preferred owner")
-		}
-		if !strings.EqualFold(newOwner, preferred) {
-			return fmt.Errorf("role must land on the preferred owner %q, moved to %q", preferred, newOwner)
 		}
 		return nil
 	}())
@@ -880,19 +928,19 @@ func (w *capWorld) whenRealClusterLifecycle(ctx context.Context) (context.Contex
 	if len(lc.hosts) >= 3 {
 		add("CLU-03", func() error {
 			pre := capPreMoveSwitchOrder(updateSteps)
-			want := lc.hosts[1:]
-			if !cluEqual(pre, want) {
-				return fmt.Errorf("passives must update in hosts order %v before the failover, got %v", want, pre)
+			if !cluEqual(pre, passives) {
+				return fmt.Errorf("passives must update in hosts order %v before the failover, got %v", passives, pre)
 			}
-			if last := capLastSwitch(updateSteps); !strings.EqualFold(last, owner) {
-				return fmt.Errorf("former owner %q must be updated last, last SWITCH was %q", owner, last)
+			if last := capLastSwitch(updateSteps); !strings.EqualFold(last, createOwner) {
+				return fmt.Errorf("former owner %q must be updated last, last SWITCH was %q", createOwner, last)
 			}
 			return nil
 		}())
 	}
 
-	// CLU-06: a role already bound to a DIFFERENT service is refused (read-only
-	// preflight) with a service-install conflict; nothing is mutated.
+	// CLU-06: a role already bound to a DIFFERENT service is refused (PreflightRole
+	// runs before the idempotency short-circuit and before any lock), so nothing is
+	// mutated even though the cluster is already current at 1.1.0.
 	add("CLU-06", func() error {
 		d, e := lc.realSpec(capRealSpecOpts{version: "1.1.0", checksum: lc.sha110, service: capService + "Conflict"})
 		if e != nil {
@@ -908,7 +956,8 @@ func (w *capWorld) whenRealClusterLifecycle(ctx context.Context) (context.Contex
 		return nil
 	}())
 
-	// CLU-05: an unreachable extra node fails the apply to CONNECT without a partial switch.
+	// CLU-05: an unreachable extra node fails the apply to CONNECT (newClusterCtx
+	// connects before any preflight/idempotency) without a partial switch.
 	add("CLU-05", func() error {
 		hosts := append(append([]string{}, lc.hosts...), "lab-unreachable.invalid")
 		d, e := lc.realSpec(capRealSpecOpts{version: "1.1.0", checksum: lc.sha110, hosts: hosts})
@@ -928,7 +977,7 @@ func (w *capWorld) whenRealClusterLifecycle(ctx context.Context) (context.Contex
 	// CLU-04: a deliberately-unhealthy release rolls the WHOLE cluster back to the
 	// last known good version (1.1.0) with two failovers (forward + back) and a ROLLBACK step.
 	add("CLU-04", func() error {
-		d, e := lc.realSpec(capRealSpecOpts{version: lc.badVersion, checksum: lc.badSha, preferred: preferred})
+		d, e := lc.realSpec(capRealSpecOpts{version: lc.badVersion, checksum: lc.badSha})
 		if e != nil {
 			return e
 		}
@@ -960,6 +1009,10 @@ func (w *capWorld) whenRealClusterLifecycle(ctx context.Context) (context.Contex
 		return nil
 	}())
 
+	if len(lc.hosts) < 3 {
+		fmt.Println("[lab-note] CLU-03 (three-node rolling order) is C3-only; this 2-node C2 lab " +
+			"correctly excludes it from the expected set (7 checks), not silently omits it.")
+	}
 	return context.WithValue(ctx, capLiveKey{}, res), nil
 }
 
@@ -979,17 +1032,27 @@ func (w *capWorld) thenRealClusterAllSucceed(ctx context.Context) error {
 			"LABDEPLOY_ACC_CLU_BAD_VERSION/BAD_ZIP and LABDEPLOY_PASSWORD to run it live.")
 		return nil
 	}
-	var failed []string
-	for _, c := range res.checks {
+	// Index the checks that actually ran, then verify EVERY expected id (per node
+	// count) both ran and passed. This rejects a run that omits an applicable check
+	// as well as one that fails an assertion.
+	ran := map[string]*capCluCheck{}
+	for i := range res.checks {
+		ran[res.checks[i].id] = &res.checks[i]
+	}
+	var problems []string
+	for _, id := range res.expected {
+		c, ok := ran[id]
+		if !ok {
+			problems = append(problems, id+": expected for a "+fmt.Sprint(res.hosts)+"-node cluster but did NOT execute")
+			continue
+		}
 		if c.err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", c.id, c.err))
+			problems = append(problems, fmt.Sprintf("%s: %v", id, c.err))
 		}
 	}
-	if len(failed) > 0 {
-		return fmt.Errorf("live CLU matrix failed %d check(s):\n  %s", len(failed), strings.Join(failed, "\n  "))
-	}
-	if len(res.checks) < 7 {
-		return fmt.Errorf("live CLU matrix ran only %d checks, expected the full CLU-01..08 set", len(res.checks))
+	if len(problems) > 0 {
+		return fmt.Errorf("live CLU matrix failed %d of %d expected check(s) on the %d-node lab:\n  %s",
+			len(problems), len(res.expected), res.hosts, strings.Join(problems, "\n  "))
 	}
 	return nil
 }
@@ -1337,7 +1400,7 @@ func capLiveADO(goodVersion string) error {
 	if org == "" {
 		fmt.Println("[LAB-SKIP] PIP-03 live Azure DevOps leg NOT executed: LD_ADO_ORG unset " +
 			"(no L4 ADO agent). The shipped azure-pipelines.yml structural proofs above are the " +
-			"in-gate coverage; set LD_ADO_ORG/LD_ADO_PROJECT/LD_ADO_PAT/LD_ADO_PIPELINE_ID to run it live.")
+			"in-gate coverage; set LD_ADO_ORG/LD_ADO_PROJECT/LD_ADO_PAT/LD_ADO_PIPELINE_ID/LD_ADO_REPO to run it live.")
 		return nil // lab absent — clearly reported, not silently passed
 	}
 	project := strings.TrimSpace(os.Getenv("LD_ADO_PROJECT"))
@@ -1350,12 +1413,33 @@ func capLiveADO(goodVersion string) error {
 	if err != nil {
 		return fmt.Errorf("LD_ADO_PIPELINE_ID must be an integer: %w", err)
 	}
+	// The pipeline id alone is not proof of identity — any pipeline in the org can
+	// carry that id. PIP-03 is the AUTHORITATIVE ADO check, so it MUST assert the
+	// definition is bound to the expected lab repo (LD_ADO_REPO required) before
+	// queueing. Without this a green run could smoke an unrelated pipeline.
+	wantRepo, err := capRequireEnv("LD_ADO_REPO")
+	if err != nil {
+		return err
+	}
+	wantRepoType := capEnvOr("LD_ADO_REPO_TYPE", "TfsGit")
 	version := capEnvOr("LD_PIP_GOOD_VERSION", goodVersion)
 	checksum := strings.TrimSpace(os.Getenv("LD_PIP_GOOD_CHECKSUM"))
 
 	ado := pipeline.NewADOClient(org, project, pat)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
 	defer cancel()
+
+	// PIP-03 identity: refuse any pipeline not bound to the expected lab repo.
+	def, err := ado.GetBuildDefinition(ctx, pipelineID)
+	if err != nil {
+		return fmt.Errorf("PIP-03 get build definition %d: %w", pipelineID, err)
+	}
+	if !strings.EqualFold(def.RepoName, wantRepo) {
+		return fmt.Errorf("PIP-03 pipeline %d is bound to repo %q, want %q (set LD_ADO_REPO to the lab repo)", pipelineID, def.RepoName, wantRepo)
+	}
+	if !strings.EqualFold(strings.TrimSpace(def.RepoType), wantRepoType) {
+		return fmt.Errorf("PIP-03 pipeline %d repository type %q, want %q (set LD_ADO_REPO_TYPE if the lab uses a different SCM)", pipelineID, def.RepoType, wantRepoType)
+	}
 
 	runID, err := ado.QueueRun(ctx, pipelineID, map[string]string{"version": version, "checksum": checksum})
 	if err != nil {
