@@ -201,8 +201,8 @@ func TestPIP_03_AzureDevOpsPassPublishesTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve pipeline %d definition: %v", pipelineID, err)
 	}
-	if !strings.HasSuffix(strings.ReplaceAll(def.YamlFilename, "\\", "/"), "azure-pipelines.yml") {
-		t.Fatalf("PIP-03 pipeline %d runs %q, want the shipped examples/pipelines/azure-pipelines.yml", pipelineID, def.YamlFilename)
+	if normalizeADOYamlPath(def.YamlFilename) != shippedADOPipelinePath {
+		t.Fatalf("PIP-03 pipeline %d runs %q, want EXACTLY the shipped %q (a suffix match would accept e.g. malicious-azure-pipelines.yml)", pipelineID, def.YamlFilename, shippedADOPipelinePath)
 	}
 	if !strings.EqualFold(def.RepoName, wantRepo) {
 		t.Fatalf("PIP-03 pipeline %d is bound to repo %q, want %q (set LD_ADO_REPO to the lab repo)", pipelineID, def.RepoName, wantRepo)
@@ -289,6 +289,19 @@ func assertResultsArtifact(t *testing.T, zipBytes []byte, name string) {
 	if s.Total == nil || s.PassedTests == nil || s.Failed == nil || s.Passed == nil {
 		t.Fatalf("PIP-01 summary.json does not report the test summary (total/passed_tests/failed/passed); got %s", strings.TrimSpace(string(summary)))
 	}
+}
+
+// shippedADOPipelinePath is the exact repo-relative YAML file the ADO pipeline
+// definition MUST run. PIP-03 compares against this (not a suffix) so a lookalike
+// like "malicious-azure-pipelines.yml" or "other/azure-pipelines.yml" is rejected.
+const shippedADOPipelinePath = "examples/pipelines/azure-pipelines.yml"
+
+// normalizeADOYamlPath canonicalizes an ADO definition YAML path for an exact
+// compare: backslashes → slashes, trimmed, and a single optional leading slash
+// removed (ADO reports the repo-root-relative path with or without a leading "/").
+func normalizeADOYamlPath(p string) string {
+	p = strings.ReplaceAll(strings.TrimSpace(p), "\\", "/")
+	return strings.TrimPrefix(p, "/")
 }
 
 // summaryMarker is the heading the shipped deploy job writes to

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -101,7 +102,7 @@ func TestSelectRunCandidates(t *testing.T) {
 		{ID: 10, Event: "workflow_dispatch", HeadBranch: "main", CreatedAt: base.Format(time.RFC3339)},                     // too old (id<=afterID)
 		{ID: 21, Event: "push", HeadBranch: "main", CreatedAt: base.Format(time.RFC3339)},                                  // wrong event
 		{ID: 22, Event: "workflow_dispatch", HeadBranch: "feature", CreatedAt: base.Format(time.RFC3339)},                  // wrong branch
-		{ID: 23, Event: "workflow_dispatch", HeadBranch: "main", CreatedAt: base.Add(-time.Hour).Format(time.RFC3339)},     // before sinceFloor
+		{ID: 23, Event: "workflow_dispatch", HeadBranch: "main", CreatedAt: base.Add(-time.Hour).Format(time.RFC3339)},     // before sinceFloor (excluded by actor first)
 		{ID: 24, Event: "workflow_dispatch", HeadBranch: "refs/heads/main", CreatedAt: base.Add(time.Minute).Format(time.RFC3339)}, // MATCH (normRef)
 	}
 	runs[4].Actor.Login = "ci-bot"
@@ -110,16 +111,71 @@ func TestSelectRunCandidates(t *testing.T) {
 	other.Actor.Login = "someone-else"
 	runs = append(runs, other)
 
-	got := selectRunCandidates(runs, 20, "main", "ci-bot", base.Add(-time.Minute))
+	got, err := selectRunCandidates(runs, 20, "main", "ci-bot", base.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("selectRunCandidates unexpected error: %v", err)
+	}
 	if len(got) != 1 || got[0] != 24 {
 		t.Fatalf("selectRunCandidates = %v, want [24] (only the id>20, dispatch, main, ci-bot, recent run)", got)
 	}
 
 	// Two same-actor candidates → both returned so FindRunAfter can flag ambiguity.
 	runs[5].Actor.Login = "ci-bot"
-	got = selectRunCandidates(runs, 20, "main", "ci-bot", base.Add(-time.Minute))
+	got, err = selectRunCandidates(runs, 20, "main", "ci-bot", base.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("selectRunCandidates unexpected error: %v", err)
+	}
 	if len(got) != 2 {
 		t.Fatalf("selectRunCandidates = %v, want two ambiguous candidates", got)
+	}
+}
+
+func TestSelectRunCandidates_RejectsMissingOrBadTimestamp(t *testing.T) {
+	base := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	// A run matching every identity filter but with an empty created_at must be an
+	// [ERR_RUN_DATA] error — never silently included (mandatory time correlation).
+	empty := workflowRun{ID: 30, Event: "workflow_dispatch", HeadBranch: "main", CreatedAt: ""}
+	empty.Actor.Login = "ci-bot"
+	if _, err := selectRunCandidates([]workflowRun{empty}, 20, "main", "ci-bot", base.Add(-time.Minute)); err == nil ||
+		!strings.Contains(err.Error(), "[ERR_RUN_DATA]") {
+		t.Fatalf("empty created_at err = %v, want [ERR_RUN_DATA]", err)
+	}
+	// Malformed created_at likewise.
+	bad := workflowRun{ID: 31, Event: "workflow_dispatch", HeadBranch: "main", CreatedAt: "not-a-timestamp"}
+	bad.Actor.Login = "ci-bot"
+	if _, err := selectRunCandidates([]workflowRun{bad}, 20, "main", "ci-bot", base.Add(-time.Minute)); err == nil ||
+		!strings.Contains(err.Error(), "[ERR_RUN_DATA]") {
+		t.Fatalf("malformed created_at err = %v, want [ERR_RUN_DATA]", err)
+	}
+	// A NON-matching run (wrong actor) with a bad timestamp must NOT error — it is
+	// filtered out before the timestamp check.
+	nonmatch := workflowRun{ID: 32, Event: "workflow_dispatch", HeadBranch: "main", CreatedAt: "garbage"}
+	nonmatch.Actor.Login = "someone-else"
+	if got, err := selectRunCandidates([]workflowRun{nonmatch}, 20, "main", "ci-bot", base.Add(-time.Minute)); err != nil || len(got) != 0 {
+		t.Fatalf("non-matching bad-timestamp run = (%v,%v), want ([],nil)", got, err)
+	}
+}
+
+func TestNormalizeADOYamlPath(t *testing.T) {
+	for _, in := range []string{
+		"examples/pipelines/azure-pipelines.yml",
+		"/examples/pipelines/azure-pipelines.yml",
+		`examples\pipelines\azure-pipelines.yml`,
+		"  examples/pipelines/azure-pipelines.yml  ",
+	} {
+		if got := normalizeADOYamlPath(in); got != shippedADOPipelinePath {
+			t.Errorf("normalizeADOYamlPath(%q) = %q, want %q", in, got, shippedADOPipelinePath)
+		}
+	}
+	for _, in := range []string{
+		"malicious-azure-pipelines.yml",
+		"examples/pipelines/malicious-azure-pipelines.yml",
+		"other/examples/pipelines/azure-pipelines.yml",
+		"azure-pipelines.yml",
+	} {
+		if got := normalizeADOYamlPath(in); got == shippedADOPipelinePath {
+			t.Errorf("normalizeADOYamlPath(%q) = %q, must NOT equal the shipped path", in, got)
+		}
 	}
 }
 
@@ -128,22 +184,9 @@ func TestFindRunAfter_Stabilizes(t *testing.T) {
 	findRunStabilizeInterval = time.Millisecond
 	defer func() { findRunStabilizeInterval = prev }()
 
-	body := func(ids ...int64) string {
-		var runs []map[string]any
-		for _, id := range ids {
-			runs = append(runs, map[string]any{
-				"id": id, "event": "workflow_dispatch", "head_branch": "main",
-				"created_at": time.Now().UTC().Format(time.RFC3339),
-				"actor":      map[string]any{"login": "ci-bot"},
-			})
-		}
-		b, _ := json.Marshal(map[string]any{"workflow_runs": runs})
-		return string(b)
-	}
-
 	// Single stable candidate across polls → returned.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(body(42)))
+		_, _ = w.Write([]byte(runsBody(42)))
 	}))
 	defer srv.Close()
 	c := NewGitHubClient("o", "r", "tok")
@@ -153,17 +196,58 @@ func TestFindRunAfter_Stabilizes(t *testing.T) {
 		t.Fatalf("FindRunAfter stable = (%d,%v), want (42,nil)", id, err)
 	}
 
-	// Two same-actor candidates → ambiguity error, no silent smallest-id pick.
+	// Immediately-ambiguous response → ambiguity error, no silent smallest-id pick.
 	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(body(42, 43)))
+		_, _ = w.Write([]byte(runsBody(42, 43)))
 	}))
 	defer srv2.Close()
 	c2 := NewGitHubClient("o", "r", "tok")
 	c2.apiBase = srv2.URL
 	if _, err := c2.FindRunAfter(context.Background(), "wf.yml", "main", 40, time.Now().Add(-time.Minute), "ci-bot", 5*time.Second); err == nil ||
 		!strings.Contains(err.Error(), "ERR_RUN_AMBIGUOUS") {
-		t.Fatalf("FindRunAfter ambiguous err = %v, want [ERR_RUN_AMBIGUOUS]", err)
+		t.Fatalf("FindRunAfter immediate-ambiguous err = %v, want [ERR_RUN_AMBIGUOUS]", err)
 	}
+}
+
+// TestFindRunAfter_CatchesDelayedAmbiguity is the defining race case: poll 1 shows a
+// single candidate (42), and a concurrent same-actor dispatch (43) only appears on
+// poll 2. The stabilization window must catch this and refuse to return 42.
+func TestFindRunAfter_CatchesDelayedAmbiguity(t *testing.T) {
+	prev := findRunStabilizeInterval
+	findRunStabilizeInterval = time.Millisecond
+	defer func() { findRunStabilizeInterval = prev }()
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n <= 1 {
+			_, _ = w.Write([]byte(runsBody(42))) // poll 1: one candidate
+			return
+		}
+		_, _ = w.Write([]byte(runsBody(42, 43))) // poll 2+: the racing dispatch appears
+	}))
+	defer srv.Close()
+	c := NewGitHubClient("o", "r", "tok")
+	c.apiBase = srv.URL
+	id, err := c.FindRunAfter(context.Background(), "wf.yml", "main", 40, time.Now().Add(-time.Minute), "ci-bot", 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "ERR_RUN_AMBIGUOUS") {
+		t.Fatalf("FindRunAfter delayed-ambiguity = (%d,%v), want [ERR_RUN_AMBIGUOUS] (must not commit to 42)", id, err)
+	}
+}
+
+// runsBody renders a GitHub workflow-runs list body for the given ids (all
+// workflow_dispatch on main by ci-bot with a current timestamp).
+func runsBody(ids ...int64) string {
+	var runs []map[string]any
+	for _, id := range ids {
+		runs = append(runs, map[string]any{
+			"id": id, "event": "workflow_dispatch", "head_branch": "main",
+			"created_at": time.Now().UTC().Format(time.RFC3339),
+			"actor":      map[string]any{"login": "ci-bot"},
+		})
+	}
+	b, _ := json.Marshal(map[string]any{"workflow_runs": runs})
+	return string(b)
 }
 
 func TestGetBuildDefinition_ParsesIdentity(t *testing.T) {

@@ -165,9 +165,12 @@ func (c *GitHubClient) AuthenticatedLogin(ctx context.Context) (string, error) {
 
 // selectRunCandidates returns the ids of runs that match THIS test's dispatch
 // window: id>afterID, event=workflow_dispatch, head_branch==wantRef (when set),
-// actor.login==wantActor (when set), and created_at at or after sinceFloor. Pure and
-// deterministically unit-tested.
-func selectRunCandidates(runs []workflowRun, afterID int64, wantRef, wantActor string, sinceFloor time.Time) []int64 {
+// actor.login==wantActor (when set), and created_at at or after sinceFloor. Time
+// correlation is MANDATORY: a run that matches every identity filter but carries a
+// missing or unparseable created_at is treated as bad API data and surfaced as an
+// [ERR_RUN_DATA] error rather than being silently included (which would defeat the
+// since-window correlation). Pure and deterministically unit-tested.
+func selectRunCandidates(runs []workflowRun, afterID int64, wantRef, wantActor string, sinceFloor time.Time) ([]int64, error) {
 	var out []int64
 	for _, r := range runs {
 		if r.ID <= afterID || r.Event != "workflow_dispatch" {
@@ -179,14 +182,16 @@ func selectRunCandidates(runs []workflowRun, afterID int64, wantRef, wantActor s
 		if wantActor != "" && !strings.EqualFold(r.Actor.Login, wantActor) {
 			continue
 		}
-		if r.CreatedAt != "" {
-			if ts, err := time.Parse(time.RFC3339, r.CreatedAt); err == nil && ts.Before(sinceFloor) {
-				continue
-			}
+		ts, err := time.Parse(time.RFC3339, strings.TrimSpace(r.CreatedAt))
+		if err != nil {
+			return nil, fmt.Errorf("[ERR_RUN_DATA] run %d matches the dispatch identity but has a missing/unparseable created_at %q: cannot time-correlate it to this test's dispatch", r.ID, r.CreatedAt)
+		}
+		if ts.Before(sinceFloor) {
+			continue
 		}
 		out = append(out, r.ID)
 	}
-	return out
+	return out, nil
 }
 
 // listRunCandidates fetches the recent workflow_dispatch runs and applies
@@ -205,7 +210,7 @@ func (c *GitHubClient) listRunCandidates(ctx context.Context, workflowFile strin
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
-	return selectRunCandidates(out.Runs, afterID, wantRef, wantActor, sinceFloor), nil
+	return selectRunCandidates(out.Runs, afterID, wantRef, wantActor, sinceFloor)
 }
 
 // findRunStabilizeInterval is the delay between the two confirmation polls
@@ -237,7 +242,13 @@ func (c *GitHubClient) FindRunAfter(ctx context.Context, workflowFile, ref strin
 	var pending int64 // the single candidate awaiting stabilization confirmation
 	for {
 		cands, err := c.listRunCandidates(ctx, workflowFile, afterID, wantRef, wantActor, sinceFloor)
-		if err == nil {
+		if err != nil {
+			// Bad API data (a matching run with no correlatable timestamp) is fatal;
+			// transient HTTP/list errors are tolerated until the deadline.
+			if strings.Contains(err.Error(), "[ERR_RUN_DATA]") {
+				return 0, err
+			}
+		} else {
 			switch {
 			case len(cands) > 1:
 				return 0, ambiguous(cands)
