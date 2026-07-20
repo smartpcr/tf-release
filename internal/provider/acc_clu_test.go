@@ -465,7 +465,15 @@ func checkClusterMoveGroupOnce(path, why string) func(*terraform.State) error {
 // updated last"). former is the pre-update owner; passives is the hosts-ordered
 // list of the remaining nodes.
 func checkClusterUpdateOrder(path string, passives []string, former *string, why string) func(*terraform.State) error {
-	re := regexp.MustCompile(`(?i)deploy step\b.*\bhost=([^\s]+).*\bstep=CONFIGURE\b`)
+	// Match CONFIGURE records order-independently. The engine emits step fields from
+	// a Go map (engine stepLogger.emit), so terraform-plugin-log renders "host=" and
+	// "step=" in non-deterministic order — DESIGN §8.5 even documents them as
+	// "step=<NAME> host=<h>". A regex that requires host= before step=CONFIGURE would
+	// silently drop every record that happens to render "step=CONFIGURE … host=…",
+	// dropping nodes from `order` and flaking the assertion. So identify the step with
+	// the host-agnostic sibling helper, then extract the host with a separate search.
+	stepRe := stepLineRe("CONFIGURE")
+	hostRe := regexp.MustCompile(`(?i)\bhost=([^\s]+)`)
 	return func(*terraform.State) error {
 		lines, err := readTFLogLines(path)
 		if err != nil {
@@ -473,8 +481,10 @@ func checkClusterUpdateOrder(path string, passives []string, former *string, why
 		}
 		var order []string
 		for _, ln := range lines {
-			if m := re.FindStringSubmatch(ln); m != nil {
-				order = append(order, shortHost(m[1]))
+			if stepRe.MatchString(ln) {
+				if m := hostRe.FindStringSubmatch(ln); m != nil {
+					order = append(order, shortHost(m[1]))
+				}
 			}
 		}
 		// Expected per-node CONFIGURE order: passives (hosts order) then former owner.
