@@ -312,11 +312,21 @@ func (w *w91World) runRealLifecycle() error {
 	}
 	w.capVersion = st.DeployedVersion
 	p100 := layout.NewPaths(w.osKind, w.root, w.app, "1.0.0")
-	if fi, err := os.Lstat(p100.Current); err == nil {
-		w.currentReparse = fi.Mode()&os.ModeSymlink != 0
-	}
-	if _, err := os.Stat(filepath.Join(p100.Release, ".labdeploy-release.json")); err == nil {
-		w.currentTracks = true // a marker reachable through `current` proves it tracks the release
+	// Prove `current` is a REAL reparse point (Windows junction / POSIX symlink)
+	// that RESOLVES to releases/1.0.0. os.Readlink only succeeds on a reparse
+	// point/symlink, so a successful read proves `current` IS one -- more reliably
+	// than Lstat&ModeSymlink, which reports a `mklink /J` junction as ModeIrregular
+	// (not ModeSymlink) on modern Go. os.SameFile(current, release) then proves the
+	// handle RESOLVES to releases/1.0.0 by directory identity (robust to case / 8.3
+	// short-name / separator differences) -- rather than reading the marker straight
+	// out of releases/1.0.0, which never exercises `current`, so a stale `current`
+	// left pointing at a previous release would pass while the 1.0.0 marker is still
+	// on disk (the Linux path proves the same via ReadStatus + `readlink`).
+	if _, err := os.Readlink(p100.Current); err == nil {
+		w.currentReparse = true
+		curFI, curErr := os.Stat(p100.Current) // follows `current` to its target
+		relFI, relErr := os.Stat(p100.Release) // releases/1.0.0 directly
+		w.currentTracks = curErr == nil && relErr == nil && os.SameFile(curFI, relFI)
 	}
 
 	// IDP: byte-identical re-apply is idempotent.
