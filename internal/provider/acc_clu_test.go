@@ -773,18 +773,40 @@ func TestAccCLU05_NodeUnreachable(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{{
-			// Capture the baseline owner + cn1 junction target BEFORE the failed
-			// update so CheckDestroy can prove neither moved (cn1 is reachable).
+			// Verify the pre-seeded baseline is genuinely a HEALTHY v1.0.0 on the
+			// reachable node BEFORE attempting the update — otherwise "unchanged
+			// after the failed update" would be vacuous. Assert: cn1 owns the role
+			// (so the reachable node serves it), the role is Online, cn1's junction
+			// resolves to release 1.0.0, and the role's health serves v=1.0.0. Then
+			// capture the owner + junction so CheckDestroy can prove neither moved.
 			PreConfig: preConfig(t, func() error {
-				o, err := ownerOf(ct, clusterRole)
+				owner, state, err := clusterGroup(ct.nodes[0], clusterRole)
 				if err != nil {
-					return fmt.Errorf("capture baseline owner: %w", err)
+					return fmt.Errorf("probe baseline role: %w", err)
 				}
-				preOwner = o
+				if !strings.EqualFold(state, "Online") {
+					return fmt.Errorf("baseline role %s state = %q, want Online (pre-seed a healthy v1.0.0 before the run)", clusterRole, state)
+				}
+				if shortHost(owner) != shortHost(ct.names[0]) {
+					return fmt.Errorf("baseline role owner = %q, want the reachable node %s (pre-seed with cn1 as owner so its health + junction can be verified while cn2 is firewalled)", owner, ct.names[0])
+				}
 				j, err := readCurrentTarget(ct.nodes[0])
 				if err != nil {
 					return fmt.Errorf("capture baseline junction on cn1: %w", err)
 				}
+				if !strings.Contains(strings.ToLower(j), "1.0.0") {
+					return fmt.Errorf("baseline cn1 junction = %q, want it to resolve to release 1.0.0 (baseline is not v1.0.0)", strings.TrimSpace(j))
+				}
+				health, err := probeHost(ct.nodes[0],
+					fmt.Sprintf("(Invoke-WebRequest -UseBasicParsing -Uri '%s').Content", psq(healthURL(8080))),
+					fmt.Sprintf("curl -fsS '%s'", shq(healthURL(8080))))
+				if err != nil {
+					return fmt.Errorf("baseline health probe on cn1: %w", err)
+				}
+				if !strings.Contains(health, "v=1.0.0") {
+					return fmt.Errorf("baseline health on cn1 = %q, want it to serve v=1.0.0", strings.TrimSpace(health))
+				}
+				preOwner = owner
 				preJunction = j
 				return nil
 			}),

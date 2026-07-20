@@ -34,6 +34,12 @@ jobs:
             -var "app_version=${{ inputs.version }}" \
             -var "app_checksum=${{ inputs.checksum }}"
 
+      - name: Echo test summary to the job summary (always)
+        if: always()
+        run: |
+          echo "### labdeploy test summary" | tee -a "$GITHUB_STEP_SUMMARY"
+          terraform output -raw test_summary 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" || true
+
       - name: Upload test results + logs (always)
         if: always()
         uses: actions/upload-artifact@v4

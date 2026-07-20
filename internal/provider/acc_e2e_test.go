@@ -320,10 +320,15 @@ func checkEventLogsCollected(dest, wantProvider string, start time.Time) error {
 			if err != nil {
 				return fmt.Errorf("E2E-05: %s: %w", f, err)
 			}
-			// 2-minute tolerance absorbs sub-second rounding and provider-vs-collector clock granularity.
-			if ts.Before(start.Add(-2 * time.Minute)) {
-				return fmt.Errorf("E2E-05: event at %s precedes the test start %s (stale event collected)",
-					ts.Format(time.RFC3339), start.Format(time.RFC3339))
+			// E2E-05 requires only events AT OR AFTER the test start. The start was
+			// captured on the target's OWN clock and events carry that same host
+			// clock, so no skew tolerance is warranted. Truncate to whole seconds so
+			// sub-second capture granularity (event timestamps may drop fractional
+			// digits) does not spuriously reject an event fired in the start second,
+			// while any event from an EARLIER second is still rejected as stale.
+			if ts.Before(start.Truncate(time.Second)) {
+				return fmt.Errorf("E2E-05: event at %s precedes the test start %s (stale event collected; only events at or after start are permitted)",
+					ts.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano))
 			}
 		}
 	}
@@ -366,14 +371,15 @@ func TestAccE2E01_AllPass(t *testing.T) {
 }
 
 // E2E-02: FAIL_ONE=1, fail_on_test_failure=true ⇒ apply exit≠0 ERR_TEST_FAILED.
-// Beyond the coded error, at the moment of the hard-gate failure this proves: (a)
+// Beyond the coded error this proves, at the moment of the hard-gate failure: (a)
 // the TRX results were still collected and the results_dir fully populated
 // (summary.json + logs); (b) the labdeploy_e2e_test resource is ABSENT from state
 // (a failed create is never committed); and (c) the deployment it depends on stays
-// committed and HEALTHY (service_status=running, deployed_version=1.1.0) — the
-// failing gate does not tear the deployment down. Post-state is asserted in
-// CheckDestroy against the state captured at the failed apply (ExpectError steps
-// skip Check); resource lookups resolve there even though live infra is gone.
+// committed and — proven by a LIVE health GET, not just cached state — still serves
+// v1.1.0. Step 1 drives the failing gate (ExpectError skips its Check); step 2
+// re-applies the deployment-only config (a no-op that keeps the same
+// labdeploy_deployment.dep) so a normal Check can probe the still-running service
+// immediately after the failed test run, before the framework destroys it.
 func TestAccE2E02_FailHardGate(t *testing.T) {
 	accPreCheck(t)
 	e2eSetup(t)
@@ -382,25 +388,37 @@ func TestAccE2E02_FailHardGate(t *testing.T) {
 	dep := e2eDeployment(t, at)
 	tr := testRunSpec(t, at, "1.1.0", dest, "trx", vstestRunner(1800, map[string]string{"FAIL_ONE": "1"}), "")
 	cfg := accE2EConfig(dep, tr, `  fail_on_test_failure = true`+"\n  triggers = { run = \"1\" }")
+	// Deployment-only config with the SAME resource address as cfg's deployment
+	// block, so applying it after the failed step is a no-op that leaves the live
+	// service untouched (never a destroy/replace).
+	depOnly := testAccProviderConfig + fmt.Sprintf("\nresource \"labdeploy_deployment\" \"dep\" {\n  spec = <<-EOT\n%sEOT\n}\n", dep)
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-		Steps: []resource.TestStep{{
-			Config:      cfg,
-			ExpectError: mustRe(`ERR_TEST_FAILED`),
-		}},
-		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
-			// (a) collect-then-fail: results populated + TRX collected despite the error.
-			checkResultsPopulated(dest, "E2E-02: results_dir must be fully populated despite the hard-gate failure"),
-			func(*terraform.State) error { return checkTrxUnder(dest) },
-			// (b) the failed test-resource create is never committed to state.
-			checkStateResource("labdeploy_e2e_test.e2e", false, nil),
-			// (c) the deployment remains committed and healthy through the failure.
-			checkStateResource("labdeploy_deployment.dep", true, map[string]string{
-				"service_status":   "running",
-				"deployed_version": "1.1.0",
-			}),
-			checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
-		),
+		Steps: []resource.TestStep{
+			{
+				Config:      cfg,
+				ExpectError: mustRe(`ERR_TEST_FAILED`),
+			},
+			{
+				// No-op re-apply of the deployment only; Check runs against the live
+				// post-failure system.
+				Config: depOnly,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					// (a) collect-then-fail: results populated + TRX collected despite the error.
+					checkResultsPopulated(dest, "E2E-02: results_dir must be fully populated despite the hard-gate failure"),
+					func(*terraform.State) error { return checkTrxUnder(dest) },
+					// (b) the failed test-resource create is never committed to state.
+					checkStateResource("labdeploy_e2e_test.e2e", false, nil),
+					// (c) the deployment remains committed and, proven LIVE, still serves v1.1.0.
+					checkStateResource("labdeploy_deployment.dep", true, map[string]string{
+						"service_status":   "running",
+						"deployed_version": "1.1.0",
+					}),
+					checkHealthBody(at, healthURL(8080), "v=1.1.0"),
+				),
+			},
+		},
+		CheckDestroy: checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
 	})
 }
 

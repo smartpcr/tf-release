@@ -81,6 +81,9 @@ type workflowRun struct {
 	CreatedAt  string `json:"created_at"`
 	Event      string `json:"event"`
 	HeadBranch string `json:"head_branch"`
+	Actor      struct {
+		Login string `json:"login"`
+	} `json:"actor"`
 }
 
 // normRef strips a refs/heads/ prefix so a dispatch ref ("main" or
@@ -117,22 +120,59 @@ func (c *GitHubClient) LatestRunID(ctx context.Context, workflowFile string) (in
 	return max, nil
 }
 
+// AuthenticatedLogin returns the login of the user/identity the client's token
+// authenticates as (GET /user, outside the /repos prefix). Used to pin a dispatched
+// run to THIS test's actor so a concurrent dispatch by another identity is excluded.
+func (c *GitHubClient) AuthenticatedLogin(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GET /user: status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		Login string `json:"login"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(out.Login) == "" {
+		return "", fmt.Errorf("GET /user returned an empty login")
+	}
+	return out.Login, nil
+}
+
 // FindRunAfter polls for the NEW workflow_dispatch run created after afterID for
-// workflowFile on ref, and returns its id. Run ids are monotonic, so selecting the
-// smallest id strictly greater than the pre-dispatch max — and requiring
-// event=workflow_dispatch with a matching head_branch — pins the run THIS test
-// created, never a concurrent dispatch sharing a creation-time window.
-func (c *GitHubClient) FindRunAfter(ctx context.Context, workflowFile, ref string, afterID int64, timeout time.Duration) (int64, error) {
+// workflowFile on ref, and returns its id. It pins the run THIS test created by
+// requiring, in addition to id>afterID and event=workflow_dispatch: a matching
+// head_branch, created_at at or after the pre-dispatch instant `since`, and
+// actor.login == the dispatching identity `actor`. Because a concurrent dispatch of
+// the SAME workflow on the SAME branch by the SAME identity cannot be told apart, it
+// collects ALL matching candidates and fails LOUDLY if more than one matches (an
+// ambiguous window) rather than silently choosing the smallest id.
+func (c *GitHubClient) FindRunAfter(ctx context.Context, workflowFile, ref string, afterID int64, since time.Time, actor string, timeout time.Duration) (int64, error) {
 	wantRef := normRef(ref)
+	wantActor := strings.TrimSpace(actor)
+	sinceFloor := since.Add(-5 * time.Second) // absorb GitHub's created_at second-rounding
 	deadline := time.Now().Add(timeout)
 	for {
-		resp, raw, err := c.do(ctx, http.MethodGet, "/actions/workflows/"+workflowFile+"/runs?event=workflow_dispatch&per_page=30", nil)
+		resp, raw, err := c.do(ctx, http.MethodGet, "/actions/workflows/"+workflowFile+"/runs?event=workflow_dispatch&per_page=50", nil)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			var out struct {
 				Runs []workflowRun `json:"workflow_runs"`
 			}
 			if json.Unmarshal(raw, &out) == nil {
-				var best int64
+				var matches []int64
 				for _, r := range out.Runs {
 					if r.ID <= afterID || r.Event != "workflow_dispatch" {
 						continue
@@ -140,17 +180,25 @@ func (c *GitHubClient) FindRunAfter(ctx context.Context, workflowFile, ref strin
 					if wantRef != "" && normRef(r.HeadBranch) != wantRef {
 						continue
 					}
-					if best == 0 || r.ID < best {
-						best = r.ID
+					if wantActor != "" && !strings.EqualFold(r.Actor.Login, wantActor) {
+						continue
 					}
+					if ts, terr := time.Parse(time.RFC3339, r.CreatedAt); terr == nil && ts.Before(sinceFloor) {
+						continue
+					}
+					matches = append(matches, r.ID)
 				}
-				if best != 0 {
-					return best, nil
+				if len(matches) > 1 {
+					return 0, fmt.Errorf("[ERR_RUN_AMBIGUOUS] %d new workflow_dispatch runs for %s@%s (id>%d, actor=%s, since=%s) match this test's window: %v — cannot pin a single run; serialize dispatches or use a unique input marker",
+						len(matches), workflowFile, wantRef, afterID, wantActor, since.Format(time.RFC3339), matches)
+				}
+				if len(matches) == 1 {
+					return matches[0], nil
 				}
 			}
 		}
 		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("[ERR_RUN_NOT_FOUND] no new workflow_dispatch run for %s@%s (id>%d) within %s", workflowFile, wantRef, afterID, timeout)
+			return 0, fmt.Errorf("[ERR_RUN_NOT_FOUND] no new workflow_dispatch run for %s@%s (id>%d, actor=%s) within %s", workflowFile, wantRef, afterID, wantActor, timeout)
 		}
 		select {
 		case <-ctx.Done():

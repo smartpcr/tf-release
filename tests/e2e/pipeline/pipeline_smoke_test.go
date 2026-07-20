@@ -40,14 +40,19 @@ func TestPIP_01_GitHubDeployPublishesResults(t *testing.T) {
 	// generate before we dispatch it.
 	requireRemoteWorkflowCurrent(ctx, t, owner, repo, branch, token)
 
+	actor, err := gh.AuthenticatedLogin(ctx)
+	if err != nil {
+		t.Fatalf("resolve dispatching actor: %v", err)
+	}
 	before, err := gh.LatestRunID(ctx, workflow)
 	if err != nil {
 		t.Fatalf("baseline run id: %v", err)
 	}
-	if _, err := gh.DispatchWorkflow(ctx, workflow, branch, map[string]string{"version": version, "checksum": checksum}); err != nil {
+	since, err := gh.DispatchWorkflow(ctx, workflow, branch, map[string]string{"version": version, "checksum": checksum})
+	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	runID, err := gh.FindRunAfter(ctx, workflow, branch, before, 3*time.Minute)
+	runID, err := gh.FindRunAfter(ctx, workflow, branch, before, since, actor, 3*time.Minute)
 	if err != nil {
 		t.Fatalf("find run: %v", err)
 	}
@@ -70,6 +75,27 @@ func TestPIP_01_GitHubDeployPublishesResults(t *testing.T) {
 		t.Fatalf("download artifact %q: %v", artName, err)
 	}
 	assertResultsArtifact(t, zipBytes, artName)
+
+	// DESIGN §18.10 (item 5): the deploy job must ECHO the Terraform `test_summary`
+	// output into the GitHub job summary. There is no REST API to read a rendered
+	// step summary, but the shipped workflow writes it via `terraform output -raw
+	// test_summary | tee -a "$GITHUB_STEP_SUMMARY"`, so the same content is also
+	// emitted to the job log under a stable marker heading. Assert the deploy job log
+	// carries that marker AND a non-empty summary line — proving the contract, not
+	// just that an artifact was uploaded.
+	jobs, err := gh.JobDetails(ctx, runID)
+	if err != nil {
+		t.Fatalf("job details: %v", err)
+	}
+	deploy, ok := jobByName(jobs, "deploy")
+	if !ok {
+		t.Fatalf("PIP-01 run %d has no deploy job; jobs=%v", runID, jobNames(jobs))
+	}
+	deployLog, err := gh.DownloadJobLog(ctx, deploy.ID)
+	if err != nil {
+		t.Fatalf("download deploy job log: %v", err)
+	}
+	assertJobSummaryEchoesTerraformSummary(t, deployLog)
 }
 
 // PIP-02: GitHub deploy failure triggers auto-rollback.
@@ -95,14 +121,19 @@ func TestPIP_02_GitHubDeployFailureTriggersRollback(t *testing.T) {
 
 	requireRemoteWorkflowCurrent(ctx, t, owner, repo, branch, token)
 
+	actor, err := gh.AuthenticatedLogin(ctx)
+	if err != nil {
+		t.Fatalf("resolve dispatching actor: %v", err)
+	}
 	before, err := gh.LatestRunID(ctx, workflow)
 	if err != nil {
 		t.Fatalf("baseline run id: %v", err)
 	}
-	if _, err := gh.DispatchWorkflow(ctx, workflow, branch, map[string]string{"version": badVersion, "checksum": badChecksum}); err != nil {
+	since, err := gh.DispatchWorkflow(ctx, workflow, branch, map[string]string{"version": badVersion, "checksum": badChecksum})
+	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	runID, err := gh.FindRunAfter(ctx, workflow, branch, before, 3*time.Minute)
+	runID, err := gh.FindRunAfter(ctx, workflow, branch, before, since, actor, 3*time.Minute)
 	if err != nil {
 		t.Fatalf("find run: %v", err)
 	}
@@ -153,19 +184,32 @@ func TestPIP_03_AzureDevOpsPassPublishesTests(t *testing.T) {
 	}
 	version := envOr("LD_PIP_GOOD_VERSION", "1.1.0")
 	checksum := labEnv(t, "LD_PIP_GOOD_CHECKSUM")
+	wantRepo := labEnv(t, "LD_ADO_REPO")
+	wantBranch := envOr("LD_ADO_BRANCH", "refs/heads/main")
 
 	ado := NewADOClient(org, project, pat)
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
 
-	// Item 13: refuse to smoke-test a pipeline whose definition is not the shipped
-	// azure-pipelines.yml.
-	yamlPath, err := ado.PipelineYAMLPath(ctx, pipelineID)
+	// Item 13/6: refuse to smoke-test a pipeline unless its definition genuinely IS
+	// the shipped azure-pipelines.yml bound to the expected lab repository and
+	// branch. A path suffix alone lets an unrelated pipeline in another repo satisfy
+	// the check, so also assert repo name, repo type, and default branch.
+	def, err := ado.GetBuildDefinition(ctx, pipelineID)
 	if err != nil {
-		t.Fatalf("resolve pipeline %d YAML path: %v", pipelineID, err)
+		t.Fatalf("resolve pipeline %d definition: %v", pipelineID, err)
 	}
-	if !strings.HasSuffix(strings.ReplaceAll(yamlPath, "\\", "/"), "azure-pipelines.yml") {
-		t.Fatalf("PIP-03 pipeline %d points at %q, want the shipped examples/pipelines/azure-pipelines.yml", pipelineID, yamlPath)
+	if !strings.HasSuffix(strings.ReplaceAll(def.YamlFilename, "\\", "/"), "azure-pipelines.yml") {
+		t.Fatalf("PIP-03 pipeline %d runs %q, want the shipped examples/pipelines/azure-pipelines.yml", pipelineID, def.YamlFilename)
+	}
+	if !strings.EqualFold(def.RepoName, wantRepo) {
+		t.Fatalf("PIP-03 pipeline %d is bound to repo %q, want %q (set LD_ADO_REPO to the lab repo)", pipelineID, def.RepoName, wantRepo)
+	}
+	if strings.TrimSpace(def.RepoType) == "" {
+		t.Fatalf("PIP-03 pipeline %d definition has no repository type; cannot confirm it is a repo-backed YAML pipeline", pipelineID)
+	}
+	if !strings.EqualFold(def.DefaultBranch, wantBranch) {
+		t.Fatalf("PIP-03 pipeline %d default branch %q, want %q (set LD_ADO_BRANCH)", pipelineID, def.DefaultBranch, wantBranch)
 	}
 
 	runID, err := ado.QueueRun(ctx, pipelineID, map[string]string{"version": version, "checksum": checksum})
@@ -245,7 +289,40 @@ func assertResultsArtifact(t *testing.T, zipBytes []byte, name string) {
 	}
 }
 
-// jobByName returns the job with the given name (case-insensitive).
+// summaryMarker is the heading the shipped deploy job writes to
+// $GITHUB_STEP_SUMMARY (and, via tee, to the job log) immediately before echoing
+// the Terraform `test_summary` output. Kept in sync with
+// examples/pipelines/github-deploy.yml.
+const summaryMarker = "### labdeploy test summary"
+
+// assertJobSummaryEchoesTerraformSummary proves DESIGN §18.10's contract that the
+// deploy job's GitHub job summary echoes the Terraform `test_summary` output. It
+// requires the marker heading AND a non-empty payload line following it in the
+// deploy job log (the tee'd copy of the step summary).
+func assertJobSummaryEchoesTerraformSummary(t *testing.T, deployLog string) {
+	t.Helper()
+	idx := strings.Index(deployLog, summaryMarker)
+	if idx < 0 {
+		t.Fatalf("PIP-01 deploy job summary does not echo the Terraform test_summary output: marker %q absent from the deploy job log", summaryMarker)
+	}
+	rest := deployLog[idx+len(summaryMarker):]
+	var payload string
+	for _, line := range strings.Split(rest, "\n") {
+		// GitHub prefixes each log line with a timestamp; take the text after it.
+		if i := strings.Index(line, " "); i >= 0 {
+			line = line[i+1:]
+		}
+		if strings.TrimSpace(line) != "" {
+			payload = strings.TrimSpace(line)
+			break
+		}
+	}
+	if payload == "" {
+		t.Fatalf("PIP-01 deploy job summary marker %q is present but the echoed Terraform test_summary payload is empty", summaryMarker)
+	}
+}
+
+
 func jobByName(jobs []JobInfo, name string) (JobInfo, bool) {
 	for _, j := range jobs {
 		if strings.EqualFold(j.Name, name) {

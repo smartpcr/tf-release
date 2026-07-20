@@ -85,6 +85,51 @@ func (c *ADOClient) PipelineYAMLPath(ctx context.Context, pipelineID int) (strin
 	return out.Configuration.Path, nil
 }
 
+// BuildDefinition captures the identity fields of an ADO build/YAML pipeline
+// definition that PIP-03 asserts before queueing: the YAML file it runs, and the
+// repository it is bound to. Sourced from the Build Definitions API, which (unlike
+// the leaner Pipelines API) exposes the repository name/type/defaultBranch.
+type BuildDefinition struct {
+	YamlFilename  string
+	RepoName      string
+	RepoType      string
+	DefaultBranch string
+}
+
+// GetBuildDefinition returns the identity of build/pipeline definition id. PIP-03
+// uses it to refuse smoke-testing any pipeline that is not the shipped
+// azure-pipelines.yml bound to the expected lab repository and branch — an id alone
+// is not proof of identity.
+func (c *ADOClient) GetBuildDefinition(ctx context.Context, id int) (BuildDefinition, error) {
+	url := fmt.Sprintf("https://dev.azure.com/%s/%s/_apis/build/definitions/%d?api-version=7.1", c.Organization, c.Project, id)
+	resp, raw, err := c.do(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return BuildDefinition{}, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return BuildDefinition{}, fmt.Errorf("get build definition %d: status %d: %s", id, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		Process struct {
+			YamlFilename string `json:"yamlFilename"`
+		} `json:"process"`
+		Repository struct {
+			Name          string `json:"name"`
+			Type          string `json:"type"`
+			DefaultBranch string `json:"defaultBranch"`
+		} `json:"repository"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return BuildDefinition{}, err
+	}
+	return BuildDefinition{
+		YamlFilename:  out.Process.YamlFilename,
+		RepoName:      out.Repository.Name,
+		RepoType:      out.Repository.Type,
+		DefaultBranch: out.Repository.DefaultBranch,
+	}, nil
+}
+
 // QueueRun queues a run of pipelineID with the given template parameters
 // (version, checksum) and returns the run id.
 func (c *ADOClient) QueueRun(ctx context.Context, pipelineID int, params map[string]string) (int, error) {
