@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -745,7 +746,13 @@ func capDeployCaptured(eng *engine.Engine, d *spec.Deployment) (*engine.Status, 
 	out, err := eng.Deploy(ctx, d)
 	steps, cerr := cluCaptureSteps(&buf)
 	if cerr != nil {
-		steps = nil
+		// A tflog decode fault is a capture-harness failure, not a deploy
+		// outcome; propagate it (joined with any deploy error) instead of
+		// silently discarding it. cluCaptureSteps already returns nil steps on
+		// error, so the CLU-02/03/04/08 checks that read steps would otherwise
+		// fail with a misleading "saw 0 MOVE_GROUP"/"no HEALTH step" that hides
+		// the real decode error. Mirrors whenApply, which propagates cerr.
+		return out, nil, errors.Join(err, cerr)
 	}
 	return out, steps, err
 }
