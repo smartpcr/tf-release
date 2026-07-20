@@ -1,0 +1,153 @@
+# Azure Pipelines — Stage 9.2 "Cluster and Pipeline Acceptance"
+# lab acceptance gate for the release provider.
+#
+# Both scenarios are `[proof: lab]`:
+#
+#   * Cluster rolling acceptance (CLU-01..08) needs a real two/three-node WSFC
+#     lab (C2/C3 — Windows Server 2022 failover cluster over WinRM https), and
+#   * Pipeline smoke (PIP-01..03) needs live GitHub Actions + Azure DevOps
+#     runners against W1 that actually dispatch a workflow, publish results and
+#     recover the target to v=1.1.0 on a failed deploy.
+#
+# Forge's ordinary bare gate has no cluster, no admin, and no live GH/ADO
+# runners, so those host legs cannot execute there — on the bare gate the SAME
+# acceptance PROPERTIES are proven reproducibly (the real engine driven over an
+# in-process scripted WSFC transport for the full CLU-01..08 matrix, plus the
+# shipped pipelines + registration code asserted structurally). THIS pipeline
+# runs the host legs for real: it invokes the Stage 9.2 godog suite under
+# TF_ACC=1 with the C2/C3 cluster + artifact wiring, then the live PIP-01..03
+# smoke tests with the GH/ADO connection wiring. It is manual / scheduled
+# because it drives real lab hardware and live runners.
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: "0 3 * * *"
+    displayName: Nightly cluster + pipeline lab acceptance
+    branches:
+      include:
+        - feature/release
+        - main
+    always: true
+
+pool:
+  # Self-hosted Windows orchestrator that can reach the WSFC cluster nodes
+  # (WinRM), the W1 target and the artifact/tf mirror. Configure this pool with
+  # agents inside the lab network.
+  name: labdeploy-lab
+  demands:
+    - Agent.OS -equals Windows_NT
+
+variables:
+  # Secret group holding the LABDEPLOY_ACC_* cluster connection secrets, the
+  # sample-svc checksums, and the live GH/ADO pipeline credentials.
+  - group: labdeploy-lab-acceptance
+  - group: labdeploy-pipeline-smoke
+  - name: CGO_ENABLED
+    value: "0"
+  # Turn the TF_ACC-gated C2/C3 + live-pipeline lab paths ON.
+  - name: TF_ACC
+    value: "1"
+
+steps:
+  - task: GoTool@0
+    displayName: Set up Go 1.22
+    inputs:
+      version: "1.22"
+
+  - powershell: |
+      $missing = @()
+      foreach ($v in @(
+        'LABDEPLOY_ACC_CLU_HOSTS','LABDEPLOY_ACC_CLU_USER','LABDEPLOY_PASSWORD',
+        'LABDEPLOY_ACC_ARTIFACT_BASE_URL','LABDEPLOY_ACC_SHA_1_0_0_ZIP',
+        'LABDEPLOY_ACC_SHA_1_1_0_ZIP','LABDEPLOY_ACC_CLU_HEALTH_URL',
+        'LABDEPLOY_ACC_CLU_BAD_VERSION','LABDEPLOY_ACC_CLU_BAD_ZIP',
+        'LD_GH_LAB_REPO','LD_GH_TOKEN',
+        'LD_PIP_GOOD_CHECKSUM','LD_PIP_BAD_VERSION','LD_PIP_BAD_CHECKSUM','LD_PIP_HEALTH_URL',
+        'LD_ADO_ORG','LD_ADO_PROJECT',
+        'LD_ADO_PAT','LD_ADO_PIPELINE_ID')) {
+        if (-not (Get-Item "Env:$v" -ErrorAction SilentlyContinue).Value) { $missing += $v }
+      }
+      if ($missing.Count -gt 0) {
+        Write-Error "Missing required lab variables: $($missing -join ', ')"
+        exit 1
+      }
+    displayName: Preflight — required cluster + pipeline lab variables present
+    env:
+      LABDEPLOY_ACC_CLU_HOSTS: $(LABDEPLOY_ACC_CLU_HOSTS)
+      LABDEPLOY_ACC_CLU_USER: $(LABDEPLOY_ACC_CLU_USER)
+      LABDEPLOY_PASSWORD: $(LABDEPLOY_PASSWORD)
+      LABDEPLOY_ACC_ARTIFACT_BASE_URL: $(LABDEPLOY_ACC_ARTIFACT_BASE_URL)
+      LABDEPLOY_ACC_SHA_1_0_0_ZIP: $(LABDEPLOY_ACC_SHA_1_0_0_ZIP)
+      LABDEPLOY_ACC_SHA_1_1_0_ZIP: $(LABDEPLOY_ACC_SHA_1_1_0_ZIP)
+      LABDEPLOY_ACC_CLU_HEALTH_URL: $(LABDEPLOY_ACC_CLU_HEALTH_URL)
+      LABDEPLOY_ACC_CLU_BAD_VERSION: $(LABDEPLOY_ACC_CLU_BAD_VERSION)
+      LABDEPLOY_ACC_CLU_BAD_ZIP: $(LABDEPLOY_ACC_CLU_BAD_ZIP)
+      LD_GH_LAB_REPO: $(LD_GH_LAB_REPO)
+      LD_GH_TOKEN: $(LD_GH_TOKEN)
+      LD_PIP_GOOD_CHECKSUM: $(LD_PIP_GOOD_CHECKSUM)
+      LD_PIP_BAD_VERSION: $(LD_PIP_BAD_VERSION)
+      LD_PIP_BAD_CHECKSUM: $(LD_PIP_BAD_CHECKSUM)
+      LD_PIP_HEALTH_URL: $(LD_PIP_HEALTH_URL)
+      LD_ADO_ORG: $(LD_ADO_ORG)
+      LD_ADO_PROJECT: $(LD_ADO_PROJECT)
+      LD_ADO_PAT: $(LD_ADO_PAT)
+      LD_ADO_PIPELINE_ID: $(LD_ADO_PIPELINE_ID)
+
+  - powershell: |
+      go test -tags e2e -count=1 -timeout 60m -v `
+        -run TestE2E_lab_acceptance_gate_cluster_and_pipeline_acceptance `
+        ./test/e2e/release-RELEASE-PROVIDER/...
+    displayName: Stage 9.2 godog — CLU-01..08 + PIP-01..03 (TF_ACC=1, C2/C3 + live GH/ADO)
+    env:
+      TF_ACC: $(TF_ACC)
+      CGO_ENABLED: $(CGO_ENABLED)
+      # --- C2/C3 WSFC cluster (WinRM https) ---
+      LABDEPLOY_ACC_CLU_HOSTS: $(LABDEPLOY_ACC_CLU_HOSTS)
+      LABDEPLOY_ACC_CLU_USER: $(LABDEPLOY_ACC_CLU_USER)
+      LABDEPLOY_PASSWORD: $(LABDEPLOY_PASSWORD)
+      LABDEPLOY_ACC_CLU_HEALTH_URL: $(LABDEPLOY_ACC_CLU_HEALTH_URL)
+      # --- Artifact host + sample-svc checksums ---
+      LABDEPLOY_ACC_ARTIFACT_BASE_URL: $(LABDEPLOY_ACC_ARTIFACT_BASE_URL)
+      LABDEPLOY_ACC_SHA_1_0_0_ZIP: $(LABDEPLOY_ACC_SHA_1_0_0_ZIP)
+      LABDEPLOY_ACC_SHA_1_1_0_ZIP: $(LABDEPLOY_ACC_SHA_1_1_0_ZIP)
+      # --- Deliberately-unhealthy release for the CLU-04 rollback proof ---
+      LABDEPLOY_ACC_CLU_BAD_VERSION: $(LABDEPLOY_ACC_CLU_BAD_VERSION)
+      LABDEPLOY_ACC_CLU_BAD_ZIP: $(LABDEPLOY_ACC_CLU_BAD_ZIP)
+      # --- Live GitHub Actions smoke (PIP-01/02) ---
+      LD_GH_LAB_REPO: $(LD_GH_LAB_REPO)
+      LD_GH_TOKEN: $(LD_GH_TOKEN)
+      LD_GH_LAB_WORKFLOW: $(LD_GH_LAB_WORKFLOW)
+      LD_GH_LAB_BRANCH: $(LD_GH_LAB_BRANCH)
+      LD_PIP_GOOD_VERSION: $(LD_PIP_GOOD_VERSION)
+      LD_PIP_GOOD_CHECKSUM: $(LD_PIP_GOOD_CHECKSUM)
+      LD_PIP_BAD_VERSION: $(LD_PIP_BAD_VERSION)
+      LD_PIP_BAD_CHECKSUM: $(LD_PIP_BAD_CHECKSUM)
+      LD_PIP_HEALTH_URL: $(LD_PIP_HEALTH_URL)
+      # --- Live Azure DevOps smoke (PIP-03) ---
+      LD_ADO_ORG: $(LD_ADO_ORG)
+      LD_ADO_PROJECT: $(LD_ADO_PROJECT)
+      LD_ADO_PAT: $(LD_ADO_PAT)
+      LD_ADO_PIPELINE_ID: $(LD_ADO_PIPELINE_ID)
+
+  - powershell: |
+      go test -tags e2e -count=1 -timeout 60m -v `
+        ./tests/e2e/pipeline/...
+    displayName: Live PIP-01..03 pipeline smoke (GitHub Actions + Azure DevOps runners)
+    env:
+      TF_ACC: $(TF_ACC)
+      CGO_ENABLED: $(CGO_ENABLED)
+      LD_GH_LAB_REPO: $(LD_GH_LAB_REPO)
+      LD_GH_TOKEN: $(LD_GH_TOKEN)
+      LD_GH_LAB_WORKFLOW: $(LD_GH_LAB_WORKFLOW)
+      LD_GH_LAB_BRANCH: $(LD_GH_LAB_BRANCH)
+      LD_PIP_GOOD_VERSION: $(LD_PIP_GOOD_VERSION)
+      LD_PIP_GOOD_CHECKSUM: $(LD_PIP_GOOD_CHECKSUM)
+      LD_PIP_BAD_VERSION: $(LD_PIP_BAD_VERSION)
+      LD_PIP_BAD_CHECKSUM: $(LD_PIP_BAD_CHECKSUM)
+      LD_PIP_HEALTH_URL: $(LD_PIP_HEALTH_URL)
+      LD_ADO_ORG: $(LD_ADO_ORG)
+      LD_ADO_PROJECT: $(LD_ADO_PROJECT)
+      LD_ADO_PAT: $(LD_ADO_PAT)
+      LD_ADO_PIPELINE_ID: $(LD_ADO_PIPELINE_ID)

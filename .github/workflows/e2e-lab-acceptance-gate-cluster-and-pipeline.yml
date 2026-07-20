@@ -1,0 +1,111 @@
+name: e2e-lab-acceptance-gate-cluster-and-pipeline
+
+# Cluster and Pipeline Acceptance (Stage 9.2) is a `[proof: lab]` gate. Its two
+# authoritative scenarios require:
+#
+#   * a real two/three-node WSFC failover cluster (C2/C3 — Windows Server 2022,
+#     WinRM https) for the CLU-01..08 rolling acceptance, and
+#   * live GitHub Actions + Azure DevOps runners against W1 for the PIP-01..03
+#     smoke (dispatch a workflow, publish a results artifact, and recover the
+#     target to v=1.1.0 when a deploy fails).
+#
+# Forge's ordinary bare gate has no cluster and no live runners, so on the bare
+# gate the SAME acceptance PROPERTIES are proven reproducibly (the real rolling
+# engine driven over an in-process scripted WSFC transport for the full
+# CLU-01..08 matrix, plus the shipped pipelines + registration code asserted
+# structurally). This workflow runs the host legs FOR REAL under TF_ACC=1 on a
+# SELF-HOSTED runner with lab access, wiring the cluster + live GH/ADO secrets.
+# It is manual / scheduled (not per-PR) because it drives real lab hardware and
+# live runners.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Nightly cluster + pipeline lab acceptance run (03:00 UTC).
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+  actions: write   # dispatch the lab deploy workflow for the live PIP smoke
+
+jobs:
+  cluster-and-pipeline-acceptance:
+    name: C2/C3 cluster + live GH/ADO pipeline acceptance (TF_ACC)
+    # A self-hosted Windows orchestrator that can reach the WSFC cluster nodes
+    # (WinRM), the W1 target, the artifact/tf mirror, and the GH/ADO APIs.
+    runs-on: [self-hosted, windows, labdeploy-lab]
+    env:
+      CGO_ENABLED: "0"
+      # Turn the TF_ACC-gated C2/C3 + live-pipeline lab paths ON. Without this
+      # the suite runs only the reproducible embedded core and the lab legs
+      # return early.
+      TF_ACC: "1"
+      # --- C2/C3 WSFC cluster (WinRM https) ---
+      LABDEPLOY_ACC_CLU_HOSTS: ${{ secrets.LABDEPLOY_ACC_CLU_HOSTS }}
+      LABDEPLOY_ACC_CLU_USER: ${{ secrets.LABDEPLOY_ACC_CLU_USER }}
+      LABDEPLOY_PASSWORD: ${{ secrets.LABDEPLOY_PASSWORD }}
+      LABDEPLOY_ACC_CLU_HEALTH_URL: ${{ secrets.LABDEPLOY_ACC_CLU_HEALTH_URL }}
+      # --- Artifact host + sample-svc checksums (served to the cluster nodes) ---
+      LABDEPLOY_ACC_ARTIFACT_BASE_URL: ${{ secrets.LABDEPLOY_ACC_ARTIFACT_BASE_URL }}
+      LABDEPLOY_ACC_SHA_1_0_0_ZIP: ${{ secrets.LABDEPLOY_ACC_SHA_1_0_0_ZIP }}
+      LABDEPLOY_ACC_SHA_1_1_0_ZIP: ${{ secrets.LABDEPLOY_ACC_SHA_1_1_0_ZIP }}
+      # --- Deliberately-unhealthy release for the CLU-04 rollback proof ---
+      LABDEPLOY_ACC_CLU_BAD_VERSION: ${{ secrets.LABDEPLOY_ACC_CLU_BAD_VERSION }}
+      LABDEPLOY_ACC_CLU_BAD_ZIP: ${{ secrets.LABDEPLOY_ACC_CLU_BAD_ZIP }}
+      # --- Live GitHub Actions smoke (PIP-01/02) ---
+      LD_GH_LAB_REPO: ${{ secrets.LD_GH_LAB_REPO }}
+      LD_GH_TOKEN: ${{ secrets.LD_GH_TOKEN }}
+      LD_GH_LAB_WORKFLOW: ${{ secrets.LD_GH_LAB_WORKFLOW }}
+      LD_GH_LAB_BRANCH: ${{ secrets.LD_GH_LAB_BRANCH }}
+      LD_PIP_GOOD_VERSION: ${{ secrets.LD_PIP_GOOD_VERSION }}
+      LD_PIP_GOOD_CHECKSUM: ${{ secrets.LD_PIP_GOOD_CHECKSUM }}
+      LD_PIP_BAD_VERSION: ${{ secrets.LD_PIP_BAD_VERSION }}
+      LD_PIP_BAD_CHECKSUM: ${{ secrets.LD_PIP_BAD_CHECKSUM }}
+      LD_PIP_HEALTH_URL: ${{ secrets.LD_PIP_HEALTH_URL }}
+      # --- Live Azure DevOps smoke (PIP-03) ---
+      LD_ADO_ORG: ${{ secrets.LD_ADO_ORG }}
+      LD_ADO_PROJECT: ${{ secrets.LD_ADO_PROJECT }}
+      LD_ADO_PAT: ${{ secrets.LD_ADO_PAT }}
+      LD_ADO_PIPELINE_ID: ${{ secrets.LD_ADO_PIPELINE_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          check-latest: true
+
+      - name: Preflight — required cluster + pipeline secrets present
+        shell: pwsh
+        run: |
+          $missing = @()
+          foreach ($v in @(
+            'LABDEPLOY_ACC_CLU_HOSTS','LABDEPLOY_ACC_CLU_USER','LABDEPLOY_PASSWORD',
+            'LABDEPLOY_ACC_ARTIFACT_BASE_URL','LABDEPLOY_ACC_SHA_1_0_0_ZIP',
+            'LABDEPLOY_ACC_SHA_1_1_0_ZIP','LABDEPLOY_ACC_CLU_HEALTH_URL',
+            'LABDEPLOY_ACC_CLU_BAD_VERSION','LABDEPLOY_ACC_CLU_BAD_ZIP',
+            'LD_GH_LAB_REPO','LD_GH_TOKEN',
+            'LD_PIP_GOOD_CHECKSUM','LD_PIP_BAD_VERSION','LD_PIP_BAD_CHECKSUM','LD_PIP_HEALTH_URL',
+            'LD_ADO_ORG','LD_ADO_PROJECT',
+            'LD_ADO_PAT','LD_ADO_PIPELINE_ID')) {
+            if (-not (Get-Item "Env:$v" -ErrorAction SilentlyContinue).Value) { $missing += $v }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing required lab secrets: $($missing -join ', ')"
+            exit 1
+          }
+
+      - name: Stage 9.2 godog — CLU-01..08 + PIP-01..03 (TF_ACC=1, C2/C3 + live GH/ADO)
+        shell: pwsh
+        run: |
+          go test -tags e2e -count=1 -timeout 60m -v `
+            -run TestE2E_lab_acceptance_gate_cluster_and_pipeline_acceptance `
+            ./test/e2e/release-RELEASE-PROVIDER/...
+
+      - name: Live PIP-01..03 pipeline smoke (GitHub Actions + Azure DevOps runners)
+        shell: pwsh
+        run: |
+          go test -tags e2e -count=1 -timeout 60m -v `
+            ./tests/e2e/pipeline/...
