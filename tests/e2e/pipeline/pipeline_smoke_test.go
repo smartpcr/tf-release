@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -186,6 +187,7 @@ func TestPIP_03_AzureDevOpsPassPublishesTests(t *testing.T) {
 	checksum := labEnv(t, "LD_PIP_GOOD_CHECKSUM")
 	wantRepo := labEnv(t, "LD_ADO_REPO")
 	wantBranch := envOr("LD_ADO_BRANCH", "refs/heads/main")
+	wantRepoType := envOr("LD_ADO_REPO_TYPE", "TfsGit")
 
 	ado := NewADOClient(org, project, pat)
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
@@ -205,8 +207,8 @@ func TestPIP_03_AzureDevOpsPassPublishesTests(t *testing.T) {
 	if !strings.EqualFold(def.RepoName, wantRepo) {
 		t.Fatalf("PIP-03 pipeline %d is bound to repo %q, want %q (set LD_ADO_REPO to the lab repo)", pipelineID, def.RepoName, wantRepo)
 	}
-	if strings.TrimSpace(def.RepoType) == "" {
-		t.Fatalf("PIP-03 pipeline %d definition has no repository type; cannot confirm it is a repo-backed YAML pipeline", pipelineID)
+	if !strings.EqualFold(strings.TrimSpace(def.RepoType), wantRepoType) {
+		t.Fatalf("PIP-03 pipeline %d repository type %q, want %q (a repo-backed YAML pipeline; set LD_ADO_REPO_TYPE if the lab uses a different SCM)", pipelineID, def.RepoType, wantRepoType)
 	}
 	if !strings.EqualFold(def.DefaultBranch, wantBranch) {
 		t.Fatalf("PIP-03 pipeline %d default branch %q, want %q (set LD_ADO_BRANCH)", pipelineID, def.DefaultBranch, wantBranch)
@@ -290,38 +292,93 @@ func assertResultsArtifact(t *testing.T, zipBytes []byte, name string) {
 }
 
 // summaryMarker is the heading the shipped deploy job writes to
-// $GITHUB_STEP_SUMMARY (and, via tee, to the job log) immediately before echoing
-// the Terraform `test_summary` output. Kept in sync with
+// $GITHUB_STEP_SUMMARY (and, via tee, to the job log) immediately before the
+// sentinel-delimited Terraform `test_summary` output. Kept in sync with
 // examples/pipelines/github-deploy.yml.
 const summaryMarker = "### labdeploy test summary"
 
-// assertJobSummaryEchoesTerraformSummary proves DESIGN §18.10's contract that the
-// deploy job's GitHub job summary echoes the Terraform `test_summary` output. It
-// requires the marker heading AND a non-empty payload line following it in the
-// deploy job log (the tee'd copy of the step summary).
-func assertJobSummaryEchoesTerraformSummary(t *testing.T, deployLog string) {
-	t.Helper()
-	idx := strings.Index(deployLog, summaryMarker)
-	if idx < 0 {
-		t.Fatalf("PIP-01 deploy job summary does not echo the Terraform test_summary output: marker %q absent from the deploy job log", summaryMarker)
-	}
-	rest := deployLog[idx+len(summaryMarker):]
-	var payload string
-	for _, line := range strings.Split(rest, "\n") {
-		// GitHub prefixes each log line with a timestamp; take the text after it.
-		if i := strings.Index(line, " "); i >= 0 {
+// Bare sentinel lines the deploy job echoes AROUND the Terraform test_summary
+// output. They appear as literal DATA lines in the executed job output — never as
+// bare lines in the logged script source, where they only occur inside
+// `echo "LABDEPLOY_SUMMARY_BEGIN"` — so a log reader can distinguish the two.
+const (
+	summaryBegin = "LABDEPLOY_SUMMARY_BEGIN"
+	summaryEnd   = "LABDEPLOY_SUMMARY_END"
+)
+
+// stripLogLinePrefix removes GitHub's per-line RFC3339 UTC timestamp prefix (raw
+// job logs are emitted as "<timestamp> <content>") and trims surrounding space, so
+// a content line can be exact-matched against a sentinel.
+func stripLogLinePrefix(line string) string {
+	line = strings.TrimRight(line, "\r")
+	if i := strings.IndexByte(line, ' '); i > 0 {
+		if _, err := time.Parse(time.RFC3339, line[:i]); err == nil {
 			line = line[i+1:]
 		}
-		if strings.TrimSpace(line) != "" {
-			payload = strings.TrimSpace(line)
-			break
-		}
 	}
-	if payload == "" {
-		t.Fatalf("PIP-01 deploy job summary marker %q is present but the echoed Terraform test_summary payload is empty", summaryMarker)
-	}
+	return strings.TrimSpace(line)
 }
 
+// parseJobSummaryEcho extracts the Terraform test_summary payload the deploy job
+// echoed into its GitHub job summary. It scans for a BARE summaryBegin line (which
+// only occurs in the executed output, not the logged `echo "LABDEPLOY_SUMMARY_BEGIN"`
+// script line) and returns the non-blank content up to the BARE summaryEnd line. An
+// absent block, an unterminated block, or an empty payload (e.g. `terraform output`
+// produced nothing) is an error — proving the contract, not just that the marker was
+// logged as part of the script.
+func parseJobSummaryEcho(log string) (string, error) {
+	inBlock := false
+	var content []string
+	for _, raw := range strings.Split(log, "\n") {
+		line := stripLogLinePrefix(raw)
+		if !inBlock {
+			if line == summaryBegin {
+				inBlock = true
+			}
+			continue
+		}
+		if line == summaryEnd {
+			payload := strings.TrimSpace(strings.Join(content, "\n"))
+			if payload == "" {
+				return "", fmt.Errorf("the deploy job summary block (%s..%s) is empty: `terraform output -raw test_summary` produced no content", summaryBegin, summaryEnd)
+			}
+			return payload, nil
+		}
+		content = append(content, line)
+	}
+	if inBlock {
+		return "", fmt.Errorf("the deploy job summary block began (%s) but never terminated (%s missing)", summaryBegin, summaryEnd)
+	}
+	return "", fmt.Errorf("the deploy job log has no executed summary block: bare %q line absent (the marker only appearing inside the logged script does NOT satisfy DESIGN §18.10)", summaryBegin)
+}
+
+// assertJobSummaryEchoesTerraformSummary proves DESIGN §18.10's contract that the
+// deploy job's GitHub job summary echoes the Terraform `test_summary` output. It
+// also requires the human-facing marker heading to have been emitted as executed
+// output (a bare line), not merely logged as script text.
+func assertJobSummaryEchoesTerraformSummary(t *testing.T, deployLog string) {
+	t.Helper()
+	if !containsBareLine(deployLog, summaryMarker) {
+		t.Fatalf("PIP-01 deploy job did not emit the %q heading into its job summary (executed output, not just the logged script)", summaryMarker)
+	}
+	payload, err := parseJobSummaryEcho(deployLog)
+	if err != nil {
+		t.Fatalf("PIP-01 deploy job summary does not echo the Terraform test_summary output: %v", err)
+	}
+	_ = payload
+}
+
+// containsBareLine reports whether want appears as a whole log line (after stripping
+// GitHub's timestamp prefix), i.e. as executed output rather than embedded in a
+// longer `echo "..."` script line.
+func containsBareLine(log, want string) bool {
+	for _, raw := range strings.Split(log, "\n") {
+		if stripLogLinePrefix(raw) == want {
+			return true
+		}
+	}
+	return false
+}
 
 func jobByName(jobs []JobInfo, name string) (JobInfo, bool) {
 	for _, j := range jobs {

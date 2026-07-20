@@ -20,21 +20,32 @@ type GitHubClient struct {
 	Repo  string
 	Token string
 	HTTP  *http.Client
+	// apiBase is the REST root (default https://api.github.com); overridable so
+	// deterministic tests can point the client at an httptest server.
+	apiBase string
 }
 
 // NewGitHubClient constructs a client for owner/repo authenticated with a bearer
 // token.
 func NewGitHubClient(owner, repo, token string) *GitHubClient {
 	return &GitHubClient{
-		Owner: owner,
-		Repo:  repo,
-		Token: token,
-		HTTP:  &http.Client{Timeout: 60 * time.Second},
+		Owner:   owner,
+		Repo:    repo,
+		Token:   token,
+		HTTP:    &http.Client{Timeout: 60 * time.Second},
+		apiBase: "https://api.github.com",
 	}
 }
 
+func (c *GitHubClient) base() string {
+	if c.apiBase == "" {
+		return "https://api.github.com"
+	}
+	return c.apiBase
+}
+
 func (c *GitHubClient) do(ctx context.Context, method, path string, body []byte) (*http.Response, []byte, error) {
-	u := "https://api.github.com/repos/" + c.Owner + "/" + c.Repo + path
+	u := c.base() + "/repos/" + c.Owner + "/" + c.Repo + path
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
@@ -124,7 +135,7 @@ func (c *GitHubClient) LatestRunID(ctx context.Context, workflowFile string) (in
 // authenticates as (GET /user, outside the /repos prefix). Used to pin a dispatched
 // run to THIS test's actor so a concurrent dispatch by another identity is excluded.
 func (c *GitHubClient) AuthenticatedLogin(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base()+"/user", nil)
 	if err != nil {
 		return "", err
 	}
@@ -152,58 +163,101 @@ func (c *GitHubClient) AuthenticatedLogin(ctx context.Context) (string, error) {
 	return out.Login, nil
 }
 
+// selectRunCandidates returns the ids of runs that match THIS test's dispatch
+// window: id>afterID, event=workflow_dispatch, head_branch==wantRef (when set),
+// actor.login==wantActor (when set), and created_at at or after sinceFloor. Pure and
+// deterministically unit-tested.
+func selectRunCandidates(runs []workflowRun, afterID int64, wantRef, wantActor string, sinceFloor time.Time) []int64 {
+	var out []int64
+	for _, r := range runs {
+		if r.ID <= afterID || r.Event != "workflow_dispatch" {
+			continue
+		}
+		if wantRef != "" && normRef(r.HeadBranch) != wantRef {
+			continue
+		}
+		if wantActor != "" && !strings.EqualFold(r.Actor.Login, wantActor) {
+			continue
+		}
+		if r.CreatedAt != "" {
+			if ts, err := time.Parse(time.RFC3339, r.CreatedAt); err == nil && ts.Before(sinceFloor) {
+				continue
+			}
+		}
+		out = append(out, r.ID)
+	}
+	return out
+}
+
+// listRunCandidates fetches the recent workflow_dispatch runs and applies
+// selectRunCandidates.
+func (c *GitHubClient) listRunCandidates(ctx context.Context, workflowFile string, afterID int64, wantRef, wantActor string, sinceFloor time.Time) ([]int64, error) {
+	resp, raw, err := c.do(ctx, http.MethodGet, "/actions/workflows/"+workflowFile+"/runs?event=workflow_dispatch&per_page=50", nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list runs for %s: status %d: %s", workflowFile, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		Runs []workflowRun `json:"workflow_runs"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return selectRunCandidates(out.Runs, afterID, wantRef, wantActor, sinceFloor), nil
+}
+
+// findRunStabilizeInterval is the delay between the two confirmation polls
+// FindRunAfter requires before committing to a single candidate. A concurrent
+// same-actor dispatch that lands during this window is caught as an ambiguity rather
+// than being silently accepted.
+var findRunStabilizeInterval = 12 * time.Second
+
 // FindRunAfter polls for the NEW workflow_dispatch run created after afterID for
 // workflowFile on ref, and returns its id. It pins the run THIS test created by
-// requiring, in addition to id>afterID and event=workflow_dispatch: a matching
-// head_branch, created_at at or after the pre-dispatch instant `since`, and
-// actor.login == the dispatching identity `actor`. Because a concurrent dispatch of
-// the SAME workflow on the SAME branch by the SAME identity cannot be told apart, it
-// collects ALL matching candidates and fails LOUDLY if more than one matches (an
-// ambiguous window) rather than silently choosing the smallest id.
+// requiring id>afterID, event=workflow_dispatch, a matching head_branch, created_at
+// at or after `since`, and actor.login==actor. Because a concurrent same-actor
+// dispatch is indistinguishable, it (a) fails LOUDLY (`[ERR_RUN_AMBIGUOUS]`) whenever
+// more than one candidate is visible, and (b) requires the SAME single candidate to
+// persist across two consecutive polls separated by findRunStabilizeInterval before
+// returning — so a concurrent run that only appears on a later poll is still caught
+// instead of escaping through an immediate first-match return.
 func (c *GitHubClient) FindRunAfter(ctx context.Context, workflowFile, ref string, afterID int64, since time.Time, actor string, timeout time.Duration) (int64, error) {
 	wantRef := normRef(ref)
 	wantActor := strings.TrimSpace(actor)
 	sinceFloor := since.Add(-5 * time.Second) // absorb GitHub's created_at second-rounding
 	deadline := time.Now().Add(timeout)
+
+	ambiguous := func(cands []int64) error {
+		return fmt.Errorf("[ERR_RUN_AMBIGUOUS] %d new workflow_dispatch runs for %s@%s (id>%d, actor=%s, since=%s) match this test's window: %v — cannot pin a single run; serialize dispatches or use a unique input marker",
+			len(cands), workflowFile, wantRef, afterID, wantActor, since.Format(time.RFC3339), cands)
+	}
+
+	var pending int64 // the single candidate awaiting stabilization confirmation
 	for {
-		resp, raw, err := c.do(ctx, http.MethodGet, "/actions/workflows/"+workflowFile+"/runs?event=workflow_dispatch&per_page=50", nil)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			var out struct {
-				Runs []workflowRun `json:"workflow_runs"`
-			}
-			if json.Unmarshal(raw, &out) == nil {
-				var matches []int64
-				for _, r := range out.Runs {
-					if r.ID <= afterID || r.Event != "workflow_dispatch" {
-						continue
-					}
-					if wantRef != "" && normRef(r.HeadBranch) != wantRef {
-						continue
-					}
-					if wantActor != "" && !strings.EqualFold(r.Actor.Login, wantActor) {
-						continue
-					}
-					if ts, terr := time.Parse(time.RFC3339, r.CreatedAt); terr == nil && ts.Before(sinceFloor) {
-						continue
-					}
-					matches = append(matches, r.ID)
-				}
-				if len(matches) > 1 {
-					return 0, fmt.Errorf("[ERR_RUN_AMBIGUOUS] %d new workflow_dispatch runs for %s@%s (id>%d, actor=%s, since=%s) match this test's window: %v — cannot pin a single run; serialize dispatches or use a unique input marker",
-						len(matches), workflowFile, wantRef, afterID, wantActor, since.Format(time.RFC3339), matches)
-				}
-				if len(matches) == 1 {
-					return matches[0], nil
-				}
+		cands, err := c.listRunCandidates(ctx, workflowFile, afterID, wantRef, wantActor, sinceFloor)
+		if err == nil {
+			switch {
+			case len(cands) > 1:
+				return 0, ambiguous(cands)
+			case len(cands) == 1 && pending == cands[0]:
+				// Same single candidate seen on two consecutive polls (and no other
+				// candidate appeared in between): stable, commit to it.
+				return pending, nil
+			case len(cands) == 1:
+				pending = cands[0]
+			default:
+				pending = 0
 			}
 		}
 		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("[ERR_RUN_NOT_FOUND] no new workflow_dispatch run for %s@%s (id>%d, actor=%s) within %s", workflowFile, wantRef, afterID, wantActor, timeout)
+			return 0, fmt.Errorf("[ERR_RUN_NOT_FOUND] no stable single workflow_dispatch run for %s@%s (id>%d, actor=%s) within %s", workflowFile, wantRef, afterID, wantActor, timeout)
 		}
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
-		case <-time.After(10 * time.Second):
+		case <-time.After(findRunStabilizeInterval):
 		}
 	}
 }

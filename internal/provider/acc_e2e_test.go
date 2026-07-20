@@ -320,13 +320,13 @@ func checkEventLogsCollected(dest, wantProvider string, start time.Time) error {
 			if err != nil {
 				return fmt.Errorf("E2E-05: %s: %w", f, err)
 			}
-			// E2E-05 requires only events AT OR AFTER the test start. The start was
-			// captured on the target's OWN clock and events carry that same host
-			// clock, so no skew tolerance is warranted. Truncate to whole seconds so
-			// sub-second capture granularity (event timestamps may drop fractional
-			// digits) does not spuriously reject an event fired in the start second,
-			// while any event from an EARLIER second is still rejected as stale.
-			if ts.Before(start.Truncate(time.Second)) {
+			// E2E-05 requires only events AT OR AFTER the captured test start. The
+			// start is captured on the target's OWN clock (in PreConfig, before the
+			// triggering apply) and Windows events carry that same host clock at
+			// 100 ns precision, so a strict compare is warranted: any event that
+			// precedes the captured start — even within the same second — is a
+			// pre-existing/stale event and must be rejected.
+			if ts.Before(start) {
 				return fmt.Errorf("E2E-05: event at %s precedes the test start %s (stale event collected; only events at or after start are permitted)",
 					ts.Format(time.RFC3339Nano), start.Format(time.RFC3339Nano))
 			}

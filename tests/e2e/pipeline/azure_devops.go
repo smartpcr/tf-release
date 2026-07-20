@@ -20,6 +20,9 @@ type ADOClient struct {
 	Project      string
 	PAT          string
 	HTTP         *http.Client
+	// baseURL is the ADO REST root (default https://dev.azure.com); overridable so
+	// deterministic tests can point the client at an httptest server.
+	baseURL string
 }
 
 // NewADOClient constructs a client. The PAT is sent as HTTP basic auth with an
@@ -30,7 +33,15 @@ func NewADOClient(org, project, pat string) *ADOClient {
 		Project:      project,
 		PAT:          pat,
 		HTTP:         &http.Client{Timeout: 60 * time.Second},
+		baseURL:      "https://dev.azure.com",
 	}
+}
+
+func (c *ADOClient) base() string {
+	if c.baseURL == "" {
+		return "https://dev.azure.com"
+	}
+	return c.baseURL
 }
 
 func (c *ADOClient) authHeader() string {
@@ -60,31 +71,6 @@ func (c *ADOClient) do(ctx context.Context, method, url string, body []byte) (*h
 	return resp, raw, nil
 }
 
-// PipelineYAMLPath returns the repo-relative YAML path a pipeline definition points
-// at (its `configuration.path`). PIP-03 asserts this ends with the shipped
-// azure-pipelines.yml before queueing, so it never smoke-tests an unrelated
-// pipeline that merely shares an id.
-func (c *ADOClient) PipelineYAMLPath(ctx context.Context, pipelineID int) (string, error) {
-	url := fmt.Sprintf("https://dev.azure.com/%s/%s/_apis/pipelines/%d?api-version=7.1", c.Organization, c.Project, pipelineID)
-	resp, raw, err := c.do(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("get pipeline %d: status %d: %s", pipelineID, resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	var out struct {
-		Configuration struct {
-			Path string `json:"path"`
-			Type string `json:"type"`
-		} `json:"configuration"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", err
-	}
-	return out.Configuration.Path, nil
-}
-
 // BuildDefinition captures the identity fields of an ADO build/YAML pipeline
 // definition that PIP-03 asserts before queueing: the YAML file it runs, and the
 // repository it is bound to. Sourced from the Build Definitions API, which (unlike
@@ -101,7 +87,7 @@ type BuildDefinition struct {
 // azure-pipelines.yml bound to the expected lab repository and branch — an id alone
 // is not proof of identity.
 func (c *ADOClient) GetBuildDefinition(ctx context.Context, id int) (BuildDefinition, error) {
-	url := fmt.Sprintf("https://dev.azure.com/%s/%s/_apis/build/definitions/%d?api-version=7.1", c.Organization, c.Project, id)
+	url := fmt.Sprintf("%s/%s/%s/_apis/build/definitions/%d?api-version=7.1", c.base(), c.Organization, c.Project, id)
 	resp, raw, err := c.do(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return BuildDefinition{}, err
@@ -133,7 +119,7 @@ func (c *ADOClient) GetBuildDefinition(ctx context.Context, id int) (BuildDefini
 // QueueRun queues a run of pipelineID with the given template parameters
 // (version, checksum) and returns the run id.
 func (c *ADOClient) QueueRun(ctx context.Context, pipelineID int, params map[string]string) (int, error) {
-	url := fmt.Sprintf("https://dev.azure.com/%s/%s/_apis/pipelines/%d/runs?api-version=7.1", c.Organization, c.Project, pipelineID)
+	url := fmt.Sprintf("%s/%s/%s/_apis/pipelines/%d/runs?api-version=7.1", c.base(), c.Organization, c.Project, pipelineID)
 	payload, _ := json.Marshal(map[string]interface{}{
 		"templateParameters": params,
 	})
@@ -156,7 +142,7 @@ func (c *ADOClient) QueueRun(ctx context.Context, pipelineID int, params map[str
 // WaitRun polls run runID of pipelineID until state=completed and returns its
 // result (e.g. "succeeded", "failed").
 func (c *ADOClient) WaitRun(ctx context.Context, pipelineID, runID int, timeout time.Duration) (string, error) {
-	url := fmt.Sprintf("https://dev.azure.com/%s/%s/_apis/pipelines/%d/runs/%d?api-version=7.1", c.Organization, c.Project, pipelineID, runID)
+	url := fmt.Sprintf("%s/%s/%s/_apis/pipelines/%d/runs/%d?api-version=7.1", c.base(), c.Organization, c.Project, pipelineID, runID)
 	deadline := time.Now().Add(timeout)
 	for {
 		resp, raw, err := c.do(ctx, http.MethodGet, url, nil)
@@ -184,7 +170,7 @@ func (c *ADOClient) WaitRun(ctx context.Context, pipelineID, runID int, timeout 
 // runID (the Tests tab count asserted by PIP-03). ADO pipeline runs share the id
 // with the underlying build, so the Test Management API is queried by buildUri.
 func (c *ADOClient) TestResultCount(ctx context.Context, runID int) (int, error) {
-	url := fmt.Sprintf("https://dev.azure.com/%s/%s/_apis/test/runs?buildUri=vstfs:///Build/Build/%d&api-version=7.1", c.Organization, c.Project, runID)
+	url := fmt.Sprintf("%s/%s/%s/_apis/test/runs?buildUri=vstfs:///Build/Build/%d&api-version=7.1", c.base(), c.Organization, c.Project, runID)
 	resp, raw, err := c.do(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
@@ -209,7 +195,7 @@ func (c *ADOClient) TestResultCount(ctx context.Context, runID int) (int, error)
 
 // ArtifactNames returns the names of pipeline artifacts published by build runID.
 func (c *ADOClient) ArtifactNames(ctx context.Context, runID int) ([]string, error) {
-	url := fmt.Sprintf("https://dev.azure.com/%s/%s/_apis/build/builds/%d/artifacts?api-version=7.1", c.Organization, c.Project, runID)
+	url := fmt.Sprintf("%s/%s/%s/_apis/build/builds/%d/artifacts?api-version=7.1", c.base(), c.Organization, c.Project, runID)
 	resp, raw, err := c.do(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
