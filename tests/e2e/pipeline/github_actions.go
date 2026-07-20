@@ -80,29 +80,77 @@ type workflowRun struct {
 	Conclusion string `json:"conclusion"`
 	CreatedAt  string `json:"created_at"`
 	Event      string `json:"event"`
+	HeadBranch string `json:"head_branch"`
 }
 
-// FindRun polls for the workflow_dispatch run created at/after `since` for
-// workflowFile and returns its id once one appears.
-func (c *GitHubClient) FindRun(ctx context.Context, workflowFile string, since time.Time, timeout time.Duration) (int64, error) {
+// normRef strips a refs/heads/ prefix so a dispatch ref ("main" or
+// "refs/heads/main") compares equal to a run's head_branch ("main").
+func normRef(ref string) string {
+	ref = strings.TrimPrefix(ref, "refs/heads/")
+	ref = strings.TrimPrefix(ref, "refs/tags/")
+	return strings.TrimSpace(ref)
+}
+
+// LatestRunID returns the highest run id currently present for workflowFile (0 if
+// none). Captured BEFORE a dispatch so FindRunAfter can select strictly the new
+// run rather than any concurrent one sharing a creation-time window.
+func (c *GitHubClient) LatestRunID(ctx context.Context, workflowFile string) (int64, error) {
+	resp, raw, err := c.do(ctx, http.MethodGet, "/actions/workflows/"+workflowFile+"/runs?per_page=1", nil)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("latest run for %s: status %d: %s", workflowFile, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		Runs []workflowRun `json:"workflow_runs"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return 0, err
+	}
+	var max int64
+	for _, r := range out.Runs {
+		if r.ID > max {
+			max = r.ID
+		}
+	}
+	return max, nil
+}
+
+// FindRunAfter polls for the NEW workflow_dispatch run created after afterID for
+// workflowFile on ref, and returns its id. Run ids are monotonic, so selecting the
+// smallest id strictly greater than the pre-dispatch max — and requiring
+// event=workflow_dispatch with a matching head_branch — pins the run THIS test
+// created, never a concurrent dispatch sharing a creation-time window.
+func (c *GitHubClient) FindRunAfter(ctx context.Context, workflowFile, ref string, afterID int64, timeout time.Duration) (int64, error) {
+	wantRef := normRef(ref)
 	deadline := time.Now().Add(timeout)
 	for {
-		resp, raw, err := c.do(ctx, http.MethodGet, "/actions/workflows/"+workflowFile+"/runs?event=workflow_dispatch&per_page=20", nil)
+		resp, raw, err := c.do(ctx, http.MethodGet, "/actions/workflows/"+workflowFile+"/runs?event=workflow_dispatch&per_page=30", nil)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			var out struct {
 				Runs []workflowRun `json:"workflow_runs"`
 			}
 			if json.Unmarshal(raw, &out) == nil {
+				var best int64
 				for _, r := range out.Runs {
-					created, perr := time.Parse(time.RFC3339, r.CreatedAt)
-					if perr == nil && !created.Before(since.Add(-time.Minute)) {
-						return r.ID, nil
+					if r.ID <= afterID || r.Event != "workflow_dispatch" {
+						continue
 					}
+					if wantRef != "" && normRef(r.HeadBranch) != wantRef {
+						continue
+					}
+					if best == 0 || r.ID < best {
+						best = r.ID
+					}
+				}
+				if best != 0 {
+					return best, nil
 				}
 			}
 		}
 		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("[ERR_RUN_NOT_FOUND] no workflow_dispatch run for %s within %s", workflowFile, timeout)
+			return 0, fmt.Errorf("[ERR_RUN_NOT_FOUND] no new workflow_dispatch run for %s@%s (id>%d) within %s", workflowFile, wantRef, afterID, timeout)
 		}
 		select {
 		case <-ctx.Done():
@@ -163,6 +211,28 @@ func (c *GitHubClient) ListArtifactNames(ctx context.Context, runID int64) ([]st
 // JobConclusions returns each job name → conclusion for run runID (used to assert
 // the deploy job failed and the rollback job succeeded in PIP-02).
 func (c *GitHubClient) JobConclusions(ctx context.Context, runID int64) (map[string]string, error) {
+	jobs, err := c.JobDetails(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	m := map[string]string{}
+	for _, j := range jobs {
+		m[j.Name] = j.Conclusion
+	}
+	return m, nil
+}
+
+// JobInfo carries the id/name/conclusion of a workflow-run job so PIP-02 can both
+// assert the deploy job's conclusion AND download its log to prove the coded
+// failure ([ERR_SERVICE_START]).
+type JobInfo struct {
+	ID         int64
+	Name       string
+	Conclusion string
+}
+
+// JobDetails returns the id/name/conclusion of every job in run runID.
+func (c *GitHubClient) JobDetails(ctx context.Context, runID int64) ([]JobInfo, error) {
 	resp, raw, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/actions/runs/%d/jobs", runID), nil)
 	if err != nil {
 		return nil, err
@@ -172,6 +242,7 @@ func (c *GitHubClient) JobConclusions(ctx context.Context, runID int64) (map[str
 	}
 	var out struct {
 		Jobs []struct {
+			ID         int64  `json:"id"`
 			Name       string `json:"name"`
 			Conclusion string `json:"conclusion"`
 		} `json:"jobs"`
@@ -179,9 +250,66 @@ func (c *GitHubClient) JobConclusions(ctx context.Context, runID int64) (map[str
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
-	m := map[string]string{}
+	jobs := make([]JobInfo, 0, len(out.Jobs))
 	for _, j := range out.Jobs {
-		m[j.Name] = j.Conclusion
+		jobs = append(jobs, JobInfo{ID: j.ID, Name: j.Name, Conclusion: j.Conclusion})
 	}
-	return m, nil
+	return jobs, nil
+}
+
+// DownloadJobLog returns the plain-text log of job jobID. GitHub answers with a 302
+// to a signed URL serving the log; the stdlib client follows the redirect and reads
+// the body.
+func (c *GitHubClient) DownloadJobLog(ctx context.Context, jobID int64) (string, error) {
+	resp, raw, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/actions/jobs/%d/logs", jobID), nil)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download job %d log: status %d", jobID, resp.StatusCode)
+	}
+	return string(raw), nil
+}
+
+// artifactRef is an artifact's id + name.
+type artifactRef struct {
+	ID   int64
+	Name string
+}
+
+// FindArtifact returns the id of the artifact named `name` uploaded by run runID.
+func (c *GitHubClient) FindArtifact(ctx context.Context, runID int64, name string) (int64, error) {
+	resp, raw, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/actions/runs/%d/artifacts", runID), nil)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("list artifacts run %d: status %d: %s", runID, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		Artifacts []artifactRef `json:"artifacts"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return 0, err
+	}
+	for _, a := range out.Artifacts {
+		if a.Name == name {
+			return a.ID, nil
+		}
+	}
+	return 0, fmt.Errorf("[ERR_ARTIFACT_MISSING] run %d did not upload artifact %q", runID, name)
+}
+
+// DownloadArtifactZip returns the raw zip bytes of artifact artifactID. GitHub
+// answers with a 302 to blob storage; the stdlib client follows the redirect and
+// reads the zip body.
+func (c *GitHubClient) DownloadArtifactZip(ctx context.Context, artifactID int64) ([]byte, error) {
+	resp, raw, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/actions/artifacts/%d/zip", artifactID), nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download artifact %d: status %d", artifactID, resp.StatusCode)
+	}
+	return raw, nil
 }

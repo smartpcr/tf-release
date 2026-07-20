@@ -60,6 +60,31 @@ func (c *ADOClient) do(ctx context.Context, method, url string, body []byte) (*h
 	return resp, raw, nil
 }
 
+// PipelineYAMLPath returns the repo-relative YAML path a pipeline definition points
+// at (its `configuration.path`). PIP-03 asserts this ends with the shipped
+// azure-pipelines.yml before queueing, so it never smoke-tests an unrelated
+// pipeline that merely shares an id.
+func (c *ADOClient) PipelineYAMLPath(ctx context.Context, pipelineID int) (string, error) {
+	url := fmt.Sprintf("https://dev.azure.com/%s/%s/_apis/pipelines/%d?api-version=7.1", c.Organization, c.Project, pipelineID)
+	resp, raw, err := c.do(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get pipeline %d: status %d: %s", pipelineID, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		Configuration struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+		} `json:"configuration"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", err
+	}
+	return out.Configuration.Path, nil
+}
+
 // QueueRun queues a run of pipelineID with the given template parameters
 // (version, checksum) and returns the run id.
 func (c *ADOClient) QueueRun(ctx context.Context, pipelineID int, params map[string]string) (int, error) {

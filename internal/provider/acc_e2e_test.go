@@ -1,11 +1,16 @@
 package provider
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
@@ -134,32 +139,198 @@ func e2eDeployment(t *testing.T, at accTarget) string {
 	return winServiceSpec(t, at, "1.1.0", "zip", healthURL(8080), "")
 }
 
-// checkTrxUnder asserts results_dir/results contains at least one *.trx file.
+// walkFiles recursively collects files under root whose lowercased base name
+// satisfies match. A missing root yields an empty slice (a collection subtree can
+// legitimately be absent), never an error, so callers decide what "empty" means.
+// CollectFiles preserves the remote <host>/<preserved-path> layout, so every
+// collection assertion MUST walk the tree rather than glob a single flat directory.
+func walkFiles(root string, match func(lowerName string) bool) []string {
+	var out []string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() && match(strings.ToLower(d.Name())) {
+			out = append(out, p)
+		}
+		return nil
+	})
+	return out
+}
+
+// hasSuffix builds a walkFiles matcher for a lowercased filename suffix.
+func hasSuffix(suffix string) func(string) bool {
+	return func(n string) bool { return strings.HasSuffix(n, suffix) }
+}
+
+// checkTrxUnder asserts results_dir carries at least one *.trx anywhere under its
+// results/ subtree. CollectFiles nests TRX files under results/<host>/<preserved
+// -path>/*.trx, so the search is RECURSIVE (a flat glob misses host subdirs).
 func checkTrxUnder(resultsDir string) error {
-	matches, _ := filepath.Glob(filepath.Join(resultsDir, "results", "*.trx"))
+	matches := walkFiles(filepath.Join(resultsDir, "results"), hasSuffix(".trx"))
 	if len(matches) == 0 {
 		// Some runners write directly under results_dir; accept either layout.
-		matches, _ = filepath.Glob(filepath.Join(resultsDir, "*.trx"))
+		matches = walkFiles(resultsDir, hasSuffix(".trx"))
 	}
 	if len(matches) == 0 {
-		return fmt.Errorf("no *.trx under %s", resultsDir)
+		return fmt.Errorf("no *.trx found anywhere under %s/results (walked recursively)", resultsDir)
 	}
 	return nil
 }
 
-// checkResultsPopulated asserts the collection tree under dir carries a summary.json
-// AND the collected app.log — the "results_dir fully populated" post-state.
+// checkResultsPopulated asserts the collection tree under dir carries summary.json
+// (written at the results_dir root) AND at least one collected *.log anywhere under
+// logs/ (nested logs/<host>/<preserved-path>/*.log — the search is RECURSIVE).
 func checkResultsPopulated(dir, why string) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		if _, err := os.Stat(filepath.Join(dir, "summary.json")); err != nil {
 			return fmt.Errorf("%s: summary.json absent under %s: %w", why, dir, err)
 		}
-		logs, _ := filepath.Glob(filepath.Join(dir, "logs", "*.log"))
-		if len(logs) == 0 {
-			return fmt.Errorf("%s: no collected logs under %s/logs", why, dir)
+		if logs := walkFiles(filepath.Join(dir, "logs"), hasSuffix(".log")); len(logs) == 0 {
+			return fmt.Errorf("%s: no collected *.log anywhere under %s/logs (walked recursively)", why, dir)
 		}
 		return nil
 	}
+}
+
+// checkStateResource asserts the presence/absence of addr in the Terraform state
+// and, when present, that the given attributes hold the wanted values. E2E-02 uses
+// it to prove a failed hard-gate left the deployment committed+healthy while the
+// test resource is ABSENT from state.
+func checkStateResource(addr string, wantPresent bool, attrs map[string]string) func(*terraform.State) error {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[addr]
+		if !wantPresent {
+			if ok {
+				return fmt.Errorf("resource %s must be ABSENT from state after the failed apply, but it is present", addr)
+			}
+			return nil
+		}
+		if !ok {
+			return fmt.Errorf("resource %s must be present in state, but it is absent", addr)
+		}
+		for k, want := range attrs {
+			if got := rs.Primary.Attributes[k]; got != want {
+				return fmt.Errorf("resource %s attribute %s = %q, want %q", addr, k, got, want)
+			}
+		}
+		return nil
+	}
+}
+
+// winEvent mirrors the ConvertTo-Json shape CollectEventLogs emits per event
+// (TimeCreated/Id/LevelDisplayName/ProviderName/Message). TimeCreated is a
+// RawMessage because PowerShell 5.1 serializes it as \/Date(ms)\/ while PS7 emits
+// an ISO-8601 string.
+type winEvent struct {
+	TimeCreated  json.RawMessage `json:"TimeCreated"`
+	ProviderName string          `json:"ProviderName"`
+	ID           int             `json:"Id"`
+}
+
+// parseWinEvents decodes a collected event-log JSON file, tolerating both the
+// single-object (one event) and array (many events) shapes ConvertTo-Json produces.
+func parseWinEvents(raw []byte) ([]winEvent, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	switch raw[0] {
+	case '[':
+		var evs []winEvent
+		if err := json.Unmarshal(raw, &evs); err != nil {
+			return nil, err
+		}
+		return evs, nil
+	case '{':
+		var one winEvent
+		if err := json.Unmarshal(raw, &one); err != nil {
+			return nil, err
+		}
+		return []winEvent{one}, nil
+	default:
+		return nil, fmt.Errorf("not a JSON object or array")
+	}
+}
+
+// eventTime parses a ConvertTo-Json TimeCreated value, handling both the Windows
+// PowerShell 5.1 \/Date(ms)\/ form and the PowerShell 7 ISO-8601 string form.
+func eventTime(rawTC json.RawMessage) (time.Time, error) {
+	s := strings.TrimSpace(string(rawTC))
+	s = strings.Trim(s, `"`)
+	s = strings.ReplaceAll(s, `\/`, "/")
+	if i := strings.Index(s, "Date("); i >= 0 {
+		rest := s[i+len("Date("):]
+		if j := strings.IndexByte(rest, ')'); j > 0 {
+			num := rest[:j]
+			// strip an optional trailing timezone offset, e.g. 1595280000000+0000
+			if k := strings.IndexAny(num[1:], "+-"); k >= 0 {
+				num = num[:k+1]
+			}
+			if ms, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64); err == nil {
+				return time.UnixMilli(ms).UTC(), nil
+			}
+		}
+	}
+	return parseFlexibleTime(s)
+}
+
+// parseFlexibleTime parses an ISO-8601 timestamp (RFC3339, optional sub-seconds)
+// from the target's `Get-Date -Format o` output or an event's ISO TimeCreated.
+func parseFlexibleTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.9999999Z07:00", "2006-01-02T15:04:05"} {
+		if ts, err := time.Parse(layout, s); err == nil {
+			return ts.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized timestamp %q", s)
+}
+
+// checkEventLogsCollected walks the collected event tree, asserts every event was
+// emitted by wantProvider (the provider filter was honored) and that every event's
+// TimeCreated is at or after the test start captured on the target's own clock (no
+// stale events). Requires at least one parsed event.
+func checkEventLogsCollected(dest, wantProvider string, start time.Time) error {
+	files := walkFiles(filepath.Join(dest, "logs", "events"), hasSuffix(".json"))
+	if len(files) == 0 {
+		files = walkFiles(filepath.Join(dest, "logs"), func(n string) bool {
+			return strings.Contains(n, "event") && strings.HasSuffix(n, ".json")
+		})
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("E2E-05: no collected Windows event-log JSON under %s/logs/events (walked recursively)", dest)
+	}
+	total := 0
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("E2E-05: read %s: %w", f, err)
+		}
+		evs, err := parseWinEvents(raw)
+		if err != nil {
+			return fmt.Errorf("E2E-05: parse %s: %w", f, err)
+		}
+		for _, e := range evs {
+			total++
+			if !strings.EqualFold(strings.TrimSpace(e.ProviderName), wantProvider) {
+				return fmt.Errorf("E2E-05: event in %s has ProviderName %q, want %q (provider filter not applied)", f, e.ProviderName, wantProvider)
+			}
+			ts, err := eventTime(e.TimeCreated)
+			if err != nil {
+				return fmt.Errorf("E2E-05: %s: %w", f, err)
+			}
+			// 2-minute tolerance absorbs sub-second rounding and provider-vs-collector clock granularity.
+			if ts.Before(start.Add(-2 * time.Minute)) {
+				return fmt.Errorf("E2E-05: event at %s precedes the test start %s (stale event collected)",
+					ts.Format(time.RFC3339), start.Format(time.RFC3339))
+			}
+		}
+	}
+	if total == 0 {
+		return fmt.Errorf("E2E-05: collected event JSON parsed to ZERO events; cannot verify provider identity or timestamps")
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -194,9 +365,15 @@ func TestAccE2E01_AllPass(t *testing.T) {
 	})
 }
 
-// E2E-02: FAIL_ONE=1, fail_on_test_failure=true ⇒ apply exit≠0 ERR_TEST_FAILED;
-// results_dir fully populated anyway (asserted in CheckDestroy against the captured
-// dest dir, since ExpectError steps skip Check); deployment resource unaffected.
+// E2E-02: FAIL_ONE=1, fail_on_test_failure=true ⇒ apply exit≠0 ERR_TEST_FAILED.
+// Beyond the coded error, at the moment of the hard-gate failure this proves: (a)
+// the TRX results were still collected and the results_dir fully populated
+// (summary.json + logs); (b) the labdeploy_e2e_test resource is ABSENT from state
+// (a failed create is never committed); and (c) the deployment it depends on stays
+// committed and HEALTHY (service_status=running, deployed_version=1.1.0) — the
+// failing gate does not tear the deployment down. Post-state is asserted in
+// CheckDestroy against the state captured at the failed apply (ExpectError steps
+// skip Check); resource lookups resolve there even though live infra is gone.
 func TestAccE2E02_FailHardGate(t *testing.T) {
 	accPreCheck(t)
 	e2eSetup(t)
@@ -211,8 +388,19 @@ func TestAccE2E02_FailHardGate(t *testing.T) {
 			Config:      cfg,
 			ExpectError: mustRe(`ERR_TEST_FAILED`),
 		}},
-		// collect-then-fail: results are populated even though apply errored.
-		CheckDestroy: checkResultsPopulated(dest, "E2E-02: results_dir must be fully populated despite the hard-gate failure"),
+		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
+			// (a) collect-then-fail: results populated + TRX collected despite the error.
+			checkResultsPopulated(dest, "E2E-02: results_dir must be fully populated despite the hard-gate failure"),
+			func(*terraform.State) error { return checkTrxUnder(dest) },
+			// (b) the failed test-resource create is never committed to state.
+			checkStateResource("labdeploy_e2e_test.e2e", false, nil),
+			// (c) the deployment remains committed and healthy through the failure.
+			checkStateResource("labdeploy_deployment.dep", true, map[string]string{
+				"service_status":   "running",
+				"deployed_version": "1.1.0",
+			}),
+			checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
+		),
 	})
 }
 
@@ -262,9 +450,8 @@ func TestAccE2E04_TimeoutKillsTree(t *testing.T) {
 		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
 			checkNoLingeringTestProcess(at, "E2E-04: the timed-out test process tree must be dead on the target"),
 			func(*terraform.State) error {
-				logs, _ := filepath.Glob(filepath.Join(dest, "logs", "*.log"))
-				if len(logs) == 0 {
-					return fmt.Errorf("E2E-04: no partial logs collected under %s/logs after the timeout", dest)
+				if logs := walkFiles(filepath.Join(dest, "logs"), hasSuffix(".log")); len(logs) == 0 {
+					return fmt.Errorf("E2E-04: no partial logs collected anywhere under %s/logs after the timeout (walked recursively)", dest)
 				}
 				return nil
 			},
@@ -289,9 +476,11 @@ func checkNoLingeringTestProcess(at accTarget, why string) func(*terraform.State
 	}
 }
 
-// E2E-05: collect.windows_event_logs provider filter ⇒ events json in logs dir;
-// only events at or after the test start time. (All tests pass; the assertion is on
-// the collected event JSON.)
+// E2E-05: collect.windows_event_logs provider filter ⇒ event JSON collected under
+// results_dir/logs/events. The collected JSON must PARSE, every event must carry
+// ProviderName SampleSvc (the provider filter was applied), and every event's
+// TimeCreated must be at or after the test start captured on the TARGET's own clock
+// (no stale events). All tests pass; the substantive assertion is on the events.
 func TestAccE2E05_EventLogCollection(t *testing.T) {
 	accPreCheck(t)
 	e2eSetup(t)
@@ -301,23 +490,31 @@ func TestAccE2E05_EventLogCollection(t *testing.T) {
 	collectExtra := "\n  windows_event_logs:\n    - { log: Application, provider: SampleSvc }"
 	tr := testRunSpec(t, at, "1.1.0", dest, "trx", vstestRunner(1800, nil), collectExtra)
 	cfg := accE2EConfig(dep, tr, `  triggers = { run = "1" }`)
+	var eventStart time.Time
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             checkLockAbsent(at.tgt, installRootFor(at), "sample-svc"),
 		Steps: []resource.TestStep{{
+			// Capture the start time on the TARGET's clock so the "events ≥ start"
+			// assertion is immune to runner/host skew (events carry the host clock).
+			PreConfig: preConfig(t, func() error {
+				out, err := probeHost(at,
+					"(Get-Date).ToUniversalTime().ToString('o')",
+					"date -u +%Y-%m-%dT%H:%M:%S.0000000Z")
+				if err != nil {
+					return fmt.Errorf("capture target start time: %w", err)
+				}
+				ts, perr := parseFlexibleTime(strings.TrimSpace(out))
+				if perr != nil {
+					return fmt.Errorf("parse target start time %q: %w", strings.TrimSpace(out), perr)
+				}
+				eventStart = ts
+				return nil
+			}),
 			Config: cfg,
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("labdeploy_e2e_test.e2e", "passed", "true"),
-				func(*terraform.State) error {
-					ev, _ := filepath.Glob(filepath.Join(dest, "logs", "*event*.json"))
-					if len(ev) == 0 {
-						ev, _ = filepath.Glob(filepath.Join(dest, "logs", "*.json"))
-					}
-					if len(ev) == 0 {
-						return fmt.Errorf("E2E-05: no collected Windows event-log JSON under %s/logs", dest)
-					}
-					return nil
-				},
+				func(*terraform.State) error { return checkEventLogsCollected(dest, "SampleSvc", eventStart) },
 			),
 		}},
 	})

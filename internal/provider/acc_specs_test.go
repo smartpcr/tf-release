@@ -329,6 +329,20 @@ func checkCurrentTarget(at accTarget, version string) func(*terraform.State) err
 	}
 }
 
+// readCurrentTarget returns the raw target that `current` resolves to on host `at`
+// (the junction target on Windows, the symlink target on Linux). Used by CLU-05 to
+// capture a pre-update baseline and prove it is unchanged after a failed update.
+func readCurrentTarget(at accTarget) (string, error) {
+	p := layout.NewPaths(at.tgt.OS, installRootFor(at), "sample-svc", "1.0.0")
+	out, err := probeHost(at,
+		fmt.Sprintf("(Get-Item -LiteralPath '%s').Target", strings.ReplaceAll(p.Current, "'", "''")),
+		fmt.Sprintf("readlink '%s'", strings.ReplaceAll(p.Current, "'", `'\''`)))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // Stage 9.1 — shared spec builders + step helpers for the lab (W1/L1) scenario
 // tests. The sample application is `sample-svc` (DESIGN §18): a tiny .NET worker
 // packaged as zip/nupkg at 1.0.0, 1.1.0 and 1.2.0-bad. Artifact URLs and

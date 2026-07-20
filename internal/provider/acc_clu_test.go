@@ -36,11 +36,20 @@ const (
 	envClusterPassword = "LABDEPLOY_ACC_CLUSTER_PASSWORD"
 	envClusterPort     = "LABDEPLOY_ACC_CLUSTER_PORT"
 
+	// The role's Client Access Point (CAP) health URL — the cluster VIP/network
+	// name, NOT localhost. CLU-02's availability probe MUST hit the CAP so it
+	// observes service continuity THROUGH the access point as ownership moves.
+	envClusterCAPHealthURL = "LABDEPLOY_ACC_CLUSTER_HEALTH_URL"
+
 	// Opt-in fault-injection flags (the operator provisions the fault before the
 	// run; under TF_ACC=1 the scenario FAILS if the flag is absent rather than
 	// passing on an unproven path).
 	envCN2Blocked      = "LABDEPLOY_ACC_C2_CN2_BLOCKED"
 	envRolePreConflict = "LABDEPLOY_ACC_CLU_ROLE_PRECONFLICT"
+	// CLU-05 baseline: the operator pre-seeds a healthy v1.0.0 deployment on C2
+	// (both nodes) BEFORE firewalling cn2, so the failed 1.1.0 update can be shown
+	// to leave the prior junction + role owner UNCHANGED (no partial switch).
+	envC2Baseline = "LABDEPLOY_ACC_C2_BASELINE"
 
 	clusterRole = "sample-role"
 	clusterSvc  = "SampleSvc"
@@ -199,6 +208,57 @@ func clusterGroup(coord accTarget, role string) (owner, state string, err error)
 func ownerOf(ct clusterTarget, role string) (string, error) {
 	owner, _, err := clusterGroup(ct.nodes[0], role)
 	return owner, err
+}
+
+// clusterCAPHealthURL returns the role's Client Access Point health URL (the
+// cluster VIP/network name). Under TF_ACC=1 a missing value is a FAILURE: CLU-02's
+// single-gap proof is meaningless if the probe hits localhost instead of the CAP,
+// so we refuse to run it against the wrong endpoint.
+func clusterCAPHealthURL(t *testing.T) string {
+	t.Helper()
+	u := strings.TrimSpace(os.Getenv(envClusterCAPHealthURL))
+	if u == "" {
+		t.Fatalf("CLU-02 under TF_ACC=1 requires %s (the role's Client Access Point health URL — the cluster VIP/network name, NOT localhost) so availability is observed THROUGH the access point across the failover", envClusterCAPHealthURL)
+	}
+	return u
+}
+
+// checkClusterOwnerUnchanged asserts the role owner still equals the value captured
+// before a failed update (CLU-05: an unreachable-node update must not move the
+// role). prev must have been captured in PreConfig against the reachable node.
+func checkClusterOwnerUnchanged(ct clusterTarget, role string, prev *string, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		if strings.TrimSpace(*prev) == "" {
+			return fmt.Errorf("%s: baseline owner was never captured", why)
+		}
+		owner, err := ownerOf(ct, role)
+		if err != nil {
+			return fmt.Errorf("%s: owner probe: %w", why, err)
+		}
+		if shortHost(owner) != shortHost(*prev) {
+			return fmt.Errorf("%s: role owner moved from %q to %q during the failed update (partial switch)", why, *prev, owner)
+		}
+		return nil
+	}
+}
+
+// checkJunctionUnchanged asserts node `at`'s `current` junction still resolves to
+// exactly the target captured before a failed update (CLU-05: the prior release
+// binding must survive an unreachable-node update byte-for-byte).
+func checkJunctionUnchanged(at accTarget, prev *string, why string) func(*terraform.State) error {
+	return func(*terraform.State) error {
+		if strings.TrimSpace(*prev) == "" {
+			return fmt.Errorf("%s: baseline junction target was never captured", why)
+		}
+		got, err := readCurrentTarget(at)
+		if err != nil {
+			return fmt.Errorf("%s: junction probe: %w", why, err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(*prev)) {
+			return fmt.Errorf("%s: current junction changed from %q to %q during the failed update (partial switch)", why, strings.TrimSpace(*prev), strings.TrimSpace(got))
+		}
+		return nil
+	}
 }
 
 // checkClusterOnline asserts the role is Online.
@@ -522,8 +582,8 @@ func checkClusterSingleGap(node accTarget, maxSec int, why string) func(*terrafo
 				return fmt.Errorf("%s: role never returned healthy after the outage", why)
 			}
 		}
-		if gaps > 1 {
-			return fmt.Errorf("%s: observed %d distinct outage gaps, want at most 1 (a single failover)", why, gaps)
+		if gaps != 1 {
+			return fmt.Errorf("%s: observed %d distinct outage gaps, want EXACTLY 1 (a single bounded failover — zero gaps means the drain/failover was never observed through the access point)", why, gaps)
 		}
 		if maxRun > maxSec {
 			return fmt.Errorf("%s: outage %ds exceeds bound %ds", why, maxRun, maxSec)
@@ -563,6 +623,7 @@ func TestAccCLU02_RollingSingleFailover(t *testing.T) {
 	ct := requireC2(t)
 	v10 := accDeploymentConfig(clusterSpec(t, ct, "1.0.0", "zip", ""))
 	v11 := accDeploymentConfig(clusterSpec(t, ct, "1.1.0", "zip", ""))
+	capURL := clusterCAPHealthURL(t)
 	var preOwner string
 	clusterRunScenario(t, ct,
 		clusterApplyStep(ct, v10,
@@ -578,7 +639,10 @@ func TestAccCLU02_RollingSingleFailover(t *testing.T) {
 					return err
 				}
 				preOwner = o
-				return startDowntimeProbe(ct.nodes[0], healthURL(8080), 150)
+				// Probe the role's Client Access Point (cluster VIP), NOT
+				// localhost — availability must be observed THROUGH the access
+				// point so the single failover gap is genuinely measured.
+				return startDowntimeProbe(ct.nodes[0], capURL, 150)
 			}),
 			Config: v11,
 			Check: resource.ComposeAggregateTestCheckFunc(
@@ -683,13 +747,19 @@ func TestAccCLU04_HealthFailRollsBack(t *testing.T) {
 	)
 }
 
-// CLU-05: block WinRM to cn2 before apply ⇒ apply fails ERR_CONNECT host=cn2 during
-// CONNECT/preflight; cn1 is untouched (no partial switch — the new release dir is
-// absent on cn1). Requires LABDEPLOY_ACC_C2_CN2_BLOCKED=1 (the operator firewalls
-// cn2's WinRM before the run). Probes ONLY cn1 (cn2 is intentionally unreachable).
+// CLU-05: with a healthy v1.0.0 baseline pre-seeded on C2 and WinRM to cn2
+// firewalled, applying an UPDATE to v1.1.0 fails ERR_CONNECT host=cn2 at
+// CONNECT/preflight, and cn1 is left UNCHANGED: the prior junction still resolves
+// to the baseline release AND the role owner has not moved (no partial switch).
+// Requires LABDEPLOY_ACC_C2_BASELINE=1 (operator pre-seeded 1.0.0) and
+// LABDEPLOY_ACC_C2_CN2_BLOCKED=1 (cn2 WinRM firewalled). Probes ONLY cn1 (cn2 is
+// intentionally unreachable; the WSFC nodes stay UP so cn1 still reports the owner).
 func TestAccCLU05_NodeUnreachable(t *testing.T) {
 	accPreCheck(t)
 	ct := requireC2(t)
+	if os.Getenv(envC2Baseline) != "1" {
+		t.Fatalf("CLU-05 under TF_ACC=1 requires %s=1 (a healthy v1.0.0 deployment pre-seeded on C2 before cn2 is firewalled) so the UPDATE can be shown to leave the prior junction + owner unchanged", envC2Baseline)
+	}
 	if os.Getenv(envCN2Blocked) != "1" {
 		t.Fatalf("CLU-05 under TF_ACC=1 requires %s=1 (cn2 WinRM firewalled before the run) so the ERR_CONNECT-on-cn2 path is genuinely exercised", envCN2Blocked)
 	}
@@ -697,17 +767,37 @@ func TestAccCLU05_NodeUnreachable(t *testing.T) {
 	t.Setenv("TF_ACC_PROVIDER_HOST", host)
 	t.Setenv("TF_ACC_PROVIDER_NAMESPACE", namespace)
 	cn2 := ct.names[len(ct.names)-1]
-	cfg := accDeploymentConfig(clusterSpec(t, ct, "1.0.0", "zip", ""))
+	// The update target: 1.1.0 (the baseline on the cluster is 1.0.0).
+	cfg := accDeploymentConfig(clusterSpec(t, ct, "1.1.0", "zip", ""))
+	var preOwner, preJunction string
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{{
+			// Capture the baseline owner + cn1 junction target BEFORE the failed
+			// update so CheckDestroy can prove neither moved (cn1 is reachable).
+			PreConfig: preConfig(t, func() error {
+				o, err := ownerOf(ct, clusterRole)
+				if err != nil {
+					return fmt.Errorf("capture baseline owner: %w", err)
+				}
+				preOwner = o
+				j, err := readCurrentTarget(ct.nodes[0])
+				if err != nil {
+					return fmt.Errorf("capture baseline junction on cn1: %w", err)
+				}
+				preJunction = j
+				return nil
+			}),
 			Config:      cfg,
 			ExpectError: mustRe(`ERR_CONNECT(?s).*` + regexp.QuoteMeta(shortHost(cn2))),
 		}},
-		// cn2 is unreachable; assert only cn1's post-state (untouched: no partial
-		// switch — the release dir for the attempted version never landed).
+		// cn2 is unreachable; assert cn1's post-state proves NO partial switch: the
+		// 1.1.0 release never landed, and the prior junction + role owner are
+		// unchanged from the pre-update baseline.
 		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
-			checkReleaseAbsent(ct.nodes[0], "1.0.0", "CLU-05: cn1 must be untouched — no partial switch when cn2 is unreachable"),
+			checkReleaseAbsent(ct.nodes[0], "1.1.0", "CLU-05: cn1 must be untouched — the attempted 1.1.0 release must not land when cn2 is unreachable"),
+			checkJunctionUnchanged(ct.nodes[0], &preJunction, "CLU-05: cn1 junction must still resolve to the pre-update baseline release"),
+			checkClusterOwnerUnchanged(ct, clusterRole, &preOwner, "CLU-05: role owner must not move during the failed update"),
 			checkPathAbsent(ct.nodes[0], installRootFor(ct.nodes[0])+`\sample-svc\.lock`, "CLU-05: cn1 lock must be absent"),
 		),
 	})

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // labEnv returns the value of key, or skips the test when it is unset — the
@@ -31,25 +33,82 @@ func splitOwnerRepo(t *testing.T, ownerRepo string) (string, string) {
 }
 
 // TestPIP_LINT_01_ShippedPipelinesWellFormed is the gate-tier structural proof: the
-// two committed reference pipelines exist, are non-empty, and carry their
-// always()-guarded publish steps. (The deep topology assertions live in
-// examples/examples_test.go; this keeps Phase 8 self-contained gate coverage in the
-// pipeline package.)
+// two committed reference pipelines PARSE as YAML (well-formedness) and, navigated
+// structurally, carry their always()-guarded publish steps — a GitHub
+// actions/upload-artifact step gated `if: always()` and an ADO PublishTestResults@2
+// task gated `condition: always()`. (Deep topology assertions live in
+// examples/examples_test.go; this keeps Phase 8 self-contained gate coverage here,
+// parsing rather than substring-matching so a malformed file cannot pass.)
 func TestPIP_LINT_01_ShippedPipelinesWellFormed(t *testing.T) {
-	gh, err := os.ReadFile(ShippedGitHubWorkflowPath())
-	if err != nil {
-		t.Fatalf("read shipped github-deploy.yml: %v", err)
+	gh := decodeYAMLDoc(t, ShippedGitHubWorkflowPath())
+	top, ok := gh.(map[string]interface{})
+	if !ok || top["jobs"] == nil {
+		t.Fatalf("github-deploy.yml must be a mapping that defines jobs:")
 	}
-	if !strings.Contains(string(gh), "actions/upload-artifact") || !strings.Contains(string(gh), "if: always()") {
+	if !anyMapping(gh, func(m map[string]interface{}) bool {
+		return strings.Contains(yamlStr(m, "uses"), "actions/upload-artifact") &&
+			strings.Contains(yamlStr(m, "if"), "always()")
+	}) {
 		t.Errorf("github-deploy.yml must upload artifacts with `if: always()`")
 	}
-	ado, err := os.ReadFile(ShippedAzurePipelinePath())
-	if err != nil {
-		t.Fatalf("read shipped azure-pipelines.yml: %v", err)
+
+	ado := decodeYAMLDoc(t, ShippedAzurePipelinePath())
+	if _, ok := ado.(map[string]interface{}); !ok {
+		t.Fatalf("azure-pipelines.yml must be a YAML mapping")
 	}
-	if !strings.Contains(string(ado), "PublishTestResults@2") || !strings.Contains(string(ado), "condition: always()") {
+	if !anyMapping(ado, func(m map[string]interface{}) bool {
+		return strings.Contains(yamlStr(m, "task"), "PublishTestResults@2") &&
+			strings.Contains(yamlStr(m, "condition"), "always()")
+	}) {
 		t.Errorf("azure-pipelines.yml must publish test results with `condition: always()`")
 	}
+}
+
+// decodeYAMLDoc reads and YAML-decodes a shipped pipeline file, FAILING if it is
+// not well-formed YAML (the well-formedness half of PIP_LINT-01).
+func decodeYAMLDoc(t *testing.T, path string) interface{} {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var doc interface{}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("%s is not well-formed YAML: %v", path, err)
+	}
+	return doc
+}
+
+// anyMapping returns true if any mapping node reachable from node satisfies pred.
+func anyMapping(node interface{}, pred func(map[string]interface{}) bool) bool {
+	switch n := node.(type) {
+	case map[string]interface{}:
+		if pred(n) {
+			return true
+		}
+		for _, v := range n {
+			if anyMapping(v, pred) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, v := range n {
+			if anyMapping(v, pred) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// yamlStr returns m[k] as a string (empty if absent or non-string).
+func yamlStr(m map[string]interface{}, k string) string {
+	if v, ok := m[k]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }
 
 // TestPIP_REG_01_RegisteredWorkflowEqualsShippedPlusEnvBinding is the gate-tier
@@ -92,18 +151,14 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// TestPIP_REG_02_RemoteWorkflowMatchesGeneratedBody is the live pre-dispatch proof:
+// requireRemoteWorkflowCurrent is the shared pre-dispatch ordering guard (item 8):
 // it fetches the ACTUAL registered workflow from the lab repo default branch and
-// byte-compares it to RegisterWorkflow's output, so a stale/hand-edited remote
-// registration fails here instead of dispatching altered content. Skips when the L4
-// lab is unavailable.
-func TestPIP_REG_02_RemoteWorkflowMatchesGeneratedBody(t *testing.T) {
-	ownerRepo := labEnv(t, "LD_GH_LAB_REPO")
-	token := labEnv(t, "LD_GH_TOKEN")
-	owner, repo := splitOwnerRepo(t, ownerRepo)
-	branch := envOr("LD_GH_LAB_BRANCH", "main")
+// byte-compares it (sha256) to RegisterWorkflow's output. PIP-01/PIP-02 call it
+// BEFORE dispatching, so a stale/hand-edited remote registration fails HERE rather
+// than dispatching altered content — regardless of test execution order.
+func requireRemoteWorkflowCurrent(ctx context.Context, t *testing.T, owner, repo, branch, token string) {
+	t.Helper()
 	workflowPath := envOr("LD_GH_LAB_WORKFLOW_PATH", ".github/workflows/labdeploy-e2e.yml")
-
 	shipped, err := ReadShippedGitHubWorkflow()
 	if err != nil {
 		t.Fatalf("read shipped github-deploy.yml: %v", err)
@@ -112,17 +167,28 @@ func TestPIP_REG_02_RemoteWorkflowMatchesGeneratedBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterWorkflow: %v", err)
 	}
+	got, err := FetchRemoteWorkflow(ctx, owner, repo, workflowPath, branch, token)
+	if err != nil {
+		t.Fatalf("pre-dispatch fetch of %s@%s: %v", workflowPath, branch, err)
+	}
+	if SHA256Hex(got) != SHA256Hex(want) {
+		t.Fatalf("[ERR_STALE_WORKFLOW] remote %s@%s does not match the registered body; refusing to dispatch stale content:\n remote sha256    = %s\n expected sha256  = %s",
+			workflowPath, branch, SHA256Hex(got), SHA256Hex(want))
+	}
+}
+
+// TestPIP_REG_02_RemoteWorkflowMatchesGeneratedBody is the live pre-dispatch proof
+// as an independent gate; it delegates to the same requireRemoteWorkflowCurrent
+// guard PIP-01/PIP-02 run inline. Skips when the L4 lab is unavailable.
+func TestPIP_REG_02_RemoteWorkflowMatchesGeneratedBody(t *testing.T) {
+	ownerRepo := labEnv(t, "LD_GH_LAB_REPO")
+	token := labEnv(t, "LD_GH_TOKEN")
+	owner, repo := splitOwnerRepo(t, ownerRepo)
+	branch := envOr("LD_GH_LAB_BRANCH", "main")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	got, err := FetchRemoteWorkflow(ctx, owner, repo, workflowPath, branch, token)
-	if err != nil {
-		t.Fatalf("FetchRemoteWorkflow: %v", err)
-	}
-	if SHA256Hex(got) != SHA256Hex(want) {
-		t.Fatalf("[ERR_STALE_WORKFLOW] remote %s@%s does not match the registered body:\n remote sha256    = %s\n expected sha256  = %s",
-			workflowPath, branch, SHA256Hex(got), SHA256Hex(want))
-	}
+	requireRemoteWorkflowCurrent(ctx, t, owner, repo, branch, token)
 }
 
 // envOr returns the env value for key or def when unset.
