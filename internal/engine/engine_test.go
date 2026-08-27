@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smartpcr/terraform-provider-labdeploy/internal/layout"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
@@ -25,46 +26,119 @@ import (
 // ----------------------------------------------------------------------------
 
 type fakeHost struct {
-	host       string
-	files      map[string][]byte // path -> content (case-sensitive; engine is consistent)
-	dirs       map[string]bool
-	current    string          // junction target
-	svc        string          // "", "Stopped", "Running"
-	fail       map[string]bool // step toggles: "switch","health","start","extract"
-	healthGate func() bool     // optional dynamic health failure (true => fail)
-	log        []string        // executed step markers, in order
+	host             string
+	files            map[string][]byte // path -> content (case-sensitive; engine is consistent)
+	dirs             map[string]bool
+	dirTS            map[string]int64         // optional per-dir mtime ticks for deterministic prune
+	current          string                   // junction target
+	svc              string                   // "", "Stopped", "Running"
+	fail             map[string]bool          // step toggles: "switch","health","start","extract"
+	failN            map[string]int           // one-shot step failures: fail the first N calls, then succeed
+	healthGate       func() bool              // optional dynamic health failure (true => fail)
+	healthScriptGate func(script string) bool // optional health failure keyed on the executed script (true => fail)
+	log              []string                 // executed step markers, in order
+
+	// node_modules filesystem model (DESIGN §9.4 npm ci rollback safety). nm is
+	// the CONTENT TOKEN of the live node_modules ("" = absent, "partial" = the
+	// broken tree a failed npm ci leaves behind); nmBak is the snapshot token.
+	// nodeNeedsDeps records that this app was installed with install_deps=true, so
+	// it cannot start without a good node_modules tree — this is what couples a
+	// prior-app restart to a successful restore.
+	nm            string
+	nmBak         string
+	nodeNeedsDeps bool
 }
 
 func newFakeHost(name string) *fakeHost {
-	return &fakeHost{host: name, files: map[string][]byte{}, dirs: map[string]bool{}, fail: map[string]bool{}}
+	return &fakeHost{host: name, files: map[string][]byte{}, dirs: map[string]bool{}, dirTS: map[string]int64{}, fail: map[string]bool{}, failN: map[string]int{}}
 }
 
 func (f *fakeHost) mark(s string) { f.log = append(f.log, s) }
 
-func (f *fakeHost) Connect(ctx context.Context) error { return nil }
-func (f *fakeHost) Close() error                      { return nil }
-func (f *fakeHost) OS() spec.OSKind                   { return spec.OSWindows }
-func (f *fakeHost) Host() string                      { return f.host }
+func (f *fakeHost) Connect(ctx context.Context) error {
+	if f.fail["connect"] {
+		return fmt.Errorf("simulated connect failure")
+	}
+	return nil
+}
+func (f *fakeHost) Close() error    { return nil }
+func (f *fakeHost) OS() spec.OSKind { return spec.OSWindows }
+func (f *fakeHost) Host() string    { return f.host }
 
 var reRead = regexp.MustCompile(`ReadAllBytes\('([^']+)'\)`)
 var reWrite = regexp.MustCompile(`WriteAllBytes\('([^']+)',\[Convert\]::FromBase64String\('([^']*)'\)\)`)
-var reLock = regexp.MustCompile(`\[IO\.File\]::Open\('([^']+)','CreateNew'\)`)
+var reLock = regexp.MustCompile(`\[IO\.File\]::Move\(\$tmp,'([^']+)'\)`)
 var reRmRecurse = regexp.MustCompile(`Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '([^']+)'`)
 var reRmOne = regexp.MustCompile(`Remove-Item -Force -ErrorAction SilentlyContinue '([^']+)'`)
 var reMklink = regexp.MustCompile(`mklink /J "([^"]+)" "([^"]+)"`)
 var reList = regexp.MustCompile(`Get-ChildItem -Directory '([^']+)'`)
 
+// reCasDel captures the compare-and-delete used by casDelete. Under the shared
+// path-keyed mutex it reads the current bytes and removes the file only when they
+// match this owner's content, so no persistent gate is needed and nothing can be
+// stranded on crash. Keyed on the [IO.File]::Delete call (checked before reRead,
+// which the same script also contains via ReadAllBytes).
+var reCasDel = regexp.MustCompile(`\[IO\.File\]::Delete\('([^']+)'\)`)
+var reCurEq = regexp.MustCompile(`\$cur -eq '([^']*)'`)
+
+// reCasReplace captures the atomic crash-safe compare-and-replace used by
+// casReplace: a per-path Global mutex serializes the compare, then the successor
+// bytes are published by writing a private temp and swapping it in with an atomic
+// [IO.File]::Replace (NTFS transacted, write-through) — NO in-place mutation, so an
+// interruption leaves either the intact stale lock or the intact successor, never
+// a partial/mixed file. reCasReplace captures the destination from the Replace call.
+var reCasReplace = regexp.MustCompile(`\[IO\.File\]::Replace\(\$tmp,'([^']+)',`)
+var reCurNe = regexp.MustCompile(`\$cur -ne '([^']*)'`)
+
 func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
 	s := c.Script
 	switch {
 	case strings.Contains(s, "$PSVersionTable"): // preflight
+		if f.fail["preflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "preflight gate failed"}, nil
+		}
 		f.mark("PREFLIGHT")
 		return ok(""), nil
 
-	case reLock.MatchString(s): // AcquireLock CreateNew
+	case reCasReplace.MatchString(s): // casReplace atomic crash-safe compare-and-replace
+		m := reCasReplace.FindStringSubmatch(s)
+		path := m[1]
+		cur, exists := f.files[path]
+		if !exists {
+			return transport.Result{ExitCode: 48}, nil // slot released
+		}
+		em := reCurNe.FindStringSubmatch(s)
+		if em == nil || base64.StdEncoding.EncodeToString(cur) != em[1] {
+			return transport.Result{ExitCode: 10}, nil // a fresh successor already installed
+		}
+		if nm := regexp.MustCompile(`FromBase64String\('([^']*)'\)`).FindStringSubmatch(s); nm != nil {
+			raw, _ := base64.StdEncoding.DecodeString(nm[1])
+			f.files[path] = raw // atomic replace: never absent/empty/partial
+		}
+		f.mark("LOCK")
+		return ok(""), nil
+
+	case reCasDel.MatchString(s): // casDelete compare-and-delete (shared mutex)
+		m := reCasDel.FindStringSubmatch(s)
+		path := m[1]
+		cur, exists := f.files[path]
+		if !exists {
+			return transport.Result{ExitCode: 48}, nil // absent or peer-locked
+		}
+		em := reCurEq.FindStringSubmatch(s)
+		if em == nil || base64.StdEncoding.EncodeToString(cur) != em[1] {
+			return transport.Result{ExitCode: 10}, nil // content changed: not ours
+		}
+		delete(f.files, path) // casDelete: compare-and-delete
+		return ok(""), nil
+
+	case reLock.MatchString(s): // AcquireLock atomic create (temp then Move publish)
+		if f.fail["lock"] {
+			return transport.Result{}, fmt.Errorf("simulated lock acquire transport failure")
+		}
 		p := reLock.FindStringSubmatch(s)[1]
 		if _, held := f.files[p]; held {
-			return transport.Result{ExitCode: 48}, nil
+			return transport.Result{ExitCode: 48}, nil // create-with-content: fail if exists
 		}
 		// content arrives via FromBase64String('<b64>')
 		if m := regexp.MustCompile(`FromBase64String\('([^']*)'\)`).FindStringSubmatch(s); m != nil {
@@ -78,6 +152,11 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case reWrite.MatchString(s): // writeSmallFile
 		m := reWrite.FindStringSubmatch(s)
+		// RENDER failure is scoped to the rendered config file so it does not also
+		// break manifest writes (which also flow through writeSmallFile).
+		if f.fail["render"] && strings.Contains(m[1], "render.conf") {
+			return transport.Result{ExitCode: 1, Stderr: "render write failed"}, nil
+		}
 		raw, err := base64.StdEncoding.DecodeString(m[2])
 		if err != nil {
 			return transport.Result{ExitCode: 1, Stderr: "b64"}, nil
@@ -87,23 +166,33 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 
 	case reRead.MatchString(s): // readSmallFile
 		p := reRead.FindStringSubmatch(s)[1]
+		if f.fail["read"] {
+			return transport.Result{}, fmt.Errorf("simulated manifest read transport failure")
+		}
 		raw, exists := f.files[p]
 		if !exists {
 			return transport.Result{ExitCode: 3}, nil
 		}
 		return ok(base64.StdEncoding.EncodeToString(raw)), nil
 
-	case strings.Contains(s, "New-Item -ItemType Directory"): // ensureLayout/ensureDir
-		return ok(""), nil
-
-	case strings.Contains(s, "Expand-Archive"): // extract
+	case strings.Contains(s, "Expand-Archive"): // extract (check before New-Item: script has both)
 		if f.fail["extract"] {
 			return transport.Result{ExitCode: 1, Stderr: "corrupt zip"}, nil
 		}
 		f.mark("EXTRACT")
 		return ok(""), nil
 
+	case strings.Contains(s, "New-Item -ItemType Directory"): // ensureLayout/ensureDir
+		if f.fail["stage"] {
+			return transport.Result{ExitCode: 1, Stderr: "mkdir failed"}, nil
+		}
+		return ok(""), nil
+
 	case reMklink.MatchString(s): // switchJunction
+		if f.failN["switch"] > 0 {
+			f.failN["switch"]--
+			return transport.Result{ExitCode: 42, Stderr: "mklink failed"}, nil
+		}
 		if f.fail["switch"] {
 			return transport.Result{ExitCode: 42, Stderr: "mklink failed"}, nil
 		}
@@ -113,39 +202,147 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "sc.exe create") || strings.Contains(s, "sc.exe config"): // Configure
+		if f.failN["configure"] > 0 {
+			f.failN["configure"]--
+			return transport.Result{ExitCode: 46, Stderr: "configure failed"}, nil
+		}
+		if f.fail["configure"] {
+			return transport.Result{ExitCode: 46, Stderr: "configure failed"}, nil
+		}
 		f.mark("CONFIGURE")
 		if f.svc == "" {
 			f.svc = "Stopped"
 		}
 		return ok(""), nil
 
-	case strings.Contains(s, "Stop-Service"): // Stop
+	case strings.Contains(s, "Stop-Service"): // S1 graceful Stop
 		f.mark("STOP")
+		if f.fail["stopgrace"] {
+			// service ignores the graceful stop ⇒ escalate to FORCE_KILL
+			// (windows_service Stop returns the sentinel exit 100).
+			return transport.Result{ExitCode: 100}, nil
+		}
 		if f.svc == "Running" {
 			f.svc = "Stopped"
 		}
 		return ok(""), nil
 
+	case strings.Contains(s, "LDRUNNERFAIL"): // TestRun runner command (post-staging)
+		// Checked before the taskkill/PID case because the runner watchdog
+		// wrapper legitimately embeds `taskkill /PID ... /T /F` (process-tree
+		// kill); the runner command token must win the dispatch.
+		return transport.Result{}, fmt.Errorf("runner transport blew up")
+
+	case strings.Contains(s, "taskkill /PID"): // S2 FORCE_KILL escalation
+		f.mark("FORCE_KILL")
+		if f.fail["forcekill"] {
+			return transport.Result{ExitCode: 43, Stderr: "still running after kill"}, nil
+		}
+		f.svc = "Stopped"
+		return ok(""), nil
+
 	case strings.Contains(s, "Start-Service"): // Start
+		if f.failN["start"] > 0 {
+			f.failN["start"]--
+			return transport.Result{ExitCode: 44, Stderr: "start timeout"}, nil
+		}
 		if f.fail["start"] {
 			return transport.Result{ExitCode: 44, Stderr: "start timeout"}, nil
+		}
+		// A node app installed with install_deps cannot start against a missing or
+		// broken (partial) node_modules tree — this couples a successful start to a
+		// successful dependency restore during rollback.
+		if f.nodeNeedsDeps && (f.nm == "" || f.nm == "partial") {
+			return transport.Result{ExitCode: 44, Stderr: "cannot start: node_modules missing or corrupt"}, nil
 		}
 		f.mark("START")
 		f.svc = "Running"
 		return ok(""), nil
 
 	case strings.Contains(s, "exit 41"): // target-pull fetch script (checksum marker)
+		if f.fail["checksum"] {
+			return transport.Result{ExitCode: 41, Stderr: "sha256 mismatch"}, nil
+		}
+		if f.fail["fetch"] {
+			return transport.Result{ExitCode: 40, Stderr: "download failed"}, nil
+		}
 		f.mark("FETCH")
 		return ok(""), nil
 
 	case strings.Contains(s, "Invoke-WebRequest"): // health http
-		if f.fail["health"] || (f.healthGate != nil && f.healthGate()) {
+		if f.fail["health"] || (f.healthGate != nil && f.healthGate()) || (f.healthScriptGate != nil && f.healthScriptGate(s)) {
 			return transport.Result{ExitCode: 1, Stdout: "connection refused"}, nil
 		}
 		f.mark("HEALTH")
 		return ok(""), nil
 
+	case strings.Contains(s, "Rename-Item -ErrorAction Stop 'node_modules' 'node_modules.bak'"): // NodeWebApp.BackupDeps
+		if f.fail["depbackup"] {
+			return transport.Result{ExitCode: 46, Stderr: "node_modules backup failed: access denied"}, nil
+		}
+		// Snapshot the live tree: move node_modules → node_modules.bak.
+		f.nmBak, f.nm = f.nm, ""
+		f.mark("DEPBACKUP")
+		return ok(""), nil
+	case strings.Contains(s, "Rename-Item -ErrorAction Stop 'node_modules.bak' 'node_modules'"): // NodeWebApp.RestoreDeps
+		if f.fail["deprestore"] {
+			return transport.Result{ExitCode: 46, Stderr: "node_modules restore failed: access denied"}, nil
+		}
+		// Restore the snapshot over any partial tree: node_modules.bak → node_modules.
+		if f.nmBak != "" {
+			f.nm, f.nmBak = f.nmBak, ""
+		}
+		f.mark("DEPRESTORE")
+		return ok(""), nil
+	case strings.Contains(s, "node_modules.bak"): // NodeWebApp.CommitDeps (discard snapshot)
+		f.nmBak = ""
+		f.mark("DEPCOMMIT")
+		return ok(""), nil
+
+	case strings.Contains(s, "npm ci --omit=dev"): // node_web_app InstallDeps (STAGE)
+		// npm ci DELETES node_modules first, then rebuilds. Model that: a failure
+		// leaves a "partial" (broken) tree; success yields a fresh good tree.
+		if f.fail["npmci"] {
+			f.nm = "partial"
+			return transport.Result{ExitCode: 46, Stderr: "npm ci failed"}, nil
+		}
+		f.nm = "fresh"
+		f.nodeNeedsDeps = true
+		f.mark("NPMCI")
+		return ok(""), nil
+
+	case strings.Contains(s, "node not found on PATH"): // node_web_app pattern preflight
+		if f.fail["nodepreflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "node not found on PATH"}, nil
+		}
+		f.mark("NODE_PREFLIGHT")
+		return ok(""), nil
+
+	case strings.Contains(s, "--list-runtimes"): // dotnet_api pattern preflight
+		if f.fail["dotnetpreflight"] {
+			return transport.Result{ExitCode: 1, Stderr: "Microsoft.AspNetCore.App runtime missing"}, nil
+		}
+		f.mark("DOTNET_PREFLIGHT")
+		return ok(""), nil
+
+	case strings.Contains(s, "LDPOSTINSTALL"): // post_install hook
+		if f.fail["postinstall"] {
+			return transport.Result{ExitCode: 9, Stderr: "hook failed"}, nil
+		}
+		f.mark("POSTINSTALL")
+		return ok(""), nil
+
+	case strings.Contains(s, "LDVERIFY"): // console_app verify_command
+		if f.fail["verify"] {
+			return transport.Result{ExitCode: 7, Stderr: "verify failed"}, nil
+		}
+		f.mark("VERIFY")
+		return ok(""), nil
+
 	case strings.Contains(s, "not_installed"): // Status probe
+		if f.fail["status"] {
+			return transport.Result{}, fmt.Errorf("simulated status probe transport failure")
+		}
 		if f.svc == "" {
 			return ok("not_installed"), nil
 		}
@@ -155,13 +352,23 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		var b strings.Builder
 		i := int64(1000)
 		for d := range f.dirs {
-			b.WriteString(fmt.Sprintf("%s|%d\n", d, i))
+			ts := i
+			if v, ok := f.dirTS[d]; ok {
+				ts = v
+			}
+			fmt.Fprintf(&b, "%s|%d\n", d, ts)
 			i++
 		}
 		return ok(b.String()), nil
 
 	case reRmRecurse.MatchString(s):
+		if f.fail["rmtree"] {
+			return transport.Result{}, fmt.Errorf("simulated recursive removal transport failure")
+		}
 		p := reRmRecurse.FindStringSubmatch(s)[1]
+		if f.fail["rm"] || (f.fail["rmRelease"] && strings.Contains(p, "releases")) {
+			return transport.Result{ExitCode: 1, Stderr: "remove failed"}, nil
+		}
 		for k := range f.files {
 			if strings.HasPrefix(k, p) {
 				delete(f.files, k)
@@ -175,6 +382,9 @@ func (f *fakeHost) Exec(ctx context.Context, c transport.Cmd) (transport.Result,
 		return ok(""), nil
 
 	case strings.Contains(s, "sc.exe query") && strings.Contains(s, "sc.exe delete"): // Uninstall
+		if f.fail["uninstall"] {
+			return transport.Result{ExitCode: 46, Stderr: "sc delete failed"}, nil
+		}
 		f.mark("UNINSTALL")
 		f.svc = ""
 		return ok(""), nil
@@ -253,15 +463,34 @@ pattern:
 health_check:
   type: http
   http: { url: "http://localhost:8080/health" }
-  initial_delay_seconds: 0
+  initial_delay_seconds: 1
   interval_seconds: 1
-  timeout_seconds: 2
+  timeout_seconds: 3
 strategy: { keep_releases: 2, rollback_on_failure: true }
 `, checksum, url)
 	d, _, err := spec.ParseDeployment(y, nil, "")
 	if err != nil {
 		t.Fatalf("spec: %v", err)
 	}
+	return d
+}
+
+// winSvcSpecPostInstall is winSvcSpec plus a post_install hook (sentinel
+// LDPOSTINSTALL the fake transport recognizes) to exercise the post_install
+// failure path (DESIGN §6.4 ⇒ ERR_SERVICE_INSTALL).
+func winSvcSpecPostInstall(t *testing.T, url, checksum string) *spec.Deployment {
+	t.Helper()
+	d := winSvcSpec(t, url, checksum)
+	d.Pattern.PostInstall = "LDPOSTINSTALL"
+	return d
+}
+
+// winSvcSpecRender is winSvcSpec plus a rendered config file (render.conf) so the
+// RENDER step actually writes a file the fake transport can fail on demand.
+func winSvcSpecRender(t *testing.T, url, checksum string) *spec.Deployment {
+	t.Helper()
+	d := winSvcSpec(t, url, checksum)
+	d.Files = []spec.RenderedFile{{Path: "render.conf", Content: "x"}}
 	return d
 }
 
@@ -292,7 +521,7 @@ func TestDeployFreshInstall(t *testing.T) { // WSV-01
 		t.Fatalf("junction: %q", f.current)
 	}
 	// Manifest persisted with success result.
-	m, _ := f.files[`C:\deploy\sample-svc\manifest.json`]
+	m := f.files[`C:\deploy\sample-svc\manifest.json`]
 	if !strings.Contains(string(m), `"current_version": "1.0.0"`) ||
 		!strings.Contains(string(m), `"result": "success"`) {
 		t.Fatalf("manifest: %s\nlog=%s\nfiles=%v", m, strings.Join(f.log, "\n  "), keysOf(f.files))
@@ -332,6 +561,320 @@ func TestIdempotentNoop(t *testing.T) { // IDP-01
 	joined := strings.Join(f.log, ">")
 	if strings.Contains(joined, "EXTRACT") || strings.Contains(joined, "SWITCH") || strings.Contains(joined, "STOP") {
 		t.Fatalf("second apply must be a no-op, got %v", f.log)
+	}
+}
+
+func TestReconfigureAppliesConfig(t *testing.T) { // IDP-02: config-only update reaches CONFIGURE
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Same artifact version/checksum: Deploy would be an idempotent no-op that
+	// skips CONFIGURE. Reconfigure must transactionally STOP → CONFIGURE → START →
+	// HEALTH under the lock so the new config is activated on the running process,
+	// WITHOUT re-staging/switching (no FETCH/EXTRACT/SWITCH).
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if st == nil || st.DeployedVersion != "1.0.0" {
+		t.Fatalf("reconfigure status: %+v", st)
+	}
+	order := strings.Join(f.log, ">")
+	for _, must := range []string{"LOCK", "STOP", "CONFIGURE", "START", "HEALTH"} {
+		if !strings.Contains(order, must) {
+			t.Fatalf("reconfigure must run %s, got %v", must, f.log)
+		}
+	}
+	for _, pair := range [][2]string{{"LOCK", "STOP"}, {"STOP", "CONFIGURE"}, {"CONFIGURE", "START"}, {"START", "HEALTH"}} {
+		if strings.Index(order, pair[0]) > strings.Index(order, pair[1]) {
+			t.Fatalf("reconfigure step order violated (%s before %s): %v", pair[0], pair[1], f.log)
+		}
+	}
+	for _, banned := range []string{"FETCH", "EXTRACT", "SWITCH"} {
+		if strings.Contains(order, banned) {
+			t.Fatalf("reconfigure must not %s (same release), got %v", banned, f.log)
+		}
+	}
+	// The manifest is re-finalized transactionally with a reconfigure LastOp,
+	// version/checksum unchanged.
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"type": "reconfigure"`) || !strings.Contains(mj, `"current_version": "1.0.0"`) {
+		t.Fatalf("reconfigure manifest not finalized: %s", mj)
+	}
+}
+
+func TestReconfigureAbsentIsNoop(t *testing.T) { // IDP-03: nothing deployed => nil status, no error
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	spec := winSvcSpec(t, url, sum)
+	st, err := eng.Reconfigure(context.Background(), spec, spec)
+	if err != nil {
+		t.Fatalf("reconfigure on absent deployment must be a no-op, got %v", err)
+	}
+	if st != nil {
+		t.Fatalf("reconfigure on absent deployment must return nil status, got %+v", st)
+	}
+}
+
+func TestReconfigureRestoresPriorOnFailure(t *testing.T) { // RBK-04: config-only update fails, prior restored
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Fail the FIRST CONFIGURE (the new settings) once; the restore CONFIGURE of
+	// the prior settings then succeeds. The reconfigure must roll the machine back
+	// to the prior configuration, health-check it, and surface the original error.
+	f.failN["configure"] = 1
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when CONFIGURE fails, got status %+v", st)
+	}
+	if st != nil {
+		t.Fatalf("failed reconfigure must return nil status, got %+v", st)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("error must report prior config restored, got %v", err)
+	}
+	// The manifest records the rolled-back reconfigure, version/checksum unchanged;
+	// this is written only on the restore-succeeded path.
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "rolled_back"`) || !strings.Contains(mj, `"current_version": "1.0.0"`) {
+		t.Fatalf("rolled-back manifest not finalized: %s", mj)
+	}
+}
+
+func TestReconfigureRollbackFailedSurfaces(t *testing.T) { // RBK-05: restore also fails => ERR_ROLLBACK_FAILED
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// HEALTH fails permanently: the new config fails HEALTH, and the restored prior
+	// config also fails HEALTH, so restoration cannot be confirmed. The engine must
+	// persist a failed manifest (§10.6) and surface ERR_ROLLBACK_FAILED.
+	f.fail["health"] = true
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when restore fails, got status %+v", st)
+	}
+	if !strings.Contains(err.Error(), "ERR_ROLLBACK_FAILED") || !strings.Contains(err.Error(), "MACHINE IN UNKNOWN STATE") {
+		t.Fatalf("error must be ERR_ROLLBACK_FAILED with unknown-state detail, got %v", err)
+	}
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "failed"`) || !strings.Contains(mj, `"type": "deploy"`) {
+		t.Fatalf("failed manifest (§10.6 deploy/failed marker) not written: %s", mj)
+	}
+}
+
+func TestReconfigureRestoreUsesPriorHealthCheck(t *testing.T) { // RBK-06: restore validated against prior check
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum) // new health check → http://localhost:8080/health
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	prior := winSvcSpec(t, url, sum)
+	prior.HealthCheck.HTTP.URL = "http://localhost:9090/health" // prior check differs
+	f.log = nil
+	// Health passes ONLY for the PRIOR check's endpoint (:9090); the new check's
+	// endpoint (:8080) fails. Restoration therefore succeeds only if it is validated
+	// against prior.HealthCheck — if the engine reused the new check, the restore
+	// health would fail and this would surface ERR_ROLLBACK_FAILED instead.
+	f.healthScriptGate = func(script string) bool { return strings.Contains(script, "8080") }
+	st, err := eng.Reconfigure(context.Background(), d, prior)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when new-config HEALTH fails, got status %+v", st)
+	}
+	if strings.Contains(err.Error(), "ERR_ROLLBACK_FAILED") {
+		t.Fatalf("restore validated against the WRONG (new) health check: %v", err)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("restore against prior health check must succeed, got %v", err)
+	}
+	mj := string(f.files[`C:\deploy\sample-svc\manifest.json`])
+	if !strings.Contains(mj, `"result": "rolled_back"`) {
+		t.Fatalf("rolled-back manifest not finalized: %s", mj)
+	}
+}
+
+func TestReconfigureRunsChangedPostInstall(t *testing.T) { // changed hook must run at pre-activation point
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Deploy WITHOUT a post_install hook, then reconfigure to ADD one (same
+	// artifact). The newly-added hook MUST run, between CONFIGURE and START.
+	prior := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	next := winSvcSpecPostInstall(t, url, sum) // adds LDPOSTINSTALL, artifact unchanged
+	st, err := eng.Reconfigure(context.Background(), next, prior)
+	if err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("reconfigure returned nil status")
+	}
+	order := strings.Join(f.log, ">")
+	if !strings.Contains(order, "POSTINSTALL") {
+		t.Fatalf("a CHANGED post_install hook must run, got %v", f.log)
+	}
+	for _, pair := range [][2]string{{"CONFIGURE", "POSTINSTALL"}, {"POSTINSTALL", "START"}} {
+		if strings.Index(order, pair[0]) > strings.Index(order, pair[1]) {
+			t.Fatalf("post_install order violated (%s before %s): %v", pair[0], pair[1], f.log)
+		}
+	}
+}
+
+func TestReconfigureSkipsUnchangedPostInstall(t *testing.T) { // unchanged hook must NOT re-run
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Deploy WITH a post_install hook, then reconfigure with the SAME hook. The hook
+	// already ran when the artifact was staged; a same-artifact reconfigure that does
+	// not change it must NOT re-execute it.
+	d := winSvcSpecPostInstall(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	if _, err := eng.Reconfigure(context.Background(), d, d); err != nil {
+		t.Fatalf("reconfigure: %v\nlog=%v", err, f.log)
+	}
+	if strings.Contains(strings.Join(f.log, ">"), "POSTINSTALL") {
+		t.Fatalf("an UNCHANGED post_install hook must NOT re-run, got %v", f.log)
+	}
+}
+
+func TestReconfigureRollbackSkipsPriorPostInstall(t *testing.T) { // rollback must NOT re-run the prior hook
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Prior config HAS a post_install hook; the reconfigure keeps the SAME hook (so
+	// the forward path does not run it) but fails at CONFIGURE, forcing a rollback.
+	// The restore of the prior configuration must NOT re-execute the prior hook.
+	d := winSvcSpecPostInstall(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	f.failN["configure"] = 1 // fail the forward CONFIGURE once → rollback
+	st, err := eng.Reconfigure(context.Background(), d, d)
+	if err == nil {
+		t.Fatalf("reconfigure must fail when CONFIGURE fails, got status %+v", st)
+	}
+	if !strings.Contains(err.Error(), "prior configuration restored") {
+		t.Fatalf("error must report prior config restored, got %v", err)
+	}
+	if strings.Contains(strings.Join(f.log, ">"), "POSTINSTALL") {
+		t.Fatalf("rollback must NOT re-run the prior post_install hook, got %v", f.log)
+	}
+}
+
+func TestUpdateRoutesSameArtifactThroughReconfigure(t *testing.T) { // item 2: approved path applies config
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	f.log = nil
+	// Same artifact (version + checksum unchanged): Update MUST route through the
+	// transactional Reconfigure path so CONFIGURE actually runs, rather than hitting
+	// Deploy's idempotency short-circuit which would skip it.
+	st, err := eng.Update(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("update returned nil status")
+	}
+	order := strings.Join(f.log, ">")
+	if !strings.Contains(order, "CONFIGURE") {
+		t.Fatalf("same-artifact Update must reconfigure (run CONFIGURE), got %v", f.log)
+	}
+	if strings.Contains(order, "FETCH") {
+		t.Fatalf("same-artifact Update must not re-stage the artifact, got %v", f.log)
+	}
+}
+
+func TestUpdateRoutesNewArtifactThroughDeploy(t *testing.T) { // item 2: version bump still deploys
+	p1 := []byte("v1")
+	url1, sum1, done1 := testArtifactServer(t, p1)
+	defer done1()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	prior := winSvcSpec(t, url1, sum1)
+	if _, err := eng.Deploy(context.Background(), prior); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	p2 := []byte("v2 bytes")
+	url2, sum2, done2 := testArtifactServer(t, p2)
+	defer done2()
+	next := winSvcSpec(t, url2, sum2)
+	next.Artifact.Version = "2.0.0"
+	f.log = nil
+	if _, err := eng.Update(context.Background(), next, prior); err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), "FETCH") {
+		t.Fatalf("changed-artifact Update must deploy (re-stage the artifact), got %v", f.log)
+	}
+}
+
+func TestUpdateFallsBackToDeployWhenManifestAbsent(t *testing.T) { // item 4: (nil,nil) must not surface
+	payload := []byte("v1 bytes")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	// Nothing deployed yet → the manifest is absent, so Reconfigure returns (nil,nil).
+	// Engine.Update must fall back to Deploy and return a NON-nil status (the provider
+	// dereferences it) rather than propagating the nil.
+	st, err := eng.Update(context.Background(), d, d)
+	if err != nil {
+		t.Fatalf("update: %v\nlog=%v", err, f.log)
+	}
+	if st == nil {
+		t.Fatalf("Update must fall back to Deploy (non-nil status) when nothing is deployed")
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), "FETCH") {
+		t.Fatalf("fallback Deploy must stage the artifact, got %v", f.log)
 	}
 }
 
@@ -412,6 +955,71 @@ func TestLockContention(t *testing.T) { // LCK-01
 	}
 }
 
+// TestWarnInsecureTransportExactlyOnce covers DESIGN §11: the lab-insecure transport
+// settings — WinRM insecure_skip_verify=true and an unpinned SSH host_key ("") — each
+// emit EXACTLY ONE WARN naming the setting, deduped across repeated preflight calls (the
+// cluster path preflights every host), while a secure spec emits nothing.
+func TestWarnInsecureTransportExactlyOnce(t *testing.T) {
+	insecure := true
+	winInsecure := &spec.Deployment{Target: spec.Target{
+		Transport: spec.TransportWinRM, WinRM: spec.WinRMOpts{InsecureSkipVerify: &insecure}}}
+	e := New()
+	// Simulate a 3-host cluster preflighting each node: the notice must appear once.
+	e.warnInsecureTransport(winInsecure)
+	e.warnInsecureTransport(winInsecure)
+	e.warnInsecureTransport(winInsecure)
+	if got := countContaining(e.Warnings, "insecure_skip_verify"); got != 1 {
+		t.Fatalf("winrm insecure_skip_verify=true must warn exactly once, got %d in %v", got, e.Warnings)
+	}
+
+	sshUnpinned := &spec.Deployment{Target: spec.Target{
+		Transport: spec.TransportSSH, SSH: spec.SSHOpts{HostKey: ""}}}
+	e2 := New()
+	e2.warnInsecureTransport(sshUnpinned)
+	e2.warnInsecureTransport(sshUnpinned)
+	if got := countContaining(e2.Warnings, "host_key not pinned"); got != 1 {
+		t.Fatalf("unpinned ssh host_key must warn exactly once, got %d in %v", got, e2.Warnings)
+	}
+
+	// A secure spec (pinned host key) emits no insecure-transport notice.
+	sshPinned := &spec.Deployment{Target: spec.Target{
+		Transport: spec.TransportSSH, SSH: spec.SSHOpts{HostKey: "AAAA"}}}
+	e3 := New()
+	e3.warnInsecureTransport(sshPinned)
+	if len(e3.Warnings) != 0 {
+		t.Fatalf("pinned host key must emit no warning, got %v", e3.Warnings)
+	}
+}
+
+// TestDeployWinRMInsecureWarnsOnce proves the DESIGN §11 WinRM notice flows through a real
+// apply (preflight) exactly once per apply.
+func TestDeployWinRMInsecureWarnsOnce(t *testing.T) {
+	payload := []byte("v1")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	d := winSvcSpec(t, url, sum)
+	insecure := true
+	d.Target.WinRM.InsecureSkipVerify = &insecure
+	if _, err := eng.Deploy(context.Background(), d); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if got := countContaining(eng.Warnings, "insecure_skip_verify"); got != 1 {
+		t.Fatalf("apply must emit exactly one insecure_skip_verify warning, got %d in %v", got, eng.Warnings)
+	}
+}
+
+func countContaining(ss []string, sub string) int {
+	n := 0
+	for _, s := range ss {
+		if strings.Contains(s, sub) {
+			n++
+		}
+	}
+	return n
+}
+
 func TestDestroyPurge(t *testing.T) { // DST-01
 	payload := []byte("v1")
 	url, sum, done := testArtifactServer(t, payload)
@@ -442,12 +1050,493 @@ func TestDestroyPurge(t *testing.T) { // DST-01
 
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 
-func asCoded(err error, out **CodedError) bool { return errors.As(err, out) }
-
 func keysOf(m map[string][]byte) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
 	}
 	return out
+}
+
+func asCoded(err error, out **CodedError) bool { return errors.As(err, out) }
+
+// TestPruneKeepsPrevious drives pruneReleases against the fake transport with
+// keep_releases=2 and a previous_version whose mtime is OLDER than a kept
+// non-protected release. The oldest release must be removed while both the
+// current and (old) previous versions are retained (Stage 3.3 scenario
+// "Prune keeps previous", DESIGN §10.1 step 13 / strategy.keep_releases).
+func TestPruneKeepsPrevious(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("prune"))
+	defer done()
+	d := winSvcSpec(t, url, sum) // strategy.keep_releases: 2
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	p := layout.NewPaths(spec.OSWindows, `C:\deploy`, "sample-svc", "1.2.0")
+	// keep_releases=2 is the TOTAL retention budget (DESIGN CAP-02). current
+	// (1.2.0) + previous (1.0.0) are always protected and fill the entire budget,
+	// so BOTH non-protected dirs (1.1.0, 0.9.0) must be pruned — even though
+	// 1.1.0 is newer than previous (proves protection is by identity, not age).
+	f.dirs = map[string]bool{"1.2.0": true, "1.1.0": true, "1.0.0": true, "0.9.0": true}
+	f.dirTS = map[string]int64{"1.2.0": 400, "1.1.0": 300, "1.0.0": 200, "0.9.0": 100}
+
+	m := &Manifest{CurrentVersion: "1.2.0", PreviousVersion: "1.0.0"}
+	if err := eng.pruneReleases(context.Background(), f, d, p, m); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	joined := strings.Join(f.log, ">")
+	for _, del := range []string{"1.1.0", "0.9.0"} {
+		if !strings.Contains(joined, `RM C:\deploy\sample-svc\releases\`+del) {
+			t.Fatalf("non-protected release %s must be pruned (keep=2 total); log=%v", del, f.log)
+		}
+	}
+	for _, keep := range []string{"1.2.0", "1.0.0"} {
+		if strings.Contains(joined, `RM C:\deploy\sample-svc\releases\`+keep) {
+			t.Fatalf("protected release %s (current/previous) must be retained, log=%v", keep, f.log)
+		}
+	}
+}
+
+// TestPruneReportsDeletionFailure proves prune no longer silently swallows a
+// failed removal: when removePath returns nonzero, pruneReleases surfaces the
+// error so the caller can emit its prune warning (evaluator feedback item 2).
+func TestPruneReportsDeletionFailure(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("prune-fail"))
+	defer done()
+	d := winSvcSpec(t, url, sum) // keep_releases: 2
+	f := newFakeHost("lab-01")
+	f.fail["rm"] = true
+	eng := engineWith(f)
+
+	p := layout.NewPaths(spec.OSWindows, `C:\deploy`, "sample-svc", "1.2.0")
+	f.dirs = map[string]bool{"1.2.0": true, "1.1.0": true, "1.0.0": true, "0.9.0": true}
+	f.dirTS = map[string]int64{"1.2.0": 400, "1.1.0": 300, "1.0.0": 200, "0.9.0": 100}
+
+	m := &Manifest{CurrentVersion: "1.2.0", PreviousVersion: "1.0.0"}
+	err := eng.pruneReleases(context.Background(), f, d, p, m)
+	if err == nil {
+		t.Fatal("prune must return an error when a deletion fails")
+	}
+	if !strings.Contains(err.Error(), "1.1.0") {
+		t.Fatalf("prune error should name the failed release: %v", err)
+	}
+}
+
+// runnerPushSpec is winSvcSpec with fetch_mode: runner_push so fetchToStaging
+// takes the runner-download + transport.Upload path (DESIGN §6.3).
+func runnerPushSpec(t *testing.T, url, checksum string) *spec.Deployment {
+	t.Helper()
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	y := fmt.Sprintf(`
+apiVersion: labdeploy/v1
+kind: Deployment
+metadata: { name: sample-svc }
+target:
+  transport: winrm
+  hosts: ["lab-01"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  fetch_mode: runner_push
+  checksum: "%s"
+  source: { type: http, url: "%s" }
+pattern:
+  type: windows_service
+  service_name: SampleSvc
+  exe: bin\SampleSvc.exe
+health_check:
+  type: http
+  http: { url: "http://localhost:8080/health" }
+  initial_delay_seconds: 1
+  interval_seconds: 1
+  timeout_seconds: 3
+strategy: { keep_releases: 2, rollback_on_failure: true }
+`, checksum, url)
+	d, _, err := spec.ParseDeployment(y, nil, "")
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	return d
+}
+
+// TestRunnerPushStagingAndMarker exercises the runner_push staging path: the
+// artifact is downloaded on the runner and uploaded to <staging>/pkg.zip, the
+// release marker records {version, sha256, extracted_at}, and staging is wiped
+// on success (evaluator feedback items 1 & 4).
+func TestRunnerPushStagingAndMarker(t *testing.T) {
+	payload := []byte("runner push zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	if _, err := eng.Deploy(context.Background(), runnerPushSpec(t, url, sum)); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+
+	joined := strings.Join(f.log, ">")
+	if !strings.Contains(joined, `UPLOAD C:\deploy\sample-svc\staging\pkg.zip`) {
+		t.Fatalf("runner_push must Upload the package to staging; log=%v", f.log)
+	}
+	// Marker contents.
+	marker := `C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`
+	raw, ok := f.files[marker]
+	if !ok {
+		t.Fatalf("release marker %s not written; files=%v", marker, keysOf(f.files))
+	}
+	for _, frag := range []string{`"version": "1.0.0"`, `"sha256": "` + sum + `"`, `"extracted_at"`} {
+		if !strings.Contains(string(raw), frag) {
+			t.Fatalf("marker missing %q; got:\n%s", frag, raw)
+		}
+	}
+	// Staging wiped on success: no pkg.zip survives.
+	if _, present := f.files[`C:\deploy\sample-svc\staging\pkg.zip`]; present {
+		t.Fatal("staging pkg.zip must be wiped after a successful stage")
+	}
+}
+
+// TestStagingWipedOnExtractFailure proves the deferred staging wipe runs even
+// when extraction fails, so no partial download leaks (evaluator feedback
+// items 1 & 4).
+func TestStagingWipedOnExtractFailure(t *testing.T) {
+	payload := []byte("corrupt")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["extract"] = true
+	eng := engineWith(f)
+	_, err := eng.Deploy(context.Background(), runnerPushSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("expected extract failure")
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_EXTRACT" {
+		t.Fatalf("want ERR_EXTRACT, got %v", err)
+	}
+	if _, present := f.files[`C:\deploy\sample-svc\staging\pkg.zip`]; present {
+		t.Fatal("staging pkg.zip must be wiped after a failed extract")
+	}
+	if _, present := f.files[`C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`]; present {
+		t.Fatal("release marker must NOT be written when extract fails")
+	}
+	// Item 5 (DESIGN §10.2): a failed extract must leave a staging-only failure
+	// state — the partially-created release dir is removed, not left dangling.
+	if !strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\releases\1.0.0`) {
+		t.Fatalf("partial release dir must be removed on extract failure; log=%v", f.log)
+	}
+}
+
+// TestStagingWipedOnChecksumFailure proves a runner-side checksum mismatch fails
+// closed and still triggers the staging wipe (evaluator feedback items 1 & 4).
+func TestStagingWipedOnChecksumFailure(t *testing.T) {
+	payload := []byte("real bytes")
+	url, _, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Wrong checksum ⇒ artifact.Fetch verify fails before upload.
+	badSum := "sha256:" + strings.Repeat("0", 64)
+	_, err := eng.Deploy(context.Background(), runnerPushSpec(t, url, badSum))
+	if err == nil {
+		t.Fatal("expected checksum mismatch failure")
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_CHECKSUM_MISMATCH" {
+		t.Fatalf("want ERR_CHECKSUM_MISMATCH, got %v", err)
+	}
+	// The start-of-op staging wipe must have executed.
+	if !strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\staging`) {
+		t.Fatalf("staging must be wiped on checksum failure; log=%v", f.log)
+	}
+}
+
+// TestCachedReleaseStillWipesStaging proves the whole-directory staging wipe
+// runs on EVERY op, including a cache hit that skips fetch/extract (evaluator
+// feedback item 3; DESIGN §9.1 "wiped at start & end of every op").
+func TestCachedReleaseStillWipesStaging(t *testing.T) {
+	payload := []byte("cached zip")
+	url, sum, done := testArtifactServer(t, payload)
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+	// Pre-seed a matching release marker so releaseCached() returns true, and a
+	// stale pkg.zip left behind by a prior op that the wipe must clear.
+	marker := `C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`
+	f.files[marker] = []byte(fmt.Sprintf("{\n  \"version\": \"1.0.0\",\n  \"sha256\": %q,\n  \"extracted_at\": \"x\"\n}\n", sum))
+	f.files[`C:\deploy\sample-svc\staging\pkg.zip`] = []byte("stale")
+
+	if _, err := eng.Deploy(context.Background(), runnerPushSpec(t, url, sum)); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	joined := strings.Join(f.log, ">")
+	if !strings.Contains(joined, `RM C:\deploy\sample-svc\staging`) {
+		t.Fatalf("cached deploy must still wipe staging; log=%v", f.log)
+	}
+	if strings.Contains(joined, "EXTRACT") {
+		t.Fatalf("cached deploy must skip extraction; log=%v", f.log)
+	}
+	if _, present := f.files[`C:\deploy\sample-svc\staging\pkg.zip`]; present {
+		t.Fatal("stale staging pkg.zip must be wiped on a cached deploy")
+	}
+}
+
+// recLinux is a minimal Linux-OS recording transport: it captures every script
+// the engine emits and returns success (empty listings) so orchestration paths
+// run to completion. Used to assert POSIX shell-quoting of hostile paths.
+type recLinux struct {
+	host    string
+	scripts []string
+}
+
+func (r *recLinux) Connect(ctx context.Context) error { return nil }
+func (r *recLinux) Close() error                      { return nil }
+func (r *recLinux) OS() spec.OSKind                   { return spec.OSLinux }
+func (r *recLinux) Host() string                      { return r.host }
+func (r *recLinux) Exec(ctx context.Context, c transport.Cmd) (transport.Result, error) {
+	r.scripts = append(r.scripts, c.Script)
+	return transport.Result{ExitCode: 0}, nil // empty stdout => empty prune listing
+}
+func (r *recLinux) Upload(ctx context.Context, _ io.Reader, _ int64, _ string) error { return nil }
+func (r *recLinux) Download(ctx context.Context, _, _ string) error                  { return nil }
+
+var _ transport.Transport = (*recLinux)(nil)
+
+// TestLinuxOrchestrationQuotesHostileRoot drives the REAL staging/prune
+// orchestration (wipeStaging + pruneReleases, not just the script generators)
+// with an install_root that embeds a single quote and a shell metacharacter
+// payload, and asserts every emitted script POSIX-escapes it via shq (`'\”`)
+// so the payload can never break out of its quotes (evaluator feedback item 4).
+func TestLinuxOrchestrationQuotesHostileRoot(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("x"))
+	defer done()
+	d := winSvcSpec(t, url, sum) // keep_releases: 2
+	rec := &recLinux{host: "node-01"}
+	eng := New()
+
+	root := `/opt/'; touch /tmp/pwned; '`
+	p := layout.NewPaths(spec.OSLinux, root, "sample-svc", "1.0.0")
+
+	if err := eng.wipeStaging(context.Background(), rec, p); err != nil {
+		t.Fatalf("wipeStaging: %v", err)
+	}
+	m := &Manifest{CurrentVersion: "1.0.0"}
+	if err := eng.pruneReleases(context.Background(), rec, d, p, m); err != nil {
+		t.Fatalf("pruneReleases: %v", err)
+	}
+
+	if len(rec.scripts) == 0 {
+		t.Fatal("expected orchestration to emit scripts")
+	}
+	sawRoot := false
+	for _, s := range rec.scripts {
+		if !strings.Contains(s, "touch /tmp/pwned") {
+			continue // script that doesn't interpolate the hostile root
+		}
+		sawRoot = true
+		// shq must have escaped the embedded quote as '\'' ...
+		if !strings.Contains(s, `'\''`) {
+			t.Fatalf("hostile root not POSIX-escaped in script:\n%s", s)
+		}
+		// ... and the naked breakout forms an unquoted interpolation would
+		// produce must NOT appear (payload must stay inside quotes).
+		for _, breakout := range []string{`mkdir -p '/opt/'; `, `-rf '/opt/'; `, `for d in '/opt/'; `} {
+			if strings.Contains(s, breakout) {
+				t.Fatalf("command injection breakout %q present in script:\n%s", breakout, s)
+			}
+		}
+	}
+	if !sawRoot {
+		t.Fatal("no emitted script interpolated the install_root; test ineffective")
+	}
+}
+
+// TestPostInstallFailureMapsServiceInstallAndCleansRelease covers evaluator
+// items 1 & 3: a post_install non-zero exit is mapped to ERR_SERVICE_INSTALL
+// (DESIGN §6.4), and because THIS op created the release, the partial release
+// dir is removed (DESIGN §10.2 staging-only failure state).
+func TestPostInstallFailureMapsServiceInstallAndCleansRelease(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["postinstall"] = true
+	eng := engineWith(f)
+
+	_, err := eng.Deploy(context.Background(), winSvcSpecPostInstall(t, url, sum))
+	if err == nil {
+		t.Fatal("expected post_install failure")
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != "ERR_SERVICE_INSTALL" {
+		t.Fatalf("want ERR_SERVICE_INSTALL, got %v", err)
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\releases\1.0.0`) {
+		t.Fatalf("newly-created release must be removed on post_install failure; log=%v", f.log)
+	}
+}
+
+// TestCachedReleaseSurvivesPostInstallFailure covers evaluator item 1's gate:
+// a post_install failure on a CACHED release (not created by this op) must NOT
+// delete the pre-existing good release.
+func TestCachedReleaseSurvivesPostInstallFailure(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["postinstall"] = true
+	// Seed a valid marker so releaseCached() is true ⇒ createdRelease stays false.
+	marker := `C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`
+	f.files[marker] = []byte(fmt.Sprintf("{\n  \"version\": \"1.0.0\",\n  \"sha256\": %q,\n  \"extracted_at\": \"2024-01-01T00:00:00Z\"\n}\n", sum))
+	eng := engineWith(f)
+
+	_, err := eng.Deploy(context.Background(), winSvcSpecPostInstall(t, url, sum))
+	if err == nil {
+		t.Fatal("expected post_install failure")
+	}
+	if strings.Contains(strings.Join(f.log, ">"), `RM C:\deploy\sample-svc\releases\1.0.0`) {
+		t.Fatalf("cached release must NOT be removed on post_install failure; log=%v", f.log)
+	}
+	if _, present := f.files[marker]; !present {
+		t.Fatal("cached release marker must survive a post_install failure")
+	}
+}
+
+// TestIncompleteReleaseCleanupFailureSurfaced covers evaluator item 2: when the
+// incomplete-release removal itself fails, that error is JOINED onto the op
+// error rather than silently discarded.
+func TestIncompleteReleaseCleanupFailureSurfaced(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["postinstall"] = true // pre-switch failure on a freshly-created release
+	f.fail["rmRelease"] = true   // ...and the release cleanup removal fails
+	eng := engineWith(f)
+
+	_, err := eng.Deploy(context.Background(), winSvcSpecPostInstall(t, url, sum))
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if !strings.Contains(err.Error(), "incomplete-release cleanup") {
+		t.Fatalf("cleanup failure must be surfaced (joined) onto op error; got: %v", err)
+	}
+	// Original cause must still be present (errors.Join keeps both).
+	if !strings.Contains(err.Error(), "post_install") {
+		t.Fatalf("original post_install cause must be preserved; got: %v", err)
+	}
+}
+
+// TestMalformedMarkerReFetches covers evaluator item 4: a marker that is not
+// valid/complete JSON must NOT be trusted as a cache hit — the release is
+// re-fetched and re-extracted.
+func TestMalformedMarkerReFetches(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("zip"))
+	defer done()
+
+	// (a) Non-JSON text that merely contains the checksum fragment.
+	f := newFakeHost("lab-01")
+	marker := `C:\deploy\sample-svc\releases\1.0.0\.labdeploy-release.json`
+	f.files[marker] = []byte(`garbage "sha256": "` + sum + `" not json`)
+	eng := engineWith(f)
+	if _, err := eng.Deploy(context.Background(), winSvcSpec(t, url, sum)); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if !strings.Contains(strings.Join(f.log, ">"), "EXTRACT") {
+		t.Fatalf("malformed marker must force re-extract; log=%v", f.log)
+	}
+
+	// (b) Valid JSON but missing extracted_at ⇒ incomplete ⇒ re-stage.
+	f2 := newFakeHost("lab-01")
+	f2.files[marker] = []byte(fmt.Sprintf("{\n  \"version\": \"1.0.0\",\n  \"sha256\": %q\n}\n", sum))
+	eng2 := engineWith(f2)
+	if _, err := eng2.Deploy(context.Background(), winSvcSpec(t, url, sum)); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if !strings.Contains(strings.Join(f2.log, ">"), "EXTRACT") {
+		t.Fatalf("incomplete marker (no extracted_at) must force re-extract; log=%v", f2.log)
+	}
+}
+
+// e2eTestRunSpec is a minimal TestRun whose exec runner command is the sentinel
+// LDRUNNERFAIL the fake transport fails post-staging.
+func e2eTestRunSpec(t *testing.T, url, checksum string) *spec.TestRun {
+	t.Helper()
+	t.Setenv("LABDEPLOY_PASSWORD", "pw")
+	y := fmt.Sprintf(`
+apiVersion: labdeploy/v1
+kind: TestRun
+metadata: { name: sample-svc-e2e }
+target:
+  transport: winrm
+  hosts: ["lab-01"]
+  os: windows
+  credentials: { username: u, password_env: LABDEPLOY_PASSWORD }
+artifact:
+  type: zip
+  version: 1.0.0
+  checksum: "%s"
+  source: { type: http, url: "%s" }
+runner:
+  type: exec
+  command: LDRUNNERFAIL
+  timeout_seconds: 60
+results: { format: none }
+pass_criteria: { exit_codes: [0] }
+`, checksum, url)
+	tr, _, err := spec.ParseTestRun(y, nil)
+	if err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+	// Direct runner/results output to a per-test temp dir so tests never write
+	// generated `labdeploy-results/**` artifacts into the repo working tree.
+	tr.Collect.DestinationDir = t.TempDir()
+	return tr
+}
+
+// TestRunPostStagingFailureKeepsRelease covers evaluator (iter 5) item 1: once
+// staging completes the release is fully extracted, so a LATER failure (here the
+// test-execution transport error) must NOT delete the good release — the
+// incomplete-release cleanup is strictly a pre-execution/staging remedy.
+func TestRunPostStagingFailureKeepsRelease(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("test zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	eng := engineWith(f)
+
+	_, err := eng.RunTest(context.Background(), e2eTestRunSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("expected runner execution failure")
+	}
+	// Staging happened (fresh extract) ...
+	joined := strings.Join(f.log, ">")
+	if !strings.Contains(joined, "EXTRACT") {
+		t.Fatalf("test release should have been extracted; log=%v", f.log)
+	}
+	// ... but the fully-extracted release must survive the post-staging failure.
+	release := `C:\deploy\_tests\sample-svc-e2e\releases\1.0.0`
+	if strings.Contains(joined, "RM "+release) {
+		t.Fatalf("post-staging failure must NOT delete the extracted release; log=%v", f.log)
+	}
+	// The cleanup-failure marker must also be absent from the error.
+	if strings.Contains(err.Error(), "incomplete-release cleanup") {
+		t.Fatalf("no incomplete-release cleanup should run post-staging; got: %v", err)
+	}
+}
+
+// TestRunStagingFailureRemovesRelease is the counterpart: a PRE-execution failure
+// (extract) on a freshly-created test release DOES remove the partial release.
+func TestRunStagingFailureRemovesRelease(t *testing.T) {
+	url, sum, done := testArtifactServer(t, []byte("test zip"))
+	defer done()
+	f := newFakeHost("lab-01")
+	f.fail["extract"] = true
+	eng := engineWith(f)
+
+	_, err := eng.RunTest(context.Background(), e2eTestRunSpec(t, url, sum))
+	if err == nil {
+		t.Fatal("expected extract failure")
+	}
+	release := `C:\deploy\_tests\sample-svc-e2e\releases\1.0.0`
+	if !strings.Contains(strings.Join(f.log, ">"), "RM "+release) {
+		t.Fatalf("pre-execution staging failure must remove the partial release; log=%v", f.log)
+	}
 }

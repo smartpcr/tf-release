@@ -1,0 +1,53 @@
+# golangci-lint v2 configuration for terraform-provider-labdeploy.
+# DESIGN sec 20 requires `golangci-lint run` to be clean. The CI workflow
+# installs golangci-lint v2 (latest), so this file uses the v2 schema
+# (`version: "2"`); `golangci-lint config verify` must pass.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  # The E2E step-definitions (test/e2e/**/*_test.go) are behind `//go:build e2e`,
+  # so without this tag golangci-lint would silently exclude them from analysis --
+  # letting the workstream's own deliverable escape the "Lint clean" gate that
+  # DESIGN sec 20 and the feature scenario assert. Enabling the tag makes the E2E
+  # sources part of the linted build.
+  build-tags:
+    - e2e
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unconvert
+    - unused
+  settings:
+    errcheck:
+      # Ignoring errors from best-effort cleanup on temp paths is idiomatic; the
+      # primary error path is always checked explicitly.
+      exclude-functions:
+        - os.Remove
+  exclusions:
+    # Deferred Close() on readers/sessions/handles is idiomatic best-effort
+    # cleanup; the meaningful I/O error is always surfaced on the primary path.
+    rules:
+      - linters:
+          - errcheck
+        text: 'Error return value of `[^`]+\.Close` is not checked'
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/smartpcr/terraform-provider-labdeploy
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

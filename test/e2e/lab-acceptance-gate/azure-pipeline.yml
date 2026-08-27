@@ -1,0 +1,97 @@
+# Azure Pipelines — Stage 9.1 "Windows and Linux Single Target Acceptance"
+# lab acceptance gate for the release provider.
+#
+# These two scenarios are `[proof: lab]`: they require a real Windows Server
+# 2022 host (W1 — WinRM https, node+.NET+vstest, Administrator) and a real Linux
+# VM (L1 — ssh). Forge's ordinary bare gate has no such hosts, no admin, and no
+# native symlink privilege, so the WSV/NOD/NET service registration and native
+# `ln -sfn` behaviour cannot execute there. This pipeline runs the SAME godog
+# suite under TF_ACC=1 on a self-hosted agent pool that reaches the provisioned
+# lab, wiring the LABDEPLOY_ACC_* connection variables from a secret variable
+# group. It is manual / scheduled because it drives real lab hardware.
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: "0 2 * * *"
+    displayName: Nightly lab acceptance
+    branches:
+      include:
+        - feature/release
+        - main
+    always: true
+
+pool:
+  # Self-hosted Windows orchestrator that can reach BOTH the W1 host (WinRM) and
+  # the L1 VM (ssh). Configure this pool with agents inside the lab network.
+  name: labdeploy-lab
+  demands:
+    - Agent.OS -equals Windows_NT
+
+variables:
+  # Secret group holding the LABDEPLOY_ACC_* connection secrets + checksums.
+  - group: labdeploy-lab-acceptance
+  - name: CGO_ENABLED
+    value: "0"
+  # Turn the TF_ACC-gated W1/L1 lab paths ON.
+  - name: TF_ACC
+    value: "1"
+
+steps:
+  - task: GoTool@0
+    displayName: Set up Go 1.22
+    inputs:
+      version: "1.22"
+
+  - powershell: |
+      $missing = @()
+      foreach ($v in @(
+        'LABDEPLOY_ACC_W1_HOST','LABDEPLOY_ACC_W1_USER','LABDEPLOY_ACC_W1_PASSWORD',
+        'LABDEPLOY_ACC_L1_HOST','LABDEPLOY_ACC_ARTIFACT_BASE_URL',
+        'LABDEPLOY_ACC_SHA_1_0_0_ZIP','LABDEPLOY_ACC_SHA_1_1_0_ZIP')) {
+        if (-not (Get-Item "Env:$v" -ErrorAction SilentlyContinue).Value) { $missing += $v }
+      }
+      if ($missing.Count -gt 0) {
+        Write-Error "Missing required lab variables: $($missing -join ', ')"
+        exit 1
+      }
+    displayName: Preflight — required lab variables present
+    env:
+      LABDEPLOY_ACC_W1_HOST: $(LABDEPLOY_ACC_W1_HOST)
+      LABDEPLOY_ACC_W1_USER: $(LABDEPLOY_ACC_W1_USER)
+      LABDEPLOY_ACC_W1_PASSWORD: $(LABDEPLOY_ACC_W1_PASSWORD)
+      LABDEPLOY_ACC_L1_HOST: $(LABDEPLOY_ACC_L1_HOST)
+      LABDEPLOY_ACC_ARTIFACT_BASE_URL: $(LABDEPLOY_ACC_ARTIFACT_BASE_URL)
+      LABDEPLOY_ACC_SHA_1_0_0_ZIP: $(LABDEPLOY_ACC_SHA_1_0_0_ZIP)
+      LABDEPLOY_ACC_SHA_1_1_0_ZIP: $(LABDEPLOY_ACC_SHA_1_1_0_ZIP)
+
+  - powershell: |
+      go test -tags e2e -count=1 -timeout 40m -v `
+        -run TestE2E_lab_acceptance_gate_windows_and_linux_single_target_acceptance `
+        ./test/e2e/release-RELEASE-PROVIDER/...
+    displayName: Run Stage 9.1 lab acceptance (TF_ACC=1, W1 + L1)
+    env:
+      TF_ACC: $(TF_ACC)
+      CGO_ENABLED: $(CGO_ENABLED)
+      # --- W1 (Windows Server 2022, WinRM https) ---
+      LABDEPLOY_ACC_W1_HOST: $(LABDEPLOY_ACC_W1_HOST)
+      LABDEPLOY_ACC_W1_PORT: $(LABDEPLOY_ACC_W1_PORT)
+      LABDEPLOY_ACC_W1_USER: $(LABDEPLOY_ACC_W1_USER)
+      LABDEPLOY_ACC_W1_PASSWORD: $(LABDEPLOY_ACC_W1_PASSWORD)
+      # --- L1 (Linux VM, ssh) ---
+      LABDEPLOY_ACC_L1_HOST: $(LABDEPLOY_ACC_L1_HOST)
+      LABDEPLOY_ACC_L1_PORT: $(LABDEPLOY_ACC_L1_PORT)
+      LABDEPLOY_ACC_L1_USER: $(LABDEPLOY_ACC_L1_USER)
+      LABDEPLOY_ACC_L1_PASSWORD: $(LABDEPLOY_ACC_L1_PASSWORD)
+      LABDEPLOY_ACC_L1_PRIVATE_KEY: $(LABDEPLOY_ACC_L1_PRIVATE_KEY)
+      LABDEPLOY_ACC_L1_HOST_KEY: $(LABDEPLOY_ACC_L1_HOST_KEY)
+      # --- Artifact host + sample-svc checksums ---
+      LABDEPLOY_ACC_ARTIFACT_BASE_URL: $(LABDEPLOY_ACC_ARTIFACT_BASE_URL)
+      LABDEPLOY_ACC_SHA_1_0_0_ZIP: $(LABDEPLOY_ACC_SHA_1_0_0_ZIP)
+      LABDEPLOY_ACC_SHA_1_1_0_ZIP: $(LABDEPLOY_ACC_SHA_1_1_0_ZIP)
+      # --- Optional W1 service-deployment knobs ---
+      LABDEPLOY_ACC_W1_SERVICE_INSTALL_ROOT: $(LABDEPLOY_ACC_W1_SERVICE_INSTALL_ROOT)
+      LABDEPLOY_ACC_NET_DLL: $(LABDEPLOY_ACC_NET_DLL)
+      LABDEPLOY_ACC_NOD_ENTRY: $(LABDEPLOY_ACC_NOD_ENTRY)
+      LABDEPLOY_ACC_NOD_WINSW: $(LABDEPLOY_ACC_NOD_WINSW)

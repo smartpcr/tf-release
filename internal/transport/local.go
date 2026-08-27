@@ -52,7 +52,10 @@ func (l *localTransport) Exec(ctx context.Context, c Cmd) (Result, error) {
 			"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
 			"-EncodedCommand", line[len(line)-encLen(line):])
 	case ShellSh:
-		cmd = exec.CommandContext(ctx, "sh", "-c", withEnvSh(c.Script, c.Env))
+		// Inject env via the child process environment (correct expansion),
+		// not a string prefix inside the script (DESIGN §8.1).
+		cmd = exec.CommandContext(ctx, "sh", "-c", c.Script)
+		cmd.Env = append(os.Environ(), envKV(c.Env)...)
 	case ShellCmd:
 		cmd = exec.CommandContext(ctx, "cmd.exe", "/c", c.Script)
 	}

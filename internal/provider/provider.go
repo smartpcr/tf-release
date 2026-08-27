@@ -7,10 +7,25 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/spec"
 )
+
+// Address is the Terraform registry source address the provider server
+// advertises (DESIGN §16.1). main.go serves the provider under this address and
+// the provider test asserts it, keeping the two in sync.
+const Address = "registry.local/smartpcr/labdeploy"
+
+// ServeOpts returns the base providerserver.ServeOpts main.go serves the
+// provider with. Centralizing the served source address here keeps main.go and
+// the acceptance harness reading from a single source of truth (DESIGN §16.1);
+// callers set Debug per-invocation.
+func ServeOpts() providerserver.ServeOpts {
+	return providerserver.ServeOpts{Address: Address}
+}
 
 var _ provider.Provider = (*LabDeployProvider)(nil)
 
@@ -89,7 +104,10 @@ func (p *LabDeployProvider) Configure(ctx context.Context, req provider.Configur
 			v := dt.WinRMUseHTTPS.ValueBool()
 			t.WinRM.UseHTTPS = &v
 		}
-		t.WinRM.InsecureSkipVerify = dt.WinRMInsecure.ValueBool()
+		if !dt.WinRMInsecure.IsNull() && !dt.WinRMInsecure.IsUnknown() {
+			v := dt.WinRMInsecure.ValueBool()
+			t.WinRM.InsecureSkipVerify = &v
+		}
 		if !dt.Hosts.IsNull() {
 			var hosts []string
 			resp.Diagnostics.Append(dt.Hosts.ElementsAs(ctx, &hosts, false)...)
@@ -102,6 +120,17 @@ func (p *LabDeployProvider) Configure(ctx context.Context, req provider.Configur
 }
 
 func (p *LabDeployProvider) Resources(_ context.Context) []func() resource.Resource {
+	// Public provider contract: DESIGN §5.2-5.3 and architecture.md:49 authorize
+	// exactly two resources — labdeploy_deployment and labdeploy_e2e_test. Stage 4.2
+	// (implementation-plan.md §Stage 4.2) is scoped to the windows_service pattern-layer
+	// S-steps + goldens, NOT a new public Terraform resource.
+	//
+	// The typed WindowsServiceResource (NewWindowsServiceResource, in
+	// windows_service_resource.go) is RETAINED on disk as an additive convenience
+	// projection over labdeploy_deployment (operator KEEP pin), but is intentionally
+	// NOT registered here so the runtime provider surface matches the authorized
+	// contract. Re-registering is a one-line change if the operator pins it public
+	// (open question: typed-resource-unregister-compromise).
 	return []func() resource.Resource{
 		NewDeploymentResource,
 		NewE2ETestResource,

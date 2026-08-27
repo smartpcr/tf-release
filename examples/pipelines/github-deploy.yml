@@ -34,6 +34,22 @@ jobs:
             -var "app_version=${{ inputs.version }}" \
             -var "app_checksum=${{ inputs.checksum }}"
 
+      - name: Echo test summary to the job summary (always)
+        if: always()
+        run: |
+          # Emit the Terraform test_summary into BOTH the GitHub job summary and the
+          # job log, wrapped in bare sentinel lines. The sentinels are echoed as
+          # DATA (not as part of the `echo "..."` script text), so a log reader can
+          # tell the executed output apart from the logged script source and refuse
+          # to accept an empty terraform output as a satisfied contract.
+          {
+            echo "### labdeploy test summary"
+            echo "LABDEPLOY_SUMMARY_BEGIN"
+            terraform output -raw test_summary
+            echo ""
+            echo "LABDEPLOY_SUMMARY_END"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Upload test results + logs (always)
         if: always()
         uses: actions/upload-artifact@v4

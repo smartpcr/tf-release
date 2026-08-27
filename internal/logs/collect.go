@@ -3,12 +3,19 @@
 package logs
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
 	"context"
 	"encoding/xml"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,69 +23,314 @@ import (
 	"github.com/smartpcr/terraform-provider-labdeploy/internal/transport"
 )
 
-// CollectFiles zips remote glob matches and downloads to destDir/<host>/.
-// Best-effort: returns collected paths + warnings, never a hard failure.
+// CollectFiles zips remote glob matches, downloads the archive to destDir/<host>/,
+// and EXTRACTS it there so callers get ready-to-parse files. The archive PRESERVES
+// each file's relative directory (drive/leading-slash stripped) so two files that
+// share a basename in different directories never collide; extraction is Zip-Slip
+// guarded and reports (never silently overwrites) any residual collision. No
+// external unzip/tar dependency. Best-effort: returns extracted file paths +
+// warnings, never a hard failure.
 func CollectFiles(ctx context.Context, t transport.Transport, globs []string, destDir string) ([]string, []string) {
-	var out, warns []string
+	var warns []string
 	if len(globs) == 0 {
-		return out, warns
+		return nil, warns
 	}
 	hostDir := filepath.Join(destDir, sanitize(t.Host()))
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
-		return out, []string{fmt.Sprintf("mkdir %s: %v", hostDir, err)}
+		return nil, []string{fmt.Sprintf("mkdir %s: %v", hostDir, err)}
 	}
 	stamp := time.Now().UTC().Format("20060102T150405Z")
+
+	var remoteArchive, localArchive string
+	var rmCmd transport.Cmd
 	if t.OS() == spec.OSWindows {
-		remoteZip := fmt.Sprintf(`%s\labdeploy-logs-%s.zip`, `C:\Windows\Temp`, stamp)
+		remoteArchive = fmt.Sprintf(`%s\labdeploy-logs-%s.zip`, `C:\Windows\Temp`, stamp)
+		localArchive = filepath.Join(hostDir, "logs.zip")
+		rmCmd = transport.Cmd{Shell: transport.ShellPowerShell,
+			Script: fmt.Sprintf(`Remove-Item -Force -ErrorAction SilentlyContinue %s`, psq(remoteArchive)), TimeoutSec: 30}
+	} else {
+		remoteArchive = fmt.Sprintf("/tmp/labdeploy-logs-%s.tar.gz", stamp)
+		localArchive = filepath.Join(hostDir, "logs.tar.gz")
+		rmCmd = transport.Cmd{Shell: transport.ShellSh, Script: "rm -f " + shq(remoteArchive), TimeoutSec: 30}
+	}
+
+	cmd := buildZipScript(t.OS(), globs, remoteArchive)
+	r, err := t.Exec(ctx, cmd)
+	if err != nil || r.ExitCode != 0 {
+		return nil, []string{fmt.Sprintf("log archive on %s: err=%v %s", t.Host(), err, r.Stderr)}
+	}
+	if strings.Contains(r.Stdout, "NOFILES") {
+		return nil, []string{fmt.Sprintf("no log files matched on %s: %v", t.Host(), globs)}
+	}
+	if err := t.Download(ctx, remoteArchive, localArchive); err != nil {
+		return nil, []string{fmt.Sprintf("log download from %s: %v", t.Host(), err)}
+	}
+	_, _ = t.Exec(ctx, rmCmd)
+
+	extracted, exWarns, err := extractArchive(localArchive, hostDir)
+	warns = append(warns, exWarns...)
+	if err != nil {
+		warns = append(warns, fmt.Sprintf("extract %s: %v", localArchive, err))
+	}
+	_ = os.Remove(localArchive) // keep only the extracted files
+	return extracted, warns
+}
+
+// extractArchive unpacks a .zip or .tar.gz into destDir, PRESERVING each entry's
+// relative path (Zip-Slip guarded). Returns extracted paths + collision warnings.
+func extractArchive(archivePath, destDir string) ([]string, []string, error) {
+	if strings.HasSuffix(strings.ToLower(archivePath), ".zip") {
+		return extractZip(archivePath, destDir)
+	}
+	return extractTarGz(archivePath, destDir)
+}
+
+func extractZip(archivePath, destDir string) ([]string, []string, error) {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer zr.Close()
+	var out, warns []string
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		dst, ok := safeExtractPath(destDir, f.Name)
+		if !ok {
+			warns = append(warns, "skipped unsafe archive entry "+f.Name)
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return out, warns, err
+		}
+		final, collided, err := writeExtractedUnique(dst, rc)
+		rc.Close()
+		if err != nil {
+			return out, warns, err
+		}
+		if collided {
+			warns = append(warns, fmt.Sprintf("basename collision: wrote %s for entry %s", final, f.Name))
+		}
+		out = append(out, final)
+	}
+	return out, warns, nil
+}
+
+func extractTarGz(archivePath, destDir string) ([]string, []string, error) {
+	fh, err := os.Open(archivePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer fh.Close()
+	gz, err := gzip.NewReader(fh)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	var out, warns []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return out, warns, err
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		dst, ok := safeExtractPath(destDir, hdr.Name)
+		if !ok {
+			warns = append(warns, "skipped unsafe archive entry "+hdr.Name)
+			continue
+		}
+		final, collided, err := writeExtractedUnique(dst, tr)
+		if err != nil {
+			return out, warns, err
+		}
+		if collided {
+			warns = append(warns, fmt.Sprintf("basename collision: wrote %s for entry %s", final, hdr.Name))
+		}
+		out = append(out, final)
+	}
+	return out, warns, nil
+}
+
+// safeExtractPath maps an archive entry name to a destination UNDER destDir,
+// rejecting absolute paths and `..` traversal (Zip-Slip). Returns (path, ok).
+func safeExtractPath(destDir, name string) (string, bool) {
+	clean := filepath.Clean("/" + filepath.ToSlash(name))
+	clean = strings.TrimPrefix(clean, "/")
+	if clean == "" || clean == "." {
+		return "", false
+	}
+	dst := filepath.Join(destDir, filepath.FromSlash(clean))
+	rel, err := filepath.Rel(destDir, dst)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return dst, true
+}
+
+// writeExtractedUnique writes src to dst, creating parent dirs. If dst already
+// exists it does NOT truncate: it writes to a `.dupN`-suffixed sibling and reports
+// collided=true so the caller can surface a warning instead of losing data.
+func writeExtractedUnique(dst string, src io.Reader) (string, bool, error) {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", false, err
+	}
+	final, collided := dst, false
+	ext := filepath.Ext(dst)
+	stem := strings.TrimSuffix(dst, ext)
+	for i := 1; ; i++ {
+		if _, err := os.Stat(final); os.IsNotExist(err) {
+			break
+		}
+		collided = true
+		final = fmt.Sprintf("%s.dup%d%s", stem, i, ext)
+	}
+	f, err := os.OpenFile(final, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return "", collided, err
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, src); err != nil {
+		return "", collided, err
+	}
+	return final, collided, nil
+}
+
+// buildZipScript renders the glob-to-archive command executed ON THE TARGET
+// (DESIGN §8.5, T8 "glob→zip script golden"). Windows uses Compress-Archive over
+// Get-ChildItem matches (which flattens to basenames and expands wildcards even
+// from quoted -Path values). Linux copies each glob match into a temp dir and
+// tars THAT (flat, basename-only entries) so the extracted layout is
+// discoverable by relative/basename result globs. Emits the sentinel "NOFILES"
+// (exit 0) when nothing matched. Pure function so it can be golden-tested.
+func buildZipScript(os spec.OSKind, globs []string, archive string) transport.Cmd {
+	if os == spec.OSWindows {
+		// Each glob is single-quoted (psq) and fed to Get-ChildItem as DATA, never
+		// evaluated as code. Matches are staged into a temp dir that PRESERVES each
+		// file's relative path INCLUDING a drive identifier (C:\a.log -> C\a.log,
+		// \\srv\share\a.log -> UNC\srv\share\a.log) so identically named files on
+		// different drives/shares don't collide, then Compress-Archive'd.
 		items := make([]string, len(globs))
 		for i, g := range globs {
 			items[i] = psq(g)
 		}
-		script := fmt.Sprintf(`$ErrorActionPreference='Continue'
+		return transport.Cmd{Shell: transport.ShellPowerShell, TimeoutSec: 300, Script: fmt.Sprintf(
+			`$ErrorActionPreference='Continue'
+$stage = Join-Path $env:TEMP ('labdeploy-stage-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
 $paths = @(%s) | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty FullName -Unique
-if(-not $paths){ Write-Output 'NOFILES'; exit 0 }
-Compress-Archive -Path $paths -DestinationPath %s -Force
+if(-not $paths){ Remove-Item -Recurse -Force $stage; Write-Output 'NOFILES'; exit 0 }
+foreach($p in $paths){
+  if($p -match '^([A-Za-z]):[\\/]+'){ $rel = $Matches[1] + '\' + ($p -replace '^[A-Za-z]:[\\/]+','') }
+  elseif($p -match '^[\\/]{2}'){ $rel = 'UNC\' + ($p -replace '^[\\/]{2}','') }
+  else { $rel = $p -replace '^[\\/]+','' }
+  $target = Join-Path $stage $rel
+  New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+  Copy-Item -LiteralPath $p -Destination $target -Force
+}
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath %s -Force
+Remove-Item -Recurse -Force $stage
 Write-Output 'ZIPPED'
-exit 0`, strings.Join(items, ","), psq(remoteZip))
-		r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell, Script: script, TimeoutSec: 300})
-		if err != nil || r.ExitCode != 0 {
-			return out, []string{fmt.Sprintf("log zip on %s: err=%v %s", t.Host(), err, r.Stderr)}
+exit 0`, strings.Join(items, ","), psq(archive))}
+	}
+	// Injection-safe Linux staging with SEGMENT-AWARE glob semantics using ONLY
+	// portable `find` options (GNU, BSD and BusyBox all accept
+	// -maxdepth/-mindepth/-path/-type). For each glob we pin the search DEPTH to
+	// the exact number of path components below its non-wildcard root, so `-path`'s
+	// `*` cannot span a `/` (a match always has precisely that many components).
+	// The glob is passed as DATA (single-quoted, shq) to a `stage` function; find —
+	// not the shell — matches, so command substitutions inside a manifest glob are
+	// inert. find's exit status is checked and surfaced (FINDERR/exit 3) rather than
+	// silently degrading to NOFILES on an unsupported/failed scan.
+	var b strings.Builder
+	b.WriteString(`set +e
+tmp=$(mktemp -d) || exit 1
+stagedir=$tmp/stage
+mkdir -p "$stagedir"
+n=0
+ferr=0
+stage(){
+  find "$1" -maxdepth "$2" -mindepth "$2" -type f -path "$3" > "$tmp/list" 2> "$tmp/err"
+  if [ $? -ne 0 ]; then ferr=1; cat "$tmp/err" >&2; return; fi
+  while IFS= read -r f; do
+    rel=${f#/}
+    rel=${rel#./}
+    d=$stagedir/$(dirname "$rel")
+    mkdir -p "$d"
+    cp "$f" "$d"/ 2>/dev/null && n=$((n+1))
+  done < "$tmp/list"
+}
+`)
+	for _, g := range globs {
+		root := globRoot(g)
+		depth := findDepth(g)
+		patt := g
+		if !strings.HasPrefix(g, "/") {
+			// find prints relative results as ./<path>; match that form.
+			patt = "./" + g
 		}
-		if strings.Contains(r.Stdout, "NOFILES") {
-			return out, []string{fmt.Sprintf("no log files matched on %s: %v", t.Host(), globs)}
+		b.WriteString(fmt.Sprintf("stage %s %s %s\n", shq(root), shq(strconv.Itoa(depth)), shq(patt)))
+	}
+	b.WriteString(fmt.Sprintf(`if [ "$ferr" -ne 0 ]; then rm -rf "$tmp"; echo FINDERR; exit 3; fi
+if [ "$n" = "0" ]; then rm -rf "$tmp"; echo NOFILES; exit 0; fi
+tar czf %s -C "$stagedir" .
+rm -rf "$tmp"
+echo ZIPPED`, shq(archive)))
+	return transport.Cmd{Shell: transport.ShellSh, TimeoutSec: 300, Script: b.String()}
+}
+
+// findDepth returns the number of path components below a glob's non-wildcard
+// root (globRoot). Pinning find's -maxdepth == -mindepth to this value keeps
+// `-path`'s wildcards segment-aware without relying on GNU-only -regex.
+func findDepth(g string) int {
+	trimmed := strings.TrimPrefix(g, "/")
+	gSegs := len(strings.Split(trimmed, "/"))
+	root := globRoot(g)
+	rootTrim := strings.TrimPrefix(root, "/")
+	rootTrim = strings.TrimPrefix(rootTrim, "./")
+	if rootTrim == "." {
+		rootTrim = ""
+	}
+	rootN := 0
+	if rootTrim != "" {
+		rootN = len(strings.Split(rootTrim, "/"))
+	}
+	d := gSegs - rootN
+	if d < 1 {
+		d = 1
+	}
+	return d
+}
+
+// globRoot returns the deepest non-wildcard directory prefix of a POSIX glob so
+// `find` starts from a bounded root instead of scanning the whole filesystem.
+// The returned root matches how find prints paths: absolute globs yield an
+// absolute root, relative globs yield a `./`-prefixed root.
+func globRoot(pattern string) string {
+	abs := strings.HasPrefix(pattern, "/")
+	segs := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
+	var kept []string
+	// Never include the final (filename) segment as a search-root component.
+	for _, s := range segs[:len(segs)-1] {
+		if strings.ContainsAny(s, "*?[") {
+			break
 		}
-		local := filepath.Join(hostDir, "logs.zip")
-		if err := t.Download(ctx, remoteZip, local); err != nil {
-			return out, []string{fmt.Sprintf("log download from %s: %v", t.Host(), err)}
-		}
-		_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellPowerShell,
-			Script: fmt.Sprintf(`Remove-Item -Force -ErrorAction SilentlyContinue %s`, psq(remoteZip)), TimeoutSec: 30})
-		out = append(out, local)
-		return out, warns
+		kept = append(kept, s)
 	}
-	remoteTar := fmt.Sprintf("/tmp/labdeploy-logs-%s.tar.gz", stamp)
-	quoted := make([]string, len(globs))
-	for i, g := range globs {
-		quoted[i] = "'" + g + "'"
+	if abs {
+		return "/" + strings.Join(kept, "/")
 	}
-	script := fmt.Sprintf(`set +e
-files=$(ls -1 %s 2>/dev/null)
-[ -z "$files" ] && { echo NOFILES; exit 0; }
-tar czf '%s' $files
-echo ZIPPED`, strings.Join(quoted, " "), remoteTar)
-	r, err := t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: script, TimeoutSec: 300})
-	if err != nil || r.ExitCode != 0 {
-		return out, []string{fmt.Sprintf("log tar on %s: err=%v %s", t.Host(), err, r.Stderr)}
+	if len(kept) == 0 {
+		return "."
 	}
-	if strings.Contains(r.Stdout, "NOFILES") {
-		return out, []string{fmt.Sprintf("no log files matched on %s: %v", t.Host(), globs)}
-	}
-	local := filepath.Join(hostDir, "logs.tar.gz")
-	if err := t.Download(ctx, remoteTar, local); err != nil {
-		return out, []string{fmt.Sprintf("log download from %s: %v", t.Host(), err)}
-	}
-	_, _ = t.Exec(ctx, transport.Cmd{Shell: transport.ShellSh, Script: "rm -f '" + remoteTar + "'", TimeoutSec: 30})
-	return append(out, local), warns
+	return "./" + strings.Join(kept, "/")
 }
 
 // CollectEventLogs exports matching Windows events since `since` as JSON lines
@@ -190,30 +442,74 @@ func ParseJUnit(path string) (Counters, error) {
 	return out, nil
 }
 
-// SumResults globs results paths under baseDir and merges counters.
+// SumResults walks baseDir recursively and merges counters from every file whose
+// PATH matches one of the result patterns DIRECTORY-AWARELY: a pattern's trailing
+// path segments (e.g. `expected/*.trx`) must align with the file's own trailing
+// segments, so a stale/misplaced `other/foo.trx` does NOT satisfy `expected/*.trx`
+// (unlike a bare basename match). Matched paths are DEDUPLICATED so a file is
+// never counted twice even with overlapping/duplicate patterns.
 func SumResults(format string, baseDir string, patterns []string) (Counters, []string, error) {
 	var total Counters
-	var files []string
+	// Dedup patterns (as normalized slash strings) and split each into segments.
+	patSegs := make([][]string, 0, len(patterns))
+	seenPat := make(map[string]struct{})
 	for _, pat := range patterns {
-		matches, err := filepath.Glob(filepath.Join(baseDir, pat))
-		if err != nil {
-			return total, files, err
+		norm := strings.Trim(filepath.ToSlash(pat), "/")
+		if norm == "" {
+			continue
 		}
-		files = append(files, matches...)
+		if _, dup := seenPat[norm]; dup {
+			continue
+		}
+		seenPat[norm] = struct{}{}
+		patSegs = append(patSegs, strings.Split(norm, "/"))
 	}
+	seen := make(map[string]struct{})
+	var files []string
+	err := filepath.WalkDir(baseDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // best-effort walk
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(baseDir, path)
+		if rerr != nil {
+			return nil
+		}
+		fileSegs := strings.Split(filepath.ToSlash(rel), "/")
+		for _, ps := range patSegs {
+			ok, mErr := matchSegmentsSuffix(ps, fileSegs)
+			if mErr != nil {
+				return mErr
+			}
+			if ok {
+				if _, dup := seen[path]; !dup {
+					seen[path] = struct{}{}
+					files = append(files, path)
+				}
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return total, files, err
+	}
+	sort.Strings(files)
 	if len(files) == 0 {
 		return total, files, fmt.Errorf("no result files matched %v under %s", patterns, baseDir)
 	}
 	for _, f := range files {
 		var c Counters
-		var err error
+		var perr error
 		if format == "trx" {
-			c, err = ParseTRX(f)
+			c, perr = ParseTRX(f)
 		} else {
-			c, err = ParseJUnit(f)
+			c, perr = ParseJUnit(f)
 		}
-		if err != nil {
-			return total, files, err
+		if perr != nil {
+			return total, files, perr
 		}
 		total.Total += c.Total
 		total.Passed += c.Passed
@@ -223,8 +519,33 @@ func SumResults(format string, baseDir string, patterns []string) (Counters, []s
 	return total, files, nil
 }
 
+// matchSegmentsSuffix reports whether the pattern segments match the TRAILING
+// segments of the file's path, each segment matched independently (so `*` never
+// crosses a directory boundary). Requires the file to have at least as many
+// segments as the pattern. This enforces `expected/*.trx`-style directory-aware
+// matching while remaining agnostic to any absolute prefix embedded during
+// extraction.
+func matchSegmentsSuffix(patSegs, fileSegs []string) (bool, error) {
+	if len(patSegs) > len(fileSegs) {
+		return false, nil
+	}
+	off := len(fileSegs) - len(patSegs)
+	for i, ps := range patSegs {
+		ok, err := filepath.Match(ps, fileSegs[off+i])
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 var unsafeRe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
 func sanitize(s string) string { return unsafeRe.ReplaceAllString(s, "_") }
 
 func psq(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+
+func shq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }

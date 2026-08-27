@@ -1,0 +1,86 @@
+name: e2e-lab-acceptance-gate
+
+# Windows and Linux Single Target Acceptance (Stage 9.1) is a `[proof: lab]`
+# gate: its two authoritative scenarios require a real Windows Server 2022 host
+# (W1, WinRM https, node+.NET+vstest, Administrator) and a real Linux VM (L1,
+# ssh). Forge's ordinary bare gate has NO such hosts, no admin, and no native
+# symlink privilege, so the full WSV/NOD/NET service registration and native
+# `ln -sfn` behaviour cannot run there. This workflow runs the SAME godog suite
+# under TF_ACC=1 on a SELF-HOSTED runner that has network access to the
+# provisioned lab, wiring the LABDEPLOY_ACC_* connection secrets. It is manual /
+# scheduled (not per-PR) because it drives real lab hardware.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Nightly lab acceptance run (02:00 UTC).
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  lab-acceptance:
+    name: W1 + L1 single-target acceptance (TF_ACC)
+    # A self-hosted Windows orchestrator that can reach BOTH the W1 host (WinRM)
+    # and the L1 VM (ssh). The reproducible Windows local-transport core runs on
+    # this runner; the WSV/NOD/NET service registration runs on W1 and the
+    # native `ln -sfn` lifecycle runs on L1.
+    runs-on: [self-hosted, windows, labdeploy-lab]
+    env:
+      CGO_ENABLED: "0"
+      # Turn the TF_ACC-gated W1/L1 lab paths ON. Without this the suite runs
+      # only the reproducible embedded core and the lab paths return early.
+      TF_ACC: "1"
+      # --- W1 (Windows Server 2022, WinRM https) ---
+      LABDEPLOY_ACC_W1_HOST: ${{ secrets.LABDEPLOY_ACC_W1_HOST }}
+      LABDEPLOY_ACC_W1_PORT: ${{ secrets.LABDEPLOY_ACC_W1_PORT }}
+      LABDEPLOY_ACC_W1_USER: ${{ secrets.LABDEPLOY_ACC_W1_USER }}
+      LABDEPLOY_ACC_W1_PASSWORD: ${{ secrets.LABDEPLOY_ACC_W1_PASSWORD }}
+      # --- L1 (Linux VM, ssh) ---
+      LABDEPLOY_ACC_L1_HOST: ${{ secrets.LABDEPLOY_ACC_L1_HOST }}
+      LABDEPLOY_ACC_L1_PORT: ${{ secrets.LABDEPLOY_ACC_L1_PORT }}
+      LABDEPLOY_ACC_L1_USER: ${{ secrets.LABDEPLOY_ACC_L1_USER }}
+      LABDEPLOY_ACC_L1_PASSWORD: ${{ secrets.LABDEPLOY_ACC_L1_PASSWORD }}
+      LABDEPLOY_ACC_L1_PRIVATE_KEY: ${{ secrets.LABDEPLOY_ACC_L1_PRIVATE_KEY }}
+      LABDEPLOY_ACC_L1_HOST_KEY: ${{ secrets.LABDEPLOY_ACC_L1_HOST_KEY }}
+      # --- Artifact host + sample-svc checksums (served to W1/L1 over http) ---
+      LABDEPLOY_ACC_ARTIFACT_BASE_URL: ${{ secrets.LABDEPLOY_ACC_ARTIFACT_BASE_URL }}
+      LABDEPLOY_ACC_SHA_1_0_0_ZIP: ${{ secrets.LABDEPLOY_ACC_SHA_1_0_0_ZIP }}
+      LABDEPLOY_ACC_SHA_1_1_0_ZIP: ${{ secrets.LABDEPLOY_ACC_SHA_1_1_0_ZIP }}
+      # --- Optional W1 service-deployment knobs (artifact file names) ---
+      LABDEPLOY_ACC_W1_SERVICE_INSTALL_ROOT: ${{ secrets.LABDEPLOY_ACC_W1_SERVICE_INSTALL_ROOT }}
+      LABDEPLOY_ACC_NET_DLL: ${{ secrets.LABDEPLOY_ACC_NET_DLL }}
+      LABDEPLOY_ACC_NOD_ENTRY: ${{ secrets.LABDEPLOY_ACC_NOD_ENTRY }}
+      LABDEPLOY_ACC_NOD_WINSW: ${{ secrets.LABDEPLOY_ACC_NOD_WINSW }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          check-latest: true
+
+      - name: Preflight — required lab secrets present
+        shell: pwsh
+        run: |
+          $missing = @()
+          foreach ($v in @(
+            'LABDEPLOY_ACC_W1_HOST','LABDEPLOY_ACC_W1_USER','LABDEPLOY_ACC_W1_PASSWORD',
+            'LABDEPLOY_ACC_L1_HOST','LABDEPLOY_ACC_ARTIFACT_BASE_URL',
+            'LABDEPLOY_ACC_SHA_1_0_0_ZIP','LABDEPLOY_ACC_SHA_1_1_0_ZIP')) {
+            if (-not (Get-Item "Env:$v" -ErrorAction SilentlyContinue).Value) { $missing += $v }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing required lab secrets: $($missing -join ', ')"
+            exit 1
+          }
+
+      - name: Run Stage 9.1 lab acceptance (TF_ACC=1, W1 + L1)
+        shell: pwsh
+        run: |
+          go test -tags e2e -count=1 -timeout 40m -v `
+            -run TestE2E_lab_acceptance_gate_windows_and_linux_single_target_acceptance `
+            ./test/e2e/release-RELEASE-PROVIDER/...

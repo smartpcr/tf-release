@@ -4,15 +4,35 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 )
 
-// ValidationError carries the ERR_SPEC_INVALID contract (DESIGN §12).
+// ValidationError carries the ERR_SPEC_INVALID contract (DESIGN §12). Its
+// Error() text is `[ERR_SPEC_INVALID] <msg>`, where <msg> always names the
+// offending JSON path (e.g. `artifact.version: required ...`). This makes the
+// stable pipeline/test contract observable in-process without a provider layer.
 type ValidationError struct{ Msg string }
 
-func (e *ValidationError) Error() string { return e.Msg }
+func (e *ValidationError) Error() string { return "[ERR_SPEC_INVALID] " + e.Msg }
+
+// Code exposes the stable error code (DESIGN §12) for callers matching on it.
+func (e *ValidationError) Code() string { return "ERR_SPEC_INVALID" }
 
 func vErr(format string, a ...interface{}) error {
 	return &ValidationError{Msg: fmt.Sprintf(format, a...)}
+}
+
+// requireEnv enforces env-var NAME hygiene (DESIGN §11): a referenced-but-unset
+// env var yields ERR_SPEC_INVALID naming the exact JSON path that referenced it,
+// before any dial. Empty name means "not referenced" and is a no-op.
+func requireEnv(name, jsonPath string) error {
+	if name == "" {
+		return nil
+	}
+	if _, ok := os.LookupEnv(name); !ok {
+		return vErr("env var %s referenced by %s is not set", name, jsonPath)
+	}
+	return nil
 }
 
 var (
@@ -72,12 +92,12 @@ func validateTarget(t *Target, isCluster bool) error {
 		}
 	}
 	// env var NAMES must resolve on the runner (VAL-08 fires here, pre-dial).
-	for _, name := range []string{t.Credentials.PasswordEnv, t.Credentials.PrivateKeyEnv} {
-		if name != "" {
-			if _, ok := os.LookupEnv(name); !ok {
-				return vErr("env var %s referenced by target.credentials is not set", name)
-			}
-		}
+	// Each error names the precise JSON path that referenced the missing var.
+	if err := requireEnv(t.Credentials.PasswordEnv, "target.credentials.password_env"); err != nil {
+		return err
+	}
+	if err := requireEnv(t.Credentials.PrivateKeyEnv, "target.credentials.private_key_env"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -137,12 +157,11 @@ func validateArtifact(a *Artifact, p PatternType) error {
 	default:
 		return vErr("artifact.source.type: %q not one of http|file|nuget_feed|docker_registry", s.Type)
 	}
-	for _, name := range []string{s.Auth.TokenEnv, s.Auth.PasswordEnv} {
-		if name != "" {
-			if _, ok := os.LookupEnv(name); !ok {
-				return vErr("env var %s referenced by artifact.source.auth is not set", name)
-			}
-		}
+	if err := requireEnv(s.Auth.TokenEnv, "artifact.source.auth.token_env"); err != nil {
+		return err
+	}
+	if err := requireEnv(s.Auth.PasswordEnv, "artifact.source.auth.password_env"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -311,14 +330,12 @@ func ValidateDeployment(d *Deployment) error {
 		}
 	}
 	for i, f := range d.Files {
-		if f.Path == "" {
-			return vErr("files[%d].path: required", i)
+		if err := validateRelPath(f.Path, i); err != nil {
+			return err
 		}
 	}
-	if d.Pattern.Account.PasswordEnv != "" {
-		if _, ok := os.LookupEnv(d.Pattern.Account.PasswordEnv); !ok {
-			return vErr("env var %s referenced by pattern.account is not set", d.Pattern.Account.PasswordEnv)
-		}
+	if err := requireEnv(d.Pattern.Account.PasswordEnv, "pattern.account.password_env"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -368,6 +385,53 @@ func ValidateTestRun(t *TestRun) error {
 		}
 	}
 	return nil
+}
+
+// validateRelPath enforces DESIGN §6.5: files[].path is "relative to release
+// dir". It rejects empty paths, absolute paths (both POSIX "/x" and Windows
+// "C:\x" / "\\host\share"), and any ".." traversal component so a spec can never
+// write outside the release dir. Detection is OS-independent because a spec may
+// be authored for a Windows target while validated on a Linux runner.
+func validateRelPath(p string, i int) error {
+	if p == "" {
+		return vErr("files[%d].path: required", i)
+	}
+	if isAbsPath(p) {
+		return vErr("files[%d].path: must be relative to the release dir, got absolute path %q", i, p)
+	}
+	// Normalise separators, then inspect components for "..".
+	norm := strings.ReplaceAll(p, `\`, "/")
+	for _, seg := range strings.Split(norm, "/") {
+		if seg == ".." {
+			return vErr("files[%d].path: must not contain \"..\" traversal, got %q", i, p)
+		}
+	}
+	return nil
+}
+
+// isAbsPath reports whether p is absolute or volume-qualified under either
+// POSIX or Windows rules, independent of the host OS running validation. Any
+// Windows drive qualifier ("C:\x", "C:/x", "C:x", "C:..\x") is treated as
+// non-relative: a drive-relative path still escapes the release dir's volume,
+// so it must be rejected.
+func isAbsPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	// POSIX absolute or Windows root-relative / UNC ("/x", "\x", "\\host\share").
+	if p[0] == '/' || p[0] == '\\' {
+		return true
+	}
+	// Windows drive/volume qualifier: "C:" followed by anything ("C:\x", "C:/x",
+	// "C:x", "C:..\x"). All are volume-anchored, not release-dir-relative.
+	if len(p) >= 2 && isDriveLetter(p[0]) && p[1] == ':' {
+		return true
+	}
+	return false
+}
+
+func isDriveLetter(c byte) bool {
+	return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')
 }
 
 func equalsFold(a, b string) bool {

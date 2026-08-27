@@ -1,0 +1,3 @@
+Set-Location 'C:\deploy\app\releases\1.0.0'
+bin\healthcheck.exe --probe
+exit $LASTEXITCODE

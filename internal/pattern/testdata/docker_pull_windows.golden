@@ -1,0 +1,7 @@
+$env:LD_REG_PW | docker login 'registry.example.com' -u 'svc' --password-stdin
+if($LASTEXITCODE -ne 0){ Write-Error 'docker login failed'; exit 40 }
+docker pull 'registry.example.com/app:2.0.0'
+$code=$LASTEXITCODE
+docker logout 'registry.example.com' | Out-Null
+if($code -ne 0){ exit 40 }
+exit 0

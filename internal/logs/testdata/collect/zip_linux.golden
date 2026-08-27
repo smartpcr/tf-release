@@ -1,0 +1,24 @@
+set +e
+tmp=$(mktemp -d) || exit 1
+stagedir=$tmp/stage
+mkdir -p "$stagedir"
+n=0
+ferr=0
+stage(){
+  find "$1" -maxdepth "$2" -mindepth "$2" -type f -path "$3" > "$tmp/list" 2> "$tmp/err"
+  if [ $? -ne 0 ]; then ferr=1; cat "$tmp/err" >&2; return; fi
+  while IFS= read -r f; do
+    rel=${f#/}
+    rel=${rel#./}
+    d=$stagedir/$(dirname "$rel")
+    mkdir -p "$d"
+    cp "$f" "$d"/ 2>/dev/null && n=$((n+1))
+  done < "$tmp/list"
+}
+stage '/var/log/app' '1' '/var/log/app/*.log'
+stage '/opt/app/_results' '1' '/opt/app/_results/*.xml'
+if [ "$ferr" -ne 0 ]; then rm -rf "$tmp"; echo FINDERR; exit 3; fi
+if [ "$n" = "0" ]; then rm -rf "$tmp"; echo NOFILES; exit 0; fi
+tar czf '/tmp/labdeploy-logs.tar.gz' -C "$stagedir" .
+rm -rf "$tmp"
+echo ZIPPED

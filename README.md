@@ -40,6 +40,57 @@ provider_installation {
 }
 ```
 
+## Release & distribution to runners
+
+Tagged builds (`git push --tags`, `v*`) run [`.goreleaser.yml`](.goreleaser.yml)
+via the [`release` workflow](.github/workflows/release.yml). GoReleaser produces
+statically linked (`CGO_ENABLED=0`) provider binaries and packages them as:
+
+```
+terraform-provider-labdeploy_v<version>_linux_amd64.zip
+terraform-provider-labdeploy_v<version>_windows_amd64.zip
+```
+
+Each zip contains the versioned binary (`terraform-provider-labdeploy_v<version>`
+on linux, `terraform-provider-labdeploy_v<version>.exe` on windows) alongside
+`README.md`. A separate `terraform-provider-labdeploy_v<version>_SHA256SUMS`
+checksum file is published as its own release artifact (not bundled inside the
+zips). Reproduce the full archive matrix locally with either
+`goreleaser release --snapshot --clean --skip=publish` (zips + checksums in
+`dist/`) or `goreleaser build --snapshot --clean` — a per-target build hook
+(`tools/zipbin`) writes the same `terraform-provider-labdeploy_v<version>_<os>_<arch>.zip`
+next to each binary so the plain `build` subcommand emits the zips too.
+
+To install on a CI runner, download and unzip the matching artifact into the
+filesystem-mirror layout Terraform expects (DESIGN §16.1):
+
+```
+# Linux runner
+$HOME/.terraform.d/plugins/registry.local/smartpcr/labdeploy/<version>/linux_amd64/terraform-provider-labdeploy_v<version>
+
+# Windows runner
+%APPDATA%\terraform.d\plugins\registry.local\smartpcr\labdeploy\<version>\windows_amd64\terraform-provider-labdeploy_v<version>.exe
+```
+
+Point Terraform at the mirror via `~/.terraformrc` and pin the source in the
+config's `required_providers`:
+
+```hcl
+# ~/.terraformrc  (Linux runner shown; use %APPDATA%\terraform.rc on Windows)
+provider_installation {
+  filesystem_mirror { path = "/home/runner/.terraform.d/plugins" include = ["registry.local/*/*"] }
+  direct { exclude = ["registry.local/*/*"] }
+}
+```
+
+```hcl
+terraform {
+  required_providers {
+    labdeploy = { source = "registry.local/smartpcr/labdeploy", version = "0.1.0" }
+  }
+}
+```
+
 ## Quick start
 
 ```sh

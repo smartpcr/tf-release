@@ -1,0 +1,12 @@
+<service>
+  <id>PaymentsSvc</id>
+  <name>Contoso Payments</name>
+  <description>Handles payments</description>
+  <executable>C:\deploy\payments-svc\current\bin\Payments.exe</executable>
+  <arguments>--config appsettings.json</arguments>
+  <logpath>C:\deploy\payments-svc\shared\logs</logpath>
+  <stopwait>45sec</stopwait>
+  <env name="ASPNETCORE_ENVIRONMENT" value="Production"/>
+  <env name="LD_APP" value="payments-svc"/>
+  <env name="LD_VERSION" value="1.2.0"/>
+</service>
